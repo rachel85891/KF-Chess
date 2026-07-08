@@ -1,0 +1,10 @@
+Board:
+.
+.
+wP
+.
+
+Commands:
+click 0 200
+click 0 0
+print board
