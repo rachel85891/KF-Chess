@@ -164,3 +164,19 @@ def test_arrival_sets_moved_piece_state_to_idle_and_captured_piece_state_to_capt
 
     assert rook.state is PieceState.IDLE
     assert enemy.state is PieceState.CAPTURED
+
+
+def test_has_active_motion_reflects_active_and_settled_motions():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    assert arbiter.has_active_motion() is False
+
+    arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
+    assert arbiter.has_active_motion() is True
+
+    arbiter.advance_time(board, 1000)
+    assert arbiter.has_active_motion() is False
