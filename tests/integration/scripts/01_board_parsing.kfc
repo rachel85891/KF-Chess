@@ -1,0 +1,12 @@
+Board:
+wK . .
+. . .
+. . bK
+
+Commands:
+print board
+
+EXPECTED:
+wK . .
+. . .
+. . bK

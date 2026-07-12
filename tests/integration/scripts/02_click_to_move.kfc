@@ -1,0 +1,15 @@
+Board:
+wK . .
+. . .
+. . bK
+
+Commands:
+click 0 0
+click 100 0
+wait 1000
+print board
+
+EXPECTED:
+. wK .
+. . .
+. . bK
