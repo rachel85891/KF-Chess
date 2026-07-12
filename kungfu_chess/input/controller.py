@@ -11,12 +11,12 @@ kungfu_chess.services.click_interpreter.interpret_click (the existing,
 already-verified click-classification logic) - spec.md §11 itself
 doesn't fully specify this nuance. That module's additional
 pending-move/airborne selectability gating is deliberately NOT
-mirrored here: it existed to support the legacy MoveScheduler's
-same-color parallel-motion model, which this architecture's GameEngine
-explicitly does not carry over (spec.md §2: only one motion
-system-wide) - any attempt to act on a piece mid-motion is already
-correctly rejected by GameEngine.request_move's motion_in_progress
-guard, so Controller has nothing extra to enforce at selection time.
+mirrored here: any attempt to act on a piece that is itself already
+mid-motion is already correctly rejected by GameEngine.request_move's
+motion_in_progress guard (spec.md §2's "Simultaneous movement of
+pieces" extension - the guard is scoped per-piece, not system-wide, so
+two different pieces of any colors may now have concurrent motions),
+so Controller has nothing extra to enforce at selection time.
 
 Re-clicking the exact cell of the currently-selected piece is treated
 the same as clicking any other friendly piece: it "replaces" the
