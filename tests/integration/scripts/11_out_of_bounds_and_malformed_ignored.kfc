@@ -1,0 +1,12 @@
+Board:
+wK
+
+Commands:
+click 1000 1000
+jump 1000 1000
+click 1
+foobar
+print board
+
+EXPECTED:
+wK

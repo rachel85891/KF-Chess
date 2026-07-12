@@ -1,6 +1,0 @@
-Board:
-wK wQ
-wK
-
-Commands:
-print board

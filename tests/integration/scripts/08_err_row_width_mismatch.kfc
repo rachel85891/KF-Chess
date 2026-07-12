@@ -1,0 +1,9 @@
+Board:
+wK wQ
+wK
+
+Commands:
+print board
+
+EXPECTED:
+ERROR ROW_WIDTH_MISMATCH

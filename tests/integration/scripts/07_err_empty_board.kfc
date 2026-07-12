@@ -1,0 +1,7 @@
+Board:
+
+Commands:
+print board
+
+EXPECTED:
+ERROR EMPTY_BOARD

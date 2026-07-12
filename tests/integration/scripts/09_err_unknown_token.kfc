@@ -1,0 +1,8 @@
+Board:
+wX
+
+Commands:
+print board
+
+EXPECTED:
+ERROR UNKNOWN_TOKEN
