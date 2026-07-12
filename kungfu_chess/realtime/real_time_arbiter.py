@@ -46,6 +46,9 @@ class RealTimeArbiter:
     def has_active_motion(self) -> bool:
         return len(self._motions) > 0
 
+    def active_motions(self) -> tuple[Motion, ...]:
+        return tuple(self._motions)
+
     def start_motion(self, piece: Piece, destination: Position, start_time: int) -> Motion:
         squares = _chebyshev_distance(piece.cell, destination)
         motion = Motion(

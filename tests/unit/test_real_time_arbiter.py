@@ -178,5 +178,21 @@ def test_has_active_motion_reflects_active_and_settled_motions():
     arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
     assert arbiter.has_active_motion() is True
 
+
+def test_active_motions_reflects_active_and_settled_motions():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    assert arbiter.active_motions() == ()
+
+    motion = arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
+    assert arbiter.active_motions() == (motion,)
+
+    arbiter.advance_time(board, 1000)
+    assert arbiter.active_motions() == ()
+
     arbiter.advance_time(board, 1000)
     assert arbiter.has_active_motion() is False
