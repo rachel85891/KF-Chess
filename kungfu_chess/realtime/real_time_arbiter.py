@@ -67,6 +67,9 @@ class RealTimeArbiter:
     def has_active_motion(self) -> bool:
         return len(self._motions) > 0
 
+    def is_piece_moving(self, piece: Piece) -> bool:
+        return any(motion.piece is piece for motion in self._motions)
+
     def active_motions(self) -> tuple[Motion, ...]:
         return tuple(self._motions)
 
