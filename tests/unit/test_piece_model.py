@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from kungfu_chess.domain.color import Color
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind, PieceState
 from kungfu_chess.model.position import Position
 

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from kungfu_chess.config.errors import ERR_EMPTY_BOARD, ERR_ROW_WIDTH_MISMATCH, ERR_UNKNOWN_TOKEN
-from kungfu_chess.domain.color import Color
-from kungfu_chess.io.board_parser import BoardParser
+from kungfu_chess.io.board_parser import ERR_EMPTY_BOARD, ERR_ROW_WIDTH_MISMATCH, ERR_UNKNOWN_TOKEN, BoardParser
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from kungfu_chess.domain.color import Color
 from kungfu_chess.io.board_parser import BoardParser
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.board import Board
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
 

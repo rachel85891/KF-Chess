@@ -2,16 +2,19 @@
 piece) -> set[Position] for each of Rook, Bishop, Queen, Knight, King, Pawn.
 
 Reuse, not rewrite: the shape/geometry checks (is_rook_move, etc.) and
-the intervening-cell walk (path_cells) already live in
-kungfu_chess.domain.movement, are pure functions with zero coupling to
-domain.Piece/domain.Board (plain ints/Color in, bool/cells out), and
-are already exercised by 163 passing tests. Reimplementing them here
-would risk silently diverging from proven-correct geometry for no
-benefit, so each class below delegates to the matching domain.movement
-function rather than re-deriving the shape logic. Only the model-layer
-plumbing (walking every board cell, translating Position/Piece into
-the (dr, dc, color, is_capture, is_start_row) shape these functions
-expect, and applying the resulting set) is new.
+the intervening-cell walk (path_cells) live in rules/shapes.py (moved
+there from the retired domain/movement/{rules,path}.py - originally
+reused read-only from the domain layer, now relocated into this
+package since this is their only remaining consumer), are pure
+functions with zero coupling to Piece/Board (plain ints/Color in,
+bool/cells out), and are already exercised by many passing tests.
+Reimplementing them here would risk silently diverging from
+proven-correct geometry for no benefit, so each class below delegates
+to the matching shapes function rather than re-deriving the shape
+logic. Only the model-layer plumbing (walking every board cell,
+translating Position/Piece into the (dr, dc, color, is_capture,
+is_start_row) shape these functions expect, and applying the resulting
+set) is new.
 
 legal_destination itself is defined once, on the PieceRules base
 class, as a template method: it enumerates every cell on the board and
@@ -29,19 +32,19 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from kungfu_chess.domain.color import Color
-from kungfu_chess.domain.movement.path import path_cells
-from kungfu_chess.domain.movement.rules import (
+from kungfu_chess.model.board import Board
+from kungfu_chess.model.color import Color
+from kungfu_chess.model.piece import Piece
+from kungfu_chess.model.position import Position
+from kungfu_chess.rules.shapes import (
     is_bishop_move,
     is_king_move,
     is_knight_move,
     is_pawn_move,
     is_queen_move,
     is_rook_move,
+    path_cells,
 )
-from kungfu_chess.model.board import Board
-from kungfu_chess.model.piece import Piece
-from kungfu_chess.model.position import Position
 
 
 def _path_is_blocked(board: Board, source: Position, destination: Position) -> bool:

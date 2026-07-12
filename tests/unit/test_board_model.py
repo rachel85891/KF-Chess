@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from kungfu_chess.domain.color import Color
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.board import Board, CellOccupiedError, EmptyCellError, OutOfBoundsError
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position

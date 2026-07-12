@@ -27,9 +27,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from kungfu_chess.domain.color import Color
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.input.controller import Controller
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind, PieceState
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE

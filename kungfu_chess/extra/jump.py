@@ -21,19 +21,32 @@ this mechanic functionally requires the core Piece.state to reflect
 it; airborne-ness lives only in this tracker's own registry. This
 keeps model/piece.py completely unmodified.
 
-Interception must be checked when the JUMP's own duration elapses, not
-only when the attacker's motion would otherwise arrive - the legacy
-resolve_landing cancels an already-in-flight attacker the moment the
-jump resolves, regardless of how much travel time that attacker has
-left. Reproducing this required one small additive hook on
-RealTimeArbiter, cancel_motion(motion) - see its docstring for why it
-was unavoidable; nothing else about RealTimeArbiter's timing/
-resolution logic changed.
+Interception has two distinct trigger points, both present in the
+legacy resolver and both needed - a golden-master fixture from the
+retired characterization suite (air_capture_before_landing) failed
+against an implementation that only had the second one:
+
+1. An attacker's own motion resolves while its target is STILL
+   airborne (legacy resolve_move's is_airborne check) - checked here
+   against each airborne entry's [start_time, land_time) window, so it
+   fires correctly even for an attacker whose motion was scheduled
+   before the jump even started.
+2. The jump's own duration elapses while an enemy motion is already
+   in flight toward that cell, regardless of how much travel time that
+   attacker has left (legacy resolve_landing's scan over pending
+   moves) - this is the one that needs an attacker's motion cancelled
+   before it would otherwise resolve normally much later.
+
+Both destroy the attacker and leave the defender untouched. Reproducing
+either required one small additive hook on RealTimeArbiter,
+cancel_motion(motion) - see its docstring for why it was unavoidable;
+nothing else about RealTimeArbiter's timing/resolution logic changed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.piece import Piece, PieceState
@@ -69,9 +82,32 @@ class JumpTracker:
             piece=piece, start_time=clock_ms, land_time=clock_ms + JUMP_DURATION_MS
         )
 
+    def _airborne_entry_at(self, cell: Position) -> Optional[_AirborneEntry]:
+        return next((entry for entry in self._airborne.values() if entry.piece.cell == cell), None)
+
     def resolve_due(self, clock_ms: int, arbiter: RealTimeArbiter, board: Board) -> list[InterceptionEvent]:
         events: list[InterceptionEvent] = []
 
+        # Trigger 1: an attacker due to arrive while its target is
+        # still airborne is destroyed instead of capturing/landing.
+        for motion in list(arbiter.active_motions()):
+            if motion.arrival_time > clock_ms:
+                continue
+
+            entry = self._airborne_entry_at(motion.destination)
+            if entry is None or entry.piece.color == motion.piece.color:
+                continue
+            if not (entry.start_time <= motion.arrival_time < entry.land_time):
+                continue
+
+            arbiter.cancel_motion(motion)
+            board.remove_piece(motion.piece.cell)
+            motion.piece.state = PieceState.CAPTURED
+            events.append(InterceptionEvent(attacker=motion.piece, defender=entry.piece, cell=entry.piece.cell))
+
+        # Trigger 2: the jump's own duration elapses with an
+        # already-in-flight attacker still pending (caught here even
+        # though its own arrival is much later).
         for piece_id, entry in list(self._airborne.items()):
             if entry.land_time > clock_ms:
                 continue

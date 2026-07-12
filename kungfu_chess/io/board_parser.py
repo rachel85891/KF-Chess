@@ -11,24 +11,26 @@ doesn't need. kungfu_chess.model.piece.PieceKind's value is already
 the board-notation letter (PieceKind.ROOK.value == "R"), so
 PieceKind(letter) replaces the old registry lookup entirely.
 
-The three error-code strings themselves are imported directly from
-kungfu_chess.config.errors rather than re-declared: that module is a
-tiny, dependency-free set of constants which is the external stdout
-contract this parser must not diverge from - re-typing the literal
-strings locally would risk silent drift if the shared constants ever
-changed. This is a narrower dependency than the old codec's own use of
-config.piece_registry, which is deliberately avoided here.
+The three error-code strings themselves are the external stdout
+contract this parser must not diverge from - they lived in
+kungfu_chess.config.errors while the legacy codec was still around
+(now retired); with this the single remaining consumer, they're
+declared directly here rather than in a separate single-consumer
+module.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from kungfu_chess.config.errors import ERR_EMPTY_BOARD, ERR_ROW_WIDTH_MISMATCH, ERR_UNKNOWN_TOKEN
-from kungfu_chess.domain.color import Color
 from kungfu_chess.model.board import Board
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
+
+ERR_EMPTY_BOARD = "EMPTY_BOARD"
+ERR_ROW_WIDTH_MISMATCH = "ROW_WIDTH_MISMATCH"
+ERR_UNKNOWN_TOKEN = "UNKNOWN_TOKEN"
 
 _EMPTY_TOKEN = "."
 _VALID_LETTERS = frozenset(kind.value for kind in PieceKind)

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from kungfu_chess.domain.color import Color
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.extra.extra_engine import ExtraEngine
 from kungfu_chess.model.board import Board
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind, PieceState
 from kungfu_chess.model.position import Position
 from kungfu_chess.texttests.script_parser import CommandKind, ScriptParser
@@ -51,6 +51,29 @@ def test_enemy_move_targeting_airborne_cell_results_in_attacker_destroyed_defend
     assert board.piece_at(Position(row=0, col=3)) is None
     assert attacker.state is PieceState.CAPTURED
     assert engine.arbiter.has_active_motion() is False
+
+
+def test_attacker_arriving_while_target_airborne_is_destroyed_even_if_move_started_before_jump():
+    grid = _empty_grid(1, 2)
+    attacker = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    defender = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=1))
+    grid[0][0] = attacker
+    grid[0][1] = defender
+    board = Board(grid)
+    engine = GameEngine(board)
+    extra_engine = ExtraEngine(engine)
+
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is True
+
+    extra_engine.wait(100)
+    extra_engine.request_jump(Position(row=0, col=1))
+
+    extra_engine.wait(900)
+
+    assert board.piece_at(Position(row=0, col=1)) is defender
+    assert board.piece_at(Position(row=0, col=0)) is None
+    assert attacker.state is PieceState.CAPTURED
 
 
 def test_jump_with_no_interception_ends_normally_after_duration():

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from itertools import count
 
-from kungfu_chess.domain.color import Color
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.position import Position
 
 _id_counter = count()

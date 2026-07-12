@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from typing import List
 
-from kungfu_chess.domain.color import Color
 from kungfu_chess.model.board import Board
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.realtime.motion import ArrivalEvent
 
