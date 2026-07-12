@@ -29,7 +29,7 @@ def test_request_move_rejected_when_game_over():
     assert result.reason == "game_over"
 
 
-def test_request_move_rejected_when_any_motion_active_opposite_color():
+def test_request_move_accepted_when_different_piece_moving_opposite_color():
     grid = _empty_grid(3, 3)
     white_rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
     black_rook = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=0))
@@ -41,11 +41,11 @@ def test_request_move_rejected_when_any_motion_active_opposite_color():
 
     result = engine.request_move(Position(row=2, col=0), Position(row=2, col=1))
 
-    assert result.is_accepted is False
-    assert result.reason == "motion_in_progress"
+    assert result.is_accepted is True
+    assert result.reason == "ok"
 
 
-def test_request_move_rejected_when_any_motion_active_same_color():
+def test_request_move_accepted_when_different_piece_moving_same_color():
     grid = _empty_grid(3, 3)
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
     other_rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=2, col=0))
@@ -57,8 +57,60 @@ def test_request_move_rejected_when_any_motion_active_same_color():
 
     result = engine.request_move(Position(row=2, col=0), Position(row=2, col=1))
 
+    assert result.is_accepted is True
+    assert result.reason == "ok"
+
+
+def test_request_move_rejected_when_same_piece_already_moving():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=2))
+
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+
     assert result.is_accepted is False
     assert result.reason == "motion_in_progress"
+
+
+def test_request_move_two_different_pieces_both_start_motions():
+    grid = _empty_grid(3, 3)
+    white_rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    black_rook = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=0))
+    grid[0][0] = white_rook
+    grid[2][0] = black_rook
+    board = Board(grid)
+    engine = GameEngine(board)
+
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    engine.request_move(Position(row=2, col=0), Position(row=2, col=1))
+
+    active_pieces = [motion.piece for motion in engine.arbiter.active_motions()]
+    assert len(active_pieces) == 2
+    assert white_rook in active_pieces
+    assert black_rook in active_pieces
+
+
+def test_wait_settles_two_concurrently_moving_pieces_independently():
+    grid = _empty_grid(3, 5)
+    near_rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    far_rook = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=0))
+    grid[0][0] = near_rook
+    grid[2][0] = far_rook
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    engine.request_move(Position(row=2, col=0), Position(row=2, col=3))
+
+    events = engine.wait(1000)
+
+    assert len(events) == 1
+    assert events[0].piece is near_rook
+    assert board.piece_at(Position(row=0, col=1)) is near_rook
+    assert board.piece_at(Position(row=2, col=0)) is far_rook
+    assert engine.arbiter.is_piece_moving(far_rook) is True
 
 
 def test_request_move_rejected_with_rule_engine_reason_on_illegal_move():
