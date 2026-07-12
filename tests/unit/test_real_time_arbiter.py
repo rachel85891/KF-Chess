@@ -225,3 +225,52 @@ def test_cancel_motion_returns_false_for_unknown_motion():
     arbiter.advance_time(board, 1000)
 
     assert arbiter.cancel_motion(motion) is False
+
+
+def test_is_piece_moving_false_when_no_motion_active():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    assert arbiter.is_piece_moving(rook) is False
+
+
+def test_is_piece_moving_true_for_the_moving_piece():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
+
+    assert arbiter.is_piece_moving(rook) is True
+
+
+def test_is_piece_moving_false_for_a_different_piece_while_one_is_moving():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    bishop = _piece(Color.WHITE, PieceKind.BISHOP, Position(row=2, col=2))
+    grid[0][0] = rook
+    grid[2][2] = bishop
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
+
+    assert arbiter.is_piece_moving(bishop) is False
+
+
+def test_is_piece_moving_false_after_arrival_settles():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
+    arbiter.advance_time(board, 1000)
+
+    assert arbiter.is_piece_moving(rook) is False
