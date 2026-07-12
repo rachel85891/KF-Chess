@@ -196,3 +196,32 @@ def test_active_motions_reflects_active_and_settled_motions():
 
     arbiter.advance_time(board, 1000)
     assert arbiter.has_active_motion() is False
+
+
+def test_cancel_motion_removes_it_without_resolving():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+    motion = arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
+
+    cancelled = arbiter.cancel_motion(motion)
+
+    assert cancelled is True
+    assert arbiter.has_active_motion() is False
+    assert arbiter.advance_time(board, 1000) == []
+    assert board.piece_at(Position(row=0, col=0)) is rook
+    assert board.piece_at(Position(row=0, col=1)) is None
+
+
+def test_cancel_motion_returns_false_for_unknown_motion():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+    motion = arbiter.start_motion(rook, Position(row=0, col=1), start_time=0)
+    arbiter.advance_time(board, 1000)
+
+    assert arbiter.cancel_motion(motion) is False

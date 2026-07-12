@@ -16,6 +16,15 @@ deterministically - RealTimeArbiter itself does not restrict how many
 motions can be active at once (spec.md §10 describes it as holding "a
 collection" of them); the "only one motion in progress" policy belongs
 to GameEngine, not here.
+
+cancel_motion is an additive extension point for the optional extras
+track (spec.md §2's JUMP parry mechanic): it lets a caller remove a
+specific in-flight Motion before it resolves - no arrival, no capture,
+no state change - so that a motion which should never complete (its
+target was airborne when the extras track's own jump timer elapsed)
+doesn't later crash or wrongly resolve against a board the extras
+track has already mutated out from under it. It changes nothing about
+start_motion's or advance_time's existing behavior.
 """
 
 from __future__ import annotations
@@ -48,6 +57,13 @@ class RealTimeArbiter:
 
     def active_motions(self) -> tuple[Motion, ...]:
         return tuple(self._motions)
+
+    def cancel_motion(self, motion: Motion) -> bool:
+        try:
+            self._motions.remove(motion)
+            return True
+        except ValueError:
+            return False
 
     def start_motion(self, piece: Piece, destination: Position, start_time: int) -> Motion:
         squares = _chebyshev_distance(piece.cell, destination)
