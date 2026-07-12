@@ -22,6 +22,21 @@ Deliberately out of scope for this step: GameSnapshot generation for
 the Renderer/BoardPrinter (also mentioned in spec.md §9). Renderer
 (§12) and BoardPrinter don't exist yet, so building a snapshot
 interface now would be speculative - deferred, not forgotten.
+
+last_cancellations exposes the CancellationEvents from the most recent
+wait() call (spec.md §2's "Cancelling an action if the target is
+captured before arrival" extension) as a plain instance attribute
+rather than as part of wait()'s return value. This is a deliberate
+trade-off, not an oversight: wait(ms) -> list[ArrivalEvent] is a
+preserved external contract that kungfu_chess/extra/extra_engine.py
+depends on byte-for-byte (it does
+`arrival_events = self.engine.wait(ms)` and hands that straight to
+apply_promotions, which iterates it expecting ArrivalEvent objects) -
+changing wait's return shape to also carry cancellations would silently
+break that call without any change to extra/ itself, which is out of
+bounds. Reading last_cancellations right after a wait() call gives
+tests (and future consumers - Renderer, BoardPrinter) a way to observe
+cancellations without touching wait's signature at all.
 """
 
 from __future__ import annotations
@@ -31,7 +46,7 @@ from dataclasses import dataclass
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.game_state import GameState
 from kungfu_chess.model.position import Position
-from kungfu_chess.realtime.motion import ArrivalEvent
+from kungfu_chess.realtime.motion import ArrivalEvent, CancellationEvent
 from kungfu_chess.realtime.real_time_arbiter import RealTimeArbiter
 from kungfu_chess.rules.rule_engine import RuleEngine
 
@@ -48,6 +63,7 @@ class GameEngine:
         self.state = GameState()
         self.rule_engine = RuleEngine()
         self.arbiter = RealTimeArbiter()
+        self.last_cancellations: list[CancellationEvent] = []
 
     def request_move(self, from_cell: Position, to_cell: Position) -> MoveResult:
         if self.state.game_over:
@@ -61,12 +77,13 @@ class GameEngine:
         if not validation.is_valid:
             return MoveResult(is_accepted=False, reason=validation.reason)
 
-        self.arbiter.start_motion(piece, to_cell, self.state.clock_ms)
+        self.arbiter.start_motion(piece, to_cell, self.state.clock_ms, self.board)
         return MoveResult(is_accepted=True, reason="ok")
 
     def wait(self, ms: int) -> list[ArrivalEvent]:
         self.state.clock_ms += ms
-        events = self.arbiter.advance_time(self.board, self.state.clock_ms)
+        events, cancellations = self.arbiter.advance_time(self.board, self.state.clock_ms)
+        self.last_cancellations = cancellations
 
         for event in events:
             if event.king_captured:
