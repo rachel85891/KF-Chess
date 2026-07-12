@@ -1,22 +1,25 @@
 Board:
-bP .
 . .
+bP .
 . wP
+. .
 
 Commands:
 click 100 200
 click 100 0
 wait 2000
 print board
-click 0 0
-click 0 200
+click 0 100
+click 0 300
 wait 2000
 print board
 
 EXPECTED:
-bP wQ
+. wQ
+bP .
 . .
 . .
 . wQ
+. .
 . .
 bQ .

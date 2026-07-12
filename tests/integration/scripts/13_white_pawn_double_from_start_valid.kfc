@@ -1,13 +1,14 @@
 Board:
 .
 .
-wP
 .
+.
+wP
 .
 
 Commands:
+click 0 400
 click 0 200
-click 0 0
 wait 2000
 print board
 
@@ -15,5 +16,6 @@ EXPECTED:
 .
 .
 wP
+.
 .
 .

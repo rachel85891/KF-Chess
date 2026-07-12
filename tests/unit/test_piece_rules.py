@@ -180,26 +180,43 @@ def test_pawn_cannot_move_two_steps_except_from_start_row():
     destinations = PawnRules().legal_destination(board, pawn)
     assert Position(row=0, col=2) not in destinations
 
+    # Start row is one row in from the back edge (board.height - 2 for
+    # white on a 5-row board: row 3), matching standard chess - not the
+    # literal back edge itself.
     grid_at_start = _empty_grid(5, 5)
-    start_pawn = _piece(Color.WHITE, PieceKind.PAWN, Position(row=4, col=2))
-    grid_at_start[4][2] = start_pawn
+    start_pawn = _piece(Color.WHITE, PieceKind.PAWN, Position(row=3, col=2))
+    grid_at_start[3][2] = start_pawn
     board_at_start = Board(grid_at_start)
     destinations_at_start = PawnRules().legal_destination(board_at_start, start_pawn)
-    assert Position(row=2, col=2) in destinations_at_start
+    assert Position(row=1, col=2) in destinations_at_start
 
 
-def test_pawn_two_step_opening_blocked_by_intervening_piece():
+def test_pawn_on_back_edge_cannot_move_two_steps():
+    """Regression guard for the back-edge-as-start-row bug: the
+    literal back edge (row=board.height-1 for white) must NOT be
+    treated as the pawn start row - only one row in from it is."""
     grid = _empty_grid(5, 5)
     pawn = _piece(Color.WHITE, PieceKind.PAWN, Position(row=4, col=2))
-    blocker = _piece(Color.BLACK, PieceKind.PAWN, Position(row=3, col=2))
     grid[4][2] = pawn
-    grid[3][2] = blocker
     board = Board(grid)
 
     destinations = PawnRules().legal_destination(board, pawn)
 
     assert Position(row=2, col=2) not in destinations
-    assert Position(row=3, col=2) not in destinations
+
+
+def test_pawn_two_step_opening_blocked_by_intervening_piece():
+    grid = _empty_grid(5, 5)
+    pawn = _piece(Color.WHITE, PieceKind.PAWN, Position(row=3, col=2))
+    blocker = _piece(Color.BLACK, PieceKind.PAWN, Position(row=2, col=2))
+    grid[3][2] = pawn
+    grid[2][2] = blocker
+    board = Board(grid)
+
+    destinations = PawnRules().legal_destination(board, pawn)
+
+    assert Position(row=1, col=2) not in destinations
+    assert Position(row=2, col=2) not in destinations
 
 
 def test_pawn_captures_diagonally_forward_only_when_enemy_present():

@@ -55,15 +55,22 @@ def _path_is_blocked(board: Board, source: Position, destination: Position) -> b
 
 
 def _pawn_start_row(board: Board, color: Color) -> int:
-    """The row a color's pawns begin on: white on the board's last row,
-    black on row 0 - mirrors services/move_legality_service.py's
-    identical helper for the domain layer. Computed unconditionally
-    (not just for pawns) since every other _is_legal_shape ignores
-    is_start_row, so gating this on piece kind would add a branch with
-    no behavioral effect."""
+    """The row a color's pawns begin on: one row in from each color's
+    back edge (board.height - 2 for white, 1 for black) - matching
+    standard chess, where pawns start on the second rank, not the back
+    rank shared with the rest of the back-row pieces.
+
+    This was previously board.height - 1 / 0 (the literal back edge),
+    a bug inherited from the legacy
+    services/move_legality_service.py's identical helper and carried
+    over unnoticed during the PieceRules reuse decision - confirmed
+    wrong by the external bootcamp platform's pawn double-step test
+    cases. Computed unconditionally (not just for pawns) since every
+    other _is_legal_shape ignores is_start_row, so gating this on
+    piece kind would add a branch with no behavioral effect."""
     if color == Color.WHITE:
-        return board.height - 1
-    return 0
+        return board.height - 2
+    return 1
 
 
 class PieceRules(ABC):
