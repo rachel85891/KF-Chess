@@ -17,8 +17,10 @@ simple and deterministic within a process, at the cost of being
 process-global mutable state; acceptable here since nothing depends on
 specific id values, only on ids being unique.
 
-Coexists with kungfu_chess.domain.piece.Piece for now - unifying the
-two is a deliberately deferred decision, not an oversight.
+Originally coexisted with the legacy kungfu_chess.domain.piece.Piece
+during the migration; that class has since been retired along with
+the rest of the domain/services/infrastructure/presentation
+architecture, leaving this as the only Piece.
 """
 
 from __future__ import annotations

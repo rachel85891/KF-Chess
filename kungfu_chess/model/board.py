@@ -17,8 +17,10 @@ legality - a rejection reaching Board means an invariant was already
 broken upstream, which should fail loudly rather than be silently
 ignorable.
 
-Coexists with kungfu_chess.domain.board.Board for now - unifying the
-two is a deliberately deferred decision, not an oversight.
+Originally coexisted with the legacy kungfu_chess.domain.board.Board
+during the migration; that class has since been retired along with
+the rest of the domain/services/infrastructure/presentation
+architecture, leaving this as the only Board.
 """
 
 from __future__ import annotations
