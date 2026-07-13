@@ -183,6 +183,67 @@ def test_wait_return_value_unchanged_shape_when_cancellation_occurs():
     assert events[0].destination == Position(row=0, col=2)
 
 
+def test_wait_cancels_both_pieces_on_genuine_path_crossing():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=4))
+    engine.request_move(Position(row=2, col=2), Position(row=0, col=2))
+
+    engine.wait(1000)
+
+    assert board.piece_at(Position(row=0, col=0)) is slider
+    assert board.piece_at(Position(row=2, col=2)) is crosser
+    assert engine.arbiter.is_piece_moving(slider) is False
+    assert engine.arbiter.is_piece_moving(crosser) is False
+    assert len(engine.last_collisions) == 1
+
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is True
+
+
+def test_wait_does_not_expose_collisions_when_none_occurred():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    other = _piece(Color.BLACK, PieceKind.ROOK, Position(row=4, col=0))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    grid[4][0] = other
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=4))
+    engine.request_move(Position(row=2, col=2), Position(row=0, col=2))
+    engine.wait(1000)
+    assert len(engine.last_collisions) == 1
+
+    engine.request_move(Position(row=4, col=0), Position(row=4, col=1))
+    engine.wait(1000)
+
+    assert engine.last_collisions == []
+
+
+def test_wait_return_value_unchanged_shape_when_collision_occurs():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=4))
+    engine.request_move(Position(row=2, col=2), Position(row=0, col=2))
+
+    events = engine.wait(1000)
+
+    assert isinstance(events, list)
+    assert events == []
+
+
 def test_request_move_rejected_with_rule_engine_reason_on_illegal_move():
     grid = _empty_grid(3, 3)
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))

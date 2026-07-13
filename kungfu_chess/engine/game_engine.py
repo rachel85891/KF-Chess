@@ -23,20 +23,22 @@ the Renderer/BoardPrinter (also mentioned in spec.md §9). Renderer
 (§12) and BoardPrinter don't exist yet, so building a snapshot
 interface now would be speculative - deferred, not forgotten.
 
-last_cancellations exposes the CancellationEvents from the most recent
-wait() call (spec.md §2's "Cancelling an action if the target is
-captured before arrival" extension) as a plain instance attribute
-rather than as part of wait()'s return value. This is a deliberate
-trade-off, not an oversight: wait(ms) -> list[ArrivalEvent] is a
-preserved external contract that kungfu_chess/extra/extra_engine.py
+last_cancellations and last_collisions expose the CancellationEvents
+and CollisionEvents from the most recent wait() call (spec.md §2's
+"Cancelling an action if the target is captured before arrival" and
+"Collision between moving pieces" extensions) as plain instance
+attributes rather than as part of wait()'s return value. This is a
+deliberate trade-off, not an oversight: wait(ms) -> list[ArrivalEvent]
+is a preserved external contract that kungfu_chess/extra/extra_engine.py
 depends on byte-for-byte (it does
 `arrival_events = self.engine.wait(ms)` and hands that straight to
 apply_promotions, which iterates it expecting ArrivalEvent objects) -
-changing wait's return shape to also carry cancellations would silently
-break that call without any change to extra/ itself, which is out of
-bounds. Reading last_cancellations right after a wait() call gives
-tests (and future consumers - Renderer, BoardPrinter) a way to observe
-cancellations without touching wait's signature at all.
+changing wait's return shape to also carry cancellations or collisions
+would silently break that call without any change to extra/ itself,
+which is out of bounds. Reading last_cancellations/last_collisions
+right after a wait() call gives tests (and future consumers - Renderer,
+BoardPrinter) a way to observe them without touching wait's signature
+at all.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ from dataclasses import dataclass
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.game_state import GameState
 from kungfu_chess.model.position import Position
-from kungfu_chess.realtime.motion import ArrivalEvent, CancellationEvent
+from kungfu_chess.realtime.motion import ArrivalEvent, CancellationEvent, CollisionEvent
 from kungfu_chess.realtime.real_time_arbiter import RealTimeArbiter
 from kungfu_chess.rules.rule_engine import RuleEngine
 
@@ -64,6 +66,7 @@ class GameEngine:
         self.rule_engine = RuleEngine()
         self.arbiter = RealTimeArbiter()
         self.last_cancellations: list[CancellationEvent] = []
+        self.last_collisions: list[CollisionEvent] = []
 
     def request_move(self, from_cell: Position, to_cell: Position) -> MoveResult:
         if self.state.game_over:
@@ -82,8 +85,9 @@ class GameEngine:
 
     def wait(self, ms: int) -> list[ArrivalEvent]:
         self.state.clock_ms += ms
-        events, cancellations = self.arbiter.advance_time(self.board, self.state.clock_ms)
+        events, cancellations, collisions = self.arbiter.advance_time(self.board, self.state.clock_ms)
         self.last_cancellations = cancellations
+        self.last_collisions = collisions
 
         for event in events:
             if event.king_captured:
