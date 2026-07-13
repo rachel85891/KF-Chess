@@ -113,6 +113,76 @@ def test_wait_settles_two_concurrently_moving_pieces_independently():
     assert engine.arbiter.is_piece_moving(far_rook) is True
 
 
+def test_wait_cancels_pending_motion_whose_target_is_captured():
+    grid = _empty_grid(3, 4)
+    mover = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    target = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=2))
+    assassin = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = mover
+    grid[0][2] = target
+    grid[0][3] = assassin
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=2))
+    engine.request_move(Position(row=0, col=3), Position(row=0, col=2))
+
+    engine.wait(2000)
+
+    assert board.piece_at(Position(row=0, col=0)) is mover
+    assert board.piece_at(Position(row=0, col=2)) is assassin
+    assert engine.arbiter.is_piece_moving(mover) is False
+    assert len(engine.last_cancellations) == 1
+    assert engine.last_cancellations[0].piece is mover
+    assert engine.last_cancellations[0].target is target
+
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is True
+
+
+def test_wait_does_not_expose_cancellations_when_none_occurred():
+    grid = _empty_grid(3, 4)
+    mover = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    target = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=2))
+    assassin = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=3))
+    other = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=0))
+    grid[0][0] = mover
+    grid[0][2] = target
+    grid[0][3] = assassin
+    grid[2][0] = other
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=2))
+    engine.request_move(Position(row=0, col=3), Position(row=0, col=2))
+    engine.wait(2000)
+    assert len(engine.last_cancellations) == 1
+
+    engine.request_move(Position(row=2, col=0), Position(row=2, col=1))
+    engine.wait(1000)
+
+    assert engine.last_cancellations == []
+
+
+def test_wait_return_value_unchanged_shape_when_cancellation_occurs():
+    grid = _empty_grid(3, 4)
+    mover = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    target = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=2))
+    assassin = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = mover
+    grid[0][2] = target
+    grid[0][3] = assassin
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=2))
+    engine.request_move(Position(row=0, col=3), Position(row=0, col=2))
+
+    events = engine.wait(2000)
+
+    assert isinstance(events, list)
+    assert len(events) == 1
+    assert events[0].piece is assassin
+    assert events[0].destination == Position(row=0, col=2)
+
+
 def test_request_move_rejected_with_rule_engine_reason_on_illegal_move():
     grid = _empty_grid(3, 3)
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
