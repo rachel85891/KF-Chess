@@ -19,6 +19,17 @@ guard against here. CancellationEvent is what advance_time reports for
 a motion voided because its target was captured by a different motion's
 arrival first - see RealTimeArbiter.advance_time's docstring for
 exactly how that's detected and ordered.
+
+CollisionEvent is what advance_time reports for a pair of motions
+mutually cancelled because their swept paths occupied the same cell at
+overlapping times (spec.md §2's "Collision between moving pieces"
+extension) - piece_a is always the motion with the lower sequence
+number (the one started first), a fixed, deterministic ordering rather
+than an arbitrary pair. It is deliberately color-blind: the same
+physical-space reasoning as RuleEngine's existing static
+_path_is_blocked check (which also does not exempt same-color pieces),
+just applied to two pieces in transit instead of one mover against the
+static board.
 """
 
 from __future__ import annotations
@@ -56,3 +67,11 @@ class CancellationEvent:
     source: Position
     destination: Position
     target: Piece
+
+
+@dataclass(frozen=True)
+class CollisionEvent:
+    piece_a: Piece
+    piece_b: Piece
+    cell: Position
+    time: int
