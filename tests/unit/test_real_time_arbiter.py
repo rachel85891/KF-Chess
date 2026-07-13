@@ -24,12 +24,13 @@ def test_one_square_move_takes_1000ms():
 
     arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
 
-    events, cancellations = arbiter.advance_time(board, 999)
+    events, cancellations, collisions = arbiter.advance_time(board, 999)
     assert events == []
     assert cancellations == []
+    assert collisions == []
     assert board.piece_at(Position(row=0, col=1)) is None
 
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
 
     assert len(events) == 1
     assert board.piece_at(Position(row=0, col=1)) is rook
@@ -44,10 +45,11 @@ def test_n_square_move_takes_n_times_1000ms():
 
     arbiter.start_motion(rook, Position(row=0, col=3), start_time=0, board=board)
 
-    events, cancellations = arbiter.advance_time(board, 2999)
+    events, cancellations, collisions = arbiter.advance_time(board, 2999)
     assert events == []
     assert cancellations == []
-    events, cancellations = arbiter.advance_time(board, 3000)
+    assert collisions == []
+    events, cancellations, collisions = arbiter.advance_time(board, 3000)
     assert len(events) == 1
     assert board.piece_at(Position(row=0, col=3)) is rook
 
@@ -61,10 +63,11 @@ def test_diagonal_move_uses_chebyshev_distance_not_euclidean():
 
     arbiter.start_motion(bishop, Position(row=3, col=3), start_time=0, board=board)
 
-    events, cancellations = arbiter.advance_time(board, 2999)
+    events, cancellations, collisions = arbiter.advance_time(board, 2999)
     assert events == []
     assert cancellations == []
-    events, cancellations = arbiter.advance_time(board, 3000)
+    assert collisions == []
+    events, cancellations, collisions = arbiter.advance_time(board, 3000)
     assert len(events) == 1
     assert board.piece_at(Position(row=3, col=3)) is bishop
 
@@ -93,11 +96,12 @@ def test_arrival_captures_occupying_piece():
     arbiter = RealTimeArbiter()
 
     arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
 
     assert board.piece_at(Position(row=0, col=1)) is rook
     assert events[0].captured_piece is enemy
     assert cancellations == []
+    assert collisions == []
 
 
 def test_arrival_capturing_king_flags_king_captured():
@@ -110,7 +114,7 @@ def test_arrival_capturing_king_flags_king_captured():
     arbiter = RealTimeArbiter()
 
     arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
 
     assert events[0].king_captured is True
 
@@ -125,7 +129,7 @@ def test_arrival_capturing_non_king_does_not_flag_king_captured():
     arbiter = RealTimeArbiter()
 
     arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
 
     assert events[0].king_captured is False
 
@@ -138,10 +142,11 @@ def test_advance_time_before_arrival_does_nothing():
     arbiter = RealTimeArbiter()
 
     arbiter.start_motion(rook, Position(row=0, col=2), start_time=0, board=board)
-    events, cancellations = arbiter.advance_time(board, 500)
+    events, cancellations, collisions = arbiter.advance_time(board, 500)
 
     assert events == []
     assert cancellations == []
+    assert collisions == []
     assert board.piece_at(Position(row=0, col=0)) is rook
     assert board.piece_at(Position(row=0, col=2)) is None
 
@@ -218,9 +223,10 @@ def test_cancel_motion_removes_it_without_resolving():
 
     assert cancelled is True
     assert arbiter.has_active_motion() is False
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
     assert events == []
     assert cancellations == []
+    assert collisions == []
     assert board.piece_at(Position(row=0, col=0)) is rook
     assert board.piece_at(Position(row=0, col=1)) is None
 
@@ -347,7 +353,7 @@ def test_advance_time_reports_cancellation_event_with_piece_source_destination_a
     arbiter.start_motion(mover, Position(row=0, col=2), start_time=0, board=board)
     arbiter.start_motion(assassin, Position(row=0, col=2), start_time=0, board=board)
 
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
 
     assert len(cancellations) == 1
     cancellation = cancellations[0]
@@ -367,7 +373,7 @@ def test_advance_time_does_not_cancel_motion_whose_target_survives():
     arbiter = RealTimeArbiter()
 
     arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
 
     assert len(events) == 1
     assert events[0].captured_piece is enemy
@@ -386,11 +392,11 @@ def test_advance_time_does_not_cancel_when_target_relocates_without_being_captur
     arbiter.start_motion(mover, Position(row=0, col=2), start_time=0, board=board)
     arbiter.start_motion(target, Position(row=0, col=3), start_time=0, board=board)
 
-    events, cancellations = arbiter.advance_time(board, 1000)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
     assert cancellations == []
     assert board.piece_at(Position(row=0, col=3)) is target
 
-    events, cancellations = arbiter.advance_time(board, 2000)
+    events, cancellations, collisions = arbiter.advance_time(board, 2000)
 
     assert cancellations == []
     assert len(events) == 1
@@ -412,7 +418,7 @@ def test_advance_time_cancels_motion_due_in_the_same_batch_as_the_capturing_arri
     arbiter.start_motion(mover, Position(row=0, col=2), start_time=0, board=board)
     arbiter.start_motion(assassin, Position(row=0, col=2), start_time=0, board=board)
 
-    events, cancellations = arbiter.advance_time(board, 2000)
+    events, cancellations, collisions = arbiter.advance_time(board, 2000)
 
     assert len(events) == 1
     assert events[0].piece is assassin
@@ -440,7 +446,7 @@ def test_advance_time_cancellation_ignores_new_occupant_after_target_gone():
     arbiter.advance_time(board, 1000)
 
     arbiter.start_motion(newcomer, Position(row=0, col=2), start_time=1000, board=board)
-    events, cancellations = arbiter.advance_time(board, 3000)
+    events, cancellations, collisions = arbiter.advance_time(board, 3000)
 
     assert cancellations == []
     assert len(events) == 1
@@ -461,3 +467,234 @@ def test_cancel_motion_resets_piece_state_to_idle():
     arbiter.cancel_motion(motion)
 
     assert rook.state is PieceState.IDLE
+
+
+def test_advance_time_cancels_both_motions_on_genuine_mid_path_crossing():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    slider_motion = arbiter.start_motion(slider, Position(row=0, col=4), start_time=0, board=board)
+    crosser_motion = arbiter.start_motion(crosser, Position(row=0, col=2), start_time=0, board=board)
+
+    arbiter.advance_time(board, 1000)
+
+    assert slider_motion not in arbiter.active_motions()
+    assert crosser_motion not in arbiter.active_motions()
+    assert slider.state is PieceState.IDLE
+    assert crosser.state is PieceState.IDLE
+    assert board.piece_at(Position(row=0, col=0)) is slider
+    assert board.piece_at(Position(row=2, col=2)) is crosser
+
+
+def test_advance_time_reports_collision_event_with_both_pieces_and_cell():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(slider, Position(row=0, col=4), start_time=0, board=board)
+    arbiter.start_motion(crosser, Position(row=0, col=2), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
+
+    assert events == []
+    assert cancellations == []
+    assert len(collisions) == 1
+    collision = collisions[0]
+    assert collision.piece_a is slider
+    assert collision.piece_b is crosser
+    assert collision.cell == Position(row=0, col=2)
+    assert collision.time == 1000
+
+
+def test_advance_time_mutually_cancels_race_to_shared_empty_destination():
+    grid = _empty_grid(3, 5)
+    mover_a = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    mover_b = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=4))
+    grid[0][0] = mover_a
+    grid[0][4] = mover_b
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(mover_a, Position(row=0, col=2), start_time=0, board=board)
+    arbiter.start_motion(mover_b, Position(row=0, col=2), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
+
+    assert events == []
+    assert len(collisions) == 1
+    assert board.piece_at(Position(row=0, col=0)) is mover_a
+    assert board.piece_at(Position(row=0, col=4)) is mover_b
+    assert board.piece_at(Position(row=0, col=2)) is None
+
+
+def test_advance_time_collision_is_color_blind():
+    grid = _empty_grid(3, 5)
+    mover_a = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    mover_b = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=4))
+    grid[0][0] = mover_a
+    grid[0][4] = mover_b
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(mover_a, Position(row=0, col=2), start_time=0, board=board)
+    arbiter.start_motion(mover_b, Position(row=0, col=2), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
+
+    assert len(collisions) == 1
+    assert board.piece_at(Position(row=0, col=2)) is None
+
+
+def test_advance_time_does_not_collide_when_paths_never_share_a_cell():
+    grid = _empty_grid(4, 4)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    bishop = _piece(Color.BLACK, PieceKind.BISHOP, Position(row=3, col=3))
+    grid[0][0] = rook
+    grid[3][3] = bishop
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=2), start_time=0, board=board)
+    arbiter.start_motion(bishop, Position(row=1, col=1), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 2000)
+
+    assert collisions == []
+    assert cancellations == []
+    assert len(events) == 2
+    assert board.piece_at(Position(row=0, col=2)) is rook
+    assert board.piece_at(Position(row=1, col=1)) is bishop
+
+
+def test_advance_time_target_captured_cancellation_still_takes_priority_over_collision_when_no_overlap():
+    grid = _empty_grid(3, 4)
+    mover = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    target = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=2))
+    assassin = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = mover
+    grid[0][2] = target
+    grid[0][3] = assassin
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(mover, Position(row=0, col=2), start_time=0, board=board)
+    arbiter.start_motion(assassin, Position(row=0, col=2), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
+
+    assert collisions == []
+    assert len(events) == 1
+    assert events[0].piece is assassin
+    assert events[0].captured_piece is target
+    assert len(cancellations) == 1
+    assert cancellations[0].piece is mover
+
+
+def test_advance_time_knight_motion_participates_in_shared_destination_collision():
+    grid = _empty_grid(3, 3)
+    knight = _piece(Color.WHITE, PieceKind.KNIGHT, Position(row=0, col=0))
+    rook = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = knight
+    grid[2][2] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(knight, Position(row=2, col=1), start_time=0, board=board)
+    arbiter.start_motion(rook, Position(row=2, col=1), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
+
+    assert events == []
+    assert len(collisions) == 1
+    assert board.piece_at(Position(row=0, col=0)) is knight
+    assert board.piece_at(Position(row=2, col=2)) is rook
+    assert board.piece_at(Position(row=2, col=1)) is None
+
+
+def test_advance_time_knight_motion_is_exempt_from_intermediate_path_collision():
+    grid = _empty_grid(3, 4)
+    knight = _piece(Color.WHITE, PieceKind.KNIGHT, Position(row=0, col=0))
+    rook = _piece(Color.BLACK, PieceKind.ROOK, Position(row=1, col=1))
+    grid[0][0] = knight
+    grid[1][1] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(knight, Position(row=2, col=1), start_time=0, board=board)
+    arbiter.start_motion(rook, Position(row=1, col=3), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 2000)
+
+    assert collisions == []
+    assert len(events) == 2
+    assert board.piece_at(Position(row=2, col=1)) is knight
+    assert board.piece_at(Position(row=1, col=3)) is rook
+
+
+def test_advance_time_collision_detection_runs_before_arrival_resolution_in_the_same_call():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(slider, Position(row=0, col=4), start_time=0, board=board)
+    arbiter.start_motion(crosser, Position(row=0, col=2), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 4000)
+
+    assert events == []
+    assert len(collisions) == 1
+    assert board.piece_at(Position(row=0, col=0)) is slider
+    assert board.piece_at(Position(row=2, col=2)) is crosser
+
+
+def test_advance_time_three_way_overlap_resolves_deterministically():
+    grid = _empty_grid(3, 5)
+    first = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    second = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=4))
+    third = _piece(Color.WHITE, PieceKind.BISHOP, Position(row=2, col=0))
+    grid[0][0] = first
+    grid[0][4] = second
+    grid[2][0] = third
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(first, Position(row=0, col=2), start_time=0, board=board)
+    arbiter.start_motion(second, Position(row=0, col=2), start_time=0, board=board)
+    arbiter.start_motion(third, Position(row=0, col=2), start_time=0, board=board)
+
+    events, cancellations, collisions = arbiter.advance_time(board, 2000)
+
+    assert len(collisions) == 1
+    assert board.piece_at(Position(row=0, col=0)) is first
+    assert board.piece_at(Position(row=0, col=4)) is second
+    assert len(events) == 1
+    assert events[0].piece is third
+    assert board.piece_at(Position(row=0, col=2)) is third
+
+
+def test_advance_time_no_collisions_or_cancellations_on_ordinary_single_motion_arrival():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
+    events, cancellations, collisions = arbiter.advance_time(board, 1000)
+
+    assert len(events) == 1
+    assert cancellations == []
+    assert collisions == []
