@@ -71,3 +71,9 @@ def test_two_pieces_with_identical_fields_but_different_ids_are_not_equal():
 def test_piece_id_cannot_be_passed_via_constructor():
     with pytest.raises(TypeError):
         Piece(id=1, color=Color.WHITE, kind=PieceKind.PAWN, cell=Position(row=0, col=0))
+
+
+def test_piece_available_at_ms_defaults_to_zero():
+    piece = Piece(color=Color.WHITE, kind=PieceKind.ROOK, cell=Position(row=0, col=0))
+
+    assert piece.available_at_ms == 0

@@ -57,3 +57,4 @@ class Piece:
     kind: PieceKind
     cell: Position
     state: PieceState = PieceState.IDLE
+    available_at_ms: int = 0
