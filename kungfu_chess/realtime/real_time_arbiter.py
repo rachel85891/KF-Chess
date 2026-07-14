@@ -89,6 +89,17 @@ that go on to mark the piece CAPTURED themselves, e.g. JUMP's
 interception, simply overwrite this immediately after - this fix does
 not change their observed behavior, only closes a latent gap that was
 invisible while they were the only caller.)
+
+advance_time's arrival branch also sets motion.piece.available_at_ms =
+clock_ms + COOLDOWN_MS (spec.md §2's "Cooldown after a move" extension)
+- a fixed, kind- and distance-independent grace period during which
+GameEngine.request_move will refuse to select the piece as a source
+again, checked there against GameState.clock_ms. This is deliberately
+absent from cancel_motion: a cancelled or collided motion's piece never
+actually completed a move - it reverts to IDLE at its original cell
+with nothing having happened - so only a genuine arrival, which is what
+"a piece that just finished a motion" in spec.md means, starts a
+cooldown.
 """
 
 from __future__ import annotations
@@ -105,6 +116,7 @@ from kungfu_chess.rules.shapes import path_cells
 CELL_SIZE = 100
 PIECE_SPEED = 100
 MS_PER_SQUARE = int(CELL_SIZE / PIECE_SPEED * 1000)
+COOLDOWN_MS = 1000
 
 
 def _chebyshev_distance(source: Position, destination: Position) -> int:
@@ -215,6 +227,7 @@ class RealTimeArbiter:
 
             board.move_piece(motion.source, motion.destination)
             motion.piece.state = PieceState.IDLE
+            motion.piece.available_at_ms = clock_ms + COOLDOWN_MS
 
             events.append(
                 ArrivalEvent(
