@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.extra.extra_engine import ExtraEngine
+from kungfu_chess.extra.jump import JUMP_COOLDOWN_MS
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind, PieceState
 from kungfu_chess.model.position import Position
+from kungfu_chess.realtime.real_time_arbiter import COOLDOWN_MS
 from kungfu_chess.texttests.script_parser import CommandKind, ScriptParser
 
 
@@ -100,3 +102,77 @@ def test_core_script_parser_still_recognizes_exactly_three_commands():
     assert parser.parse_line("print board").kind is CommandKind.PRINT_BOARD
     assert parser.parse_line("jump 10 20") is None
     assert set(CommandKind) == {CommandKind.CLICK, CommandKind.WAIT, CommandKind.PRINT_BOARD}
+
+
+def test_jump_landing_sets_available_at_ms_to_land_time_plus_jump_cooldown():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    extra_engine.wait(1000)
+
+    assert JUMP_COOLDOWN_MS != COOLDOWN_MS
+    assert rook.available_at_ms == 1000 + JUMP_COOLDOWN_MS
+
+
+def test_jump_landing_via_interception_also_sets_available_at_ms_on_defender():
+    grid = _empty_grid(4, 4)
+    defender = _piece(Color.WHITE, PieceKind.PAWN, Position(row=0, col=0))
+    attacker = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = defender
+    grid[0][3] = attacker
+    board = Board(grid)
+    engine = GameEngine(board)
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    engine.request_move(Position(row=0, col=3), Position(row=0, col=0))
+
+    extra_engine.wait(1000)
+
+    assert attacker.state is PieceState.CAPTURED
+    assert defender.available_at_ms == 1000 + JUMP_COOLDOWN_MS
+
+
+def test_request_move_rejected_during_jump_cooldown_and_accepted_after():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    engine = GameEngine(board)
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    extra_engine.wait(1000)
+
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is False
+    assert result.reason == "cooldown_active"
+
+    extra_engine.wait(JUMP_COOLDOWN_MS)
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+
+    assert result.is_accepted is True
+
+
+def test_request_jump_rejected_during_post_landing_cooldown_and_accepted_after():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    extra_engine.wait(1000)
+    assert extra_engine.jumps.is_airborne(rook.id) is False
+
+    accepted = extra_engine.request_jump(Position(row=0, col=0))
+    assert accepted is False
+
+    extra_engine.wait(JUMP_COOLDOWN_MS)
+    accepted = extra_engine.request_jump(Position(row=0, col=0))
+
+    assert accepted is True

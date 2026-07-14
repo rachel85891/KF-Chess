@@ -3,8 +3,9 @@ from __future__ import annotations
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
-from kungfu_chess.model.piece import Piece, PieceKind
+from kungfu_chess.model.piece import Piece, PieceKind, PieceState
 from kungfu_chess.model.position import Position
+from kungfu_chess.realtime.real_time_arbiter import COOLDOWN_MS
 
 
 def _empty_grid(rows: int, cols: int) -> list[list[None]]:
@@ -320,3 +321,123 @@ def test_request_move_rejected_after_game_over_even_if_otherwise_legal():
 
     assert result.is_accepted is False
     assert result.reason == "game_over"
+
+
+def test_request_move_rejected_during_cooldown_after_arrival():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    engine.wait(1000)
+
+    result = engine.request_move(Position(row=0, col=1), Position(row=0, col=2))
+
+    assert result.is_accepted is False
+    assert result.reason == "cooldown_active"
+
+
+def test_request_move_accepted_once_cooldown_elapses():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    engine.wait(1000)
+    engine.request_move(Position(row=0, col=1), Position(row=0, col=2))
+    assert engine.arbiter.is_piece_moving(rook) is False
+
+    engine.wait(COOLDOWN_MS)
+    result = engine.request_move(Position(row=0, col=1), Position(row=0, col=2))
+
+    assert result.is_accepted is True
+
+
+def test_request_move_accepted_exactly_at_cooldown_boundary():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    engine.wait(1000)
+    assert rook.available_at_ms == 1000 + COOLDOWN_MS
+
+    engine.wait(COOLDOWN_MS)
+    result = engine.request_move(Position(row=0, col=1), Position(row=0, col=2))
+
+    assert engine.state.clock_ms == rook.available_at_ms
+    assert result.is_accepted is True
+
+
+def test_request_move_first_ever_move_is_never_gated_by_cooldown():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    engine = GameEngine(board)
+
+    assert rook.available_at_ms == 0
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+
+    assert result.is_accepted is True
+
+
+def test_cooldown_piece_can_still_be_captured_as_target():
+    grid = _empty_grid(3, 4)
+    mover = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    attacker = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=1))
+    grid[0][0] = mover
+    grid[2][1] = attacker
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    engine.wait(1000)
+    assert mover.available_at_ms == 1000 + COOLDOWN_MS
+
+    result = engine.request_move(Position(row=2, col=1), Position(row=0, col=1))
+    assert result.is_accepted is True
+    engine.wait(2000)
+
+    assert mover.state is PieceState.CAPTURED
+    assert board.piece_at(Position(row=0, col=1)) is attacker
+
+
+def test_request_move_immediately_reaccepted_after_cancellation_no_cooldown_applied():
+    grid = _empty_grid(3, 4)
+    mover = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    target = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=2))
+    assassin = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = mover
+    grid[0][2] = target
+    grid[0][3] = assassin
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=2))
+    engine.request_move(Position(row=0, col=3), Position(row=0, col=2))
+
+    engine.wait(2000)
+
+    assert mover.available_at_ms == 0
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is True
+
+
+def test_request_move_immediately_reaccepted_after_collision_no_cooldown_applied():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    board = Board(grid)
+    engine = GameEngine(board)
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=4))
+    engine.request_move(Position(row=2, col=2), Position(row=0, col=2))
+
+    engine.wait(1000)
+
+    assert slider.available_at_ms == 0
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is True

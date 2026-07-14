@@ -4,7 +4,7 @@ from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind, PieceState
 from kungfu_chess.model.position import Position
-from kungfu_chess.realtime.real_time_arbiter import RealTimeArbiter
+from kungfu_chess.realtime.real_time_arbiter import COOLDOWN_MS, RealTimeArbiter
 
 
 def _empty_grid(rows: int, cols: int) -> list[list[None]]:
@@ -698,3 +698,92 @@ def test_advance_time_no_collisions_or_cancellations_on_ordinary_single_motion_a
     assert len(events) == 1
     assert cancellations == []
     assert collisions == []
+
+
+def test_advance_time_sets_available_at_ms_on_genuine_arrival():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
+    arbiter.advance_time(board, 1000)
+
+    assert rook.available_at_ms == 1000 + COOLDOWN_MS
+
+
+def test_advance_time_available_at_ms_is_fixed_regardless_of_distance():
+    grid = _empty_grid(3, 5)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=3), start_time=0, board=board)
+    arbiter.advance_time(board, 3000)
+
+    assert rook.available_at_ms == 3000 + COOLDOWN_MS
+
+
+def test_advance_time_does_not_set_available_at_ms_before_arrival():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
+    arbiter.advance_time(board, 999)
+
+    assert rook.available_at_ms == 0
+
+
+def test_cancel_motion_does_not_set_available_at_ms():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+    motion = arbiter.start_motion(rook, Position(row=0, col=1), start_time=0, board=board)
+
+    arbiter.cancel_motion(motion)
+
+    assert rook.available_at_ms == 0
+
+
+def test_advance_time_target_captured_cancellation_does_not_set_available_at_ms():
+    grid = _empty_grid(3, 4)
+    mover = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    target = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=2))
+    assassin = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = mover
+    grid[0][2] = target
+    grid[0][3] = assassin
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(mover, Position(row=0, col=2), start_time=0, board=board)
+    arbiter.start_motion(assassin, Position(row=0, col=2), start_time=0, board=board)
+
+    arbiter.advance_time(board, 1000)
+
+    assert mover.available_at_ms == 0
+
+
+def test_advance_time_collision_does_not_set_available_at_ms():
+    grid = _empty_grid(5, 5)
+    slider = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    crosser = _piece(Color.BLACK, PieceKind.ROOK, Position(row=2, col=2))
+    grid[0][0] = slider
+    grid[2][2] = crosser
+    board = Board(grid)
+    arbiter = RealTimeArbiter()
+
+    arbiter.start_motion(slider, Position(row=0, col=4), start_time=0, board=board)
+    arbiter.start_motion(crosser, Position(row=0, col=2), start_time=0, board=board)
+
+    arbiter.advance_time(board, 1000)
+
+    assert slider.available_at_ms == 0
+    assert crosser.available_at_ms == 0
