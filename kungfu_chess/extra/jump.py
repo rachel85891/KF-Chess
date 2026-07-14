@@ -41,6 +41,20 @@ Both destroy the attacker and leave the defender untouched. Reproducing
 either required one small additive hook on RealTimeArbiter,
 cancel_motion(motion) - see its docstring for why it was unavoidable;
 nothing else about RealTimeArbiter's timing/resolution logic changed.
+
+Landing - the unconditional `del self._airborne[piece_id]` below, which
+fires whether or not an attacking_motion was found, since an
+interception destroys the attacker, not the defender - also sets
+entry.piece.available_at_ms = entry.land_time + JUMP_COOLDOWN_MS
+(spec.md §2's "Cooldown after a move" extension, extended here to
+JUMP). This reuses Piece.available_at_ms and GameEngine.request_move's
+existing cooldown_active guard verbatim - that guard only reads
+state.clock_ms against the field, not who set it, so no change to
+request_move was needed. It uses entry.land_time rather than the
+resolve_due call's clock_ms, unlike core's clock_ms-based convention in
+RealTimeArbiter.advance_time: land_time is the piece's actual scheduled
+landing instant, so the cooldown window doesn't get inflated just
+because resolve_due happened to be reached late via a large wait().
 """
 
 from __future__ import annotations
@@ -54,6 +68,7 @@ from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE, RealTimeArbiter
 
 JUMP_DURATION_MS = MS_PER_SQUARE
+JUMP_COOLDOWN_MS = 500
 
 
 @dataclass(frozen=True)
@@ -131,6 +146,10 @@ class JumpTracker:
                     InterceptionEvent(attacker=attacking_motion.piece, defender=entry.piece, cell=entry.piece.cell)
                 )
 
+            # land_time, not clock_ms: reflects the piece's actual scheduled
+            # landing instant, avoiding cooldown inflation when resolve_due
+            # is reached late via a large wait().
+            entry.piece.available_at_ms = entry.land_time + JUMP_COOLDOWN_MS
             del self._airborne[piece_id]
 
         return events
