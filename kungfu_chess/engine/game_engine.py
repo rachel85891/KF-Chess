@@ -39,6 +39,14 @@ which is out of bounds. Reading last_cancellations/last_collisions
 right after a wait() call gives tests (and future consumers - Renderer,
 BoardPrinter) a way to observe them without touching wait's signature
 at all.
+
+request_move's cooldown_active guard (spec.md §2's "Cooldown after a
+move" extension) checks state.clock_ms against piece.available_at_ms,
+a timestamp RealTimeArbiter.advance_time sets only on a genuine
+arrival (see its own docstring) - this guard doesn't care who set that
+timestamp or when, which is exactly what lets extra/'s JUMP mechanic
+(kungfu_chess/extra/jump.py) reuse it for a post-landing cooldown with
+zero changes here.
 """
 
 from __future__ import annotations
@@ -75,6 +83,8 @@ class GameEngine:
         piece = self.board.piece_at(from_cell)
         if piece is not None and self.arbiter.is_piece_moving(piece):
             return MoveResult(is_accepted=False, reason="motion_in_progress")
+        if piece is not None and self.state.clock_ms < piece.available_at_ms:
+            return MoveResult(is_accepted=False, reason="cooldown_active")
 
         validation = self.rule_engine.validate_move(self.board, from_cell, to_cell)
         if not validation.is_valid:
