@@ -77,18 +77,77 @@ def default_event_ordering_policy(events: Sequence[object]) -> Sequence[object]:
 
 class GameEventPublisher:
     def __init__(self, engine: GameEngine, ordering_policy: EventOrderingPolicy = default_event_ordering_policy):
+        """Wrap an existing GameEngine (Decorator/composition, per the
+        module docstring) so its outputs can also be published as
+        client-layer events to subscribed Observers.
+
+        Args:
+            engine: The GameEngine instance to wrap. Never modified,
+                subclassed, or replaced - all calls delegate to it.
+            ordering_policy: Callable applied to the batch of events
+                built inside wait() before publishing them (see
+                default_event_ordering_policy and client_spec.md
+                §10). Defaults to FIFO/identity; injectable (DIP) so a
+                caller can supply a different policy without
+                GameEventPublisher itself changing.
+        """
+
         self._engine = engine
         self._ordering_policy = ordering_policy
         self._observers: List[Observer] = []
 
     def subscribe(self, observer: Observer) -> None:
+        """Register an Observer to receive every event this publisher
+        publishes from now on.
+
+        Args:
+            observer: Any object implementing Observer's single
+                on_event(event) method. No unsubscribe is provided -
+                not needed yet by any current caller.
+
+        Returns:
+            None.
+        """
+
         self._observers.append(observer)
 
     def _notify(self, event: object) -> None:
+        """Deliver one event to every currently-subscribed Observer,
+        in subscription order.
+
+        Args:
+            event: The event instance to deliver (one of the frozen
+                dataclasses in game_events.py).
+
+        Returns:
+            None.
+        """
+
         for observer in self._observers:
             observer.on_event(event)
 
     def request_move(self, from_cell: Position, to_cell: Position) -> MoveResult:
+        """Request a move via the wrapped GameEngine, and publish
+        MoveAccepted or MoveRejected based on its real MoveResult.
+
+        Args:
+            from_cell: The Position the moving piece currently
+                occupies.
+            to_cell: The Position it is being requested to move to.
+
+        Returns:
+            The original MoveResult from GameEngine.request_move,
+            unchanged - callers that only use the return value (not
+            events) keep working exactly as if GameEventPublisher
+            weren't in the call path at all.
+
+        Raises:
+            MotionNotFoundError: See this module's docstring and
+                MotionNotFoundError's own docstring - guards an
+                invariant that always holds today, not a normal,
+                user-triggerable condition.
+        """
+
         piece = self._engine.board.piece_at(from_cell)
 
         result = self._engine.request_move(from_cell, to_cell)
@@ -117,6 +176,22 @@ class GameEventPublisher:
         return result
 
     def wait(self, ms: int) -> List[ArrivalEvent]:
+        """Advance the wrapped GameEngine's clock by ms, and publish a
+        PieceArrived (and a GameOver, if a king was captured) for each
+        resulting ArrivalEvent, in the order this publisher's
+        EventOrderingPolicy produces.
+
+        Args:
+            ms: Milliseconds of logical time to advance, forwarded
+                as-is to GameEngine.wait.
+
+        Returns:
+            The original list[ArrivalEvent] from GameEngine.wait,
+            unchanged - callers that only use the return value (not
+            events) keep working exactly as if GameEventPublisher
+            weren't in the call path at all.
+        """
+
         arrival_events = self._engine.wait(ms)
 
         pending: List[object] = []

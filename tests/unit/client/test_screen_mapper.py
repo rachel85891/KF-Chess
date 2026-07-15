@@ -1,4 +1,6 @@
-from kungfu_chess.client.input.screen_mapper import ImagePosition, ScreenToImageMapper
+import pytest
+
+from kungfu_chess.client.input.screen_mapper import ImagePosition, InvalidWindowScaleError, ScreenToImageMapper
 
 
 def test_identity_when_origin_zero_and_scale_one():
@@ -53,3 +55,25 @@ def test_different_instances_can_use_different_origin_and_scale():
 
     assert result_a == ImagePosition(x=10.0, y=10.0)
     assert result_b == ImagePosition(x=0.0, y=-20.0)
+
+
+def test_zero_window_scale_raises_invalid_window_scale_error():
+    with pytest.raises(InvalidWindowScaleError) as exc_info:
+        ScreenToImageMapper(window_origin=(0, 0), window_scale=0)
+
+    assert "0" in str(exc_info.value)
+
+
+def test_negative_window_scale_raises_invalid_window_scale_error():
+    with pytest.raises(InvalidWindowScaleError) as exc_info:
+        ScreenToImageMapper(window_origin=(0, 0), window_scale=-2.5)
+
+    assert "-2.5" in str(exc_info.value)
+
+
+def test_valid_positive_window_scale_still_constructs_and_converts_correctly():
+    mapper = ScreenToImageMapper(window_origin=(0, 0), window_scale=2.5)
+
+    result = mapper.to_image(50, 25)
+
+    assert result == ImagePosition(x=20.0, y=10.0)
