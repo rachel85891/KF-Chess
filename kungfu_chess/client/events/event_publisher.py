@@ -18,6 +18,19 @@ publish_jump_accepted() below is therefore a deliberate stub: it lets a
 future stage publish a real JumpAccepted once ExtraEngine exposes
 enough to fill it in honestly, without GameEventPublisher's public
 shape needing to change again then.
+
+GameEventPublisherError/MotionNotFoundError follow the same
+one-class-per-failure-mode convention as
+kungfu_chess/model/board.py's BoardError and the client animation
+layer's StateConfigError hierarchy: request_move's internal lookup for
+the just-started Motion (see its own comment) relies on an invariant
+that always holds today - GameEngine.request_move calls
+arbiter.start_motion for every accepted move, so the Motion is always
+present immediately afterward - but a bare `next(...)` with no default
+would let a raw StopIteration escape if that invariant were ever
+violated, which is a confusing, unnamed failure for any caller to
+debug. Failing loudly with a named, specific exception instead costs
+nothing on the (currently unreachable) happy-invariant path.
 """
 
 from __future__ import annotations
@@ -34,6 +47,18 @@ from kungfu_chess.client.events.game_events import (
 from kungfu_chess.engine.game_engine import GameEngine, MoveResult
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.motion import ArrivalEvent
+
+
+class GameEventPublisherError(Exception):
+    """Base class for all GameEventPublisher errors, matching
+    BoardError/StateConfigError's convention: catchable via this one
+    base, or via a specific subclass below."""
+
+
+class MotionNotFoundError(GameEventPublisherError):
+    """request_move's internal Motion lookup found no active motion
+    for a piece GameEngine just reported as accepted - an invariant
+    violation, not a StopIteration."""
 
 
 class Observer(Protocol):
@@ -72,7 +97,12 @@ class GameEventPublisher:
             # piece.cell only updates on arrival (RealTimeArbiter), so
             # the just-started Motion for this exact piece is still
             # findable by identity right after request_move returns.
-            motion = next(m for m in self._engine.arbiter.active_motions() if m.piece is piece)
+            motion = next((m for m in self._engine.arbiter.active_motions() if m.piece is piece), None)
+            if motion is None:
+                raise MotionNotFoundError(
+                    f"no active motion found for piece_id={piece.id} after an accepted move "
+                    f"{from_cell} -> {to_cell}"
+                )
             self._notify(
                 MoveAccepted(
                     piece_id=piece.id,

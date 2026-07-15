@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from kungfu_chess.client.events.event_publisher import GameEventPublisher
+import pytest
+
+from kungfu_chess.client.events.event_publisher import GameEventPublisher, MotionNotFoundError
 from kungfu_chess.client.events.game_events import GameOver, MoveAccepted, MoveRejected, PieceArrived
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.model.board import Board
@@ -213,3 +215,24 @@ def test_wait_return_value_is_the_original_arrival_events_list_unchanged():
     assert len(events) == 1
     assert events[0].piece is rook
     assert events[0].destination == Position(row=0, col=1)
+
+
+def test_request_move_raises_motion_not_found_error_when_no_matching_motion_exists():
+    # Under normal operation GameEngine.request_move always calls
+    # arbiter.start_motion for an accepted move, so this branch is
+    # unreachable through the public API alone - it guards an
+    # invariant, not a normal user-triggerable condition. Forced here
+    # by monkeypatching active_motions() to simulate that invariant
+    # being violated, without touching GameEngine/RealTimeArbiter
+    # themselves.
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    engine.arbiter.active_motions = lambda: ()
+    publisher = GameEventPublisher(engine)
+
+    with pytest.raises(MotionNotFoundError) as exc_info:
+        publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
+
+    assert f"piece_id={rook.id}" in str(exc_info.value)
