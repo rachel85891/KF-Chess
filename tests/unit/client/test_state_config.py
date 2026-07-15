@@ -8,7 +8,10 @@ import pytest
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.animation.state_config import (
     PIECES_ROOT,
-    StateConfigError,
+    ConfigFileNotFoundError,
+    InvalidConfigJsonError,
+    MissingConfigFieldError,
+    UnknownAnimationStateError,
     load_piece_states,
     load_state_config,
 )
@@ -45,10 +48,10 @@ def test_sprite_paths_collected_per_state_are_non_empty_and_sorted():
         assert all(p.is_file() for p in config.sprite_paths), state
 
 
-def test_missing_field_in_config_json_raises_clear_error():
+def test_missing_field_in_config_json_raises_missing_config_field_error():
     broken_path = FIXTURES_ROOT / "broken_missing_field" / "config.json"
 
-    with pytest.raises(StateConfigError) as exc_info:
+    with pytest.raises(MissingConfigFieldError) as exc_info:
         load_state_config(broken_path)
 
     message = str(exc_info.value)
@@ -56,20 +59,31 @@ def test_missing_field_in_config_json_raises_clear_error():
     assert "frames_per_sec" in message
 
 
-def test_malformed_json_raises_clear_error():
+def test_malformed_json_raises_invalid_config_json_error():
     broken_path = FIXTURES_ROOT / "broken_invalid_json" / "config.json"
 
-    with pytest.raises(StateConfigError) as exc_info:
+    with pytest.raises(InvalidConfigJsonError) as exc_info:
         load_state_config(broken_path)
 
     message = str(exc_info.value)
     assert str(broken_path) in message
 
 
-def test_missing_config_file_raises_clear_error():
+def test_missing_config_file_raises_config_file_not_found_error():
     missing_path = FIXTURES_ROOT / "does_not_exist" / "config.json"
 
-    with pytest.raises(StateConfigError) as exc_info:
+    with pytest.raises(ConfigFileNotFoundError) as exc_info:
         load_state_config(missing_path)
 
     assert str(missing_path) in str(exc_info.value)
+
+
+def test_unknown_next_state_raises_unknown_animation_state_error():
+    broken_path = FIXTURES_ROOT / "broken_unknown_next_state" / "config.json"
+
+    with pytest.raises(UnknownAnimationStateError) as exc_info:
+        load_state_config(broken_path)
+
+    message = str(exc_info.value)
+    assert str(broken_path) in message
+    assert "not_a_real_state" in message

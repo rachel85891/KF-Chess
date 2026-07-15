@@ -41,9 +41,36 @@ STATES = tuple(AnimationState)
 
 
 class StateConfigError(Exception):
-    """Raised when a config.json is missing, malformed, or missing a
-    required field - always names the offending path so the failure is
-    diagnosable without a traceback dive."""
+    """Base class for all client-side animation-config errors, per the
+    same one-class-per-failure-mode convention as
+    kungfu_chess/model/board.py's BoardError. Always catchable via this
+    base; catch a specific subclass below to distinguish failure modes
+    without parsing message text."""
+
+
+class ConfigFileNotFoundError(StateConfigError):
+    """config.json itself does not exist at the expected path."""
+
+
+class InvalidConfigJsonError(StateConfigError):
+    """config.json exists but is not valid JSON."""
+
+
+class MissingConfigSectionError(StateConfigError):
+    """The top-level "physics" or "graphics" section is absent."""
+
+
+class MissingConfigFieldError(StateConfigError):
+    """A required field within an existing section is absent."""
+
+
+class UnknownAnimationStateError(StateConfigError):
+    """physics.next_state_when_finished does not match any
+    AnimationState value."""
+
+
+class MissingSpritesDirectoryError(StateConfigError):
+    """The sibling sprites/ directory next to config.json is absent."""
 
 
 @dataclass(frozen=True)
@@ -67,14 +94,14 @@ class StateConfig:
 
 def _require(section: dict, key: str, *, section_name: str, path: Path) -> object:
     if key not in section:
-        raise StateConfigError(f"{path}: missing required field '{section_name}.{key}'")
+        raise MissingConfigFieldError(f"{path}: missing required field '{section_name}.{key}'")
     return section[key]
 
 
 def _sprite_paths_for(config_path: Path) -> Tuple[Path, ...]:
     sprites_dir = config_path.parent / "sprites"
     if not sprites_dir.is_dir():
-        raise StateConfigError(f"{config_path}: missing sibling sprites/ directory ({sprites_dir})")
+        raise MissingSpritesDirectoryError(f"{config_path}: missing sibling sprites/ directory ({sprites_dir})")
     return tuple(sorted(sprites_dir.iterdir(), key=lambda p: p.name))
 
 
@@ -87,17 +114,17 @@ def load_state_config(path: Path) -> StateConfig:
     try:
         raw_text = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
-        raise StateConfigError(f"{path}: config.json not found") from exc
+        raise ConfigFileNotFoundError(f"{path}: config.json not found") from exc
 
     try:
         raw = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise StateConfigError(f"{path}: invalid JSON ({exc})") from exc
+        raise InvalidConfigJsonError(f"{path}: invalid JSON ({exc})") from exc
 
     if "physics" not in raw:
-        raise StateConfigError(f"{path}: missing required section 'physics'")
+        raise MissingConfigSectionError(f"{path}: missing required section 'physics'")
     if "graphics" not in raw:
-        raise StateConfigError(f"{path}: missing required section 'graphics'")
+        raise MissingConfigSectionError(f"{path}: missing required section 'graphics'")
 
     physics_raw = raw["physics"]
     graphics_raw = raw["graphics"]
@@ -106,7 +133,7 @@ def load_state_config(path: Path) -> StateConfig:
     try:
         next_state = AnimationState(next_state_raw)
     except ValueError as exc:
-        raise StateConfigError(
+        raise UnknownAnimationStateError(
             f"{path}: physics.next_state_when_finished has unknown value {next_state_raw!r}"
         ) from exc
 
