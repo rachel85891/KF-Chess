@@ -72,6 +72,19 @@ class InvalidAdvanceDurationError(PieceAnimatorError):
     """advance() was called with a negative delta_ms."""
 
 
+class EmptyStateSpritesError(PieceAnimatorError):
+    """One or more of the `states` dict's StateConfig entries has an
+    empty sprite_paths tuple. Unlike UnknownTransitionTargetError's
+    already-guarded, structurally-unreachable case, this one is a real
+    possibility: Stage 4's _sprite_paths_for
+    (kungfu_chess/client/animation/state_config.py) only guarantees
+    the sprites/ directory exists, not that it is non-empty - a
+    malformed asset set (an emptied-out sprites/ folder) would
+    otherwise reach advance()'s modulo-by-frame_count or
+    current_sprite_path()'s indexing and crash with a bare
+    ZeroDivisionError/IndexError far from the actual bad data."""
+
+
 class PieceAnimator:
     """Per-piece animation state machine: tracks which of the 5
     AnimationStates a single piece is currently displaying, advances
@@ -109,6 +122,14 @@ class PieceAnimator:
                 first time a missing state is actually needed) so a
                 caller learns about a bad asset set immediately at
                 construction, not at some arbitrary later frame.
+            EmptyStateSpritesError: If any present StateConfig has an
+                empty sprite_paths tuple - checked eagerly here for
+                the same reason as IncompleteAnimationStatesError
+                above, and specifically because Stage 4's
+                _sprite_paths_for only guarantees the sprites/
+                directory exists, not that it is non-empty, so this is
+                a real, reachable malformed-asset case, not a
+                theoretical one.
         """
 
         missing = [state for state in AnimationState if state not in states]
@@ -116,6 +137,13 @@ class PieceAnimator:
             missing_names = [state.value for state in missing]
             raise IncompleteAnimationStatesError(
                 f"piece_id={piece_id}: states dict is missing required AnimationState(s) {missing_names}"
+            )
+
+        empty = [state for state in AnimationState if len(states[state].sprite_paths) == 0]
+        if empty:
+            empty_names = [state.value for state in empty]
+            raise EmptyStateSpritesError(
+                f"piece_id={piece_id}: states with empty sprite_paths {empty_names}"
             )
 
         self.piece_id = piece_id

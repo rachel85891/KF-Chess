@@ -6,6 +6,7 @@ import pytest
 
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.animation.piece_animator import (
+    EmptyStateSpritesError,
     IncompleteAnimationStatesError,
     InvalidAdvanceDurationError,
     PieceAnimator,
@@ -168,6 +169,17 @@ def test_constructor_raises_incomplete_animation_states_error_naming_missing_sta
     assert "piece_id=7" in message
     assert "jump" in message
     assert "short_rest" in message
+
+
+def test_constructor_raises_empty_state_sprites_error_naming_the_offending_state():
+    states = _all_states({AnimationState.MOVE: _make_state_config(0, 10, True, AnimationState.IDLE)})
+
+    with pytest.raises(EmptyStateSpritesError) as exc_info:
+        PieceAnimator(piece_id=9, states=states)
+
+    message = str(exc_info.value)
+    assert "piece_id=9" in message
+    assert "move" in message
 
 
 def test_advance_raises_invalid_advance_duration_error_for_negative_delta():
