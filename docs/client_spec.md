@@ -263,6 +263,13 @@ to UI":
 - **Decided:** `jump` is linked to the existing `extra/jump.py` logic
   (currently via `ExtraEngine`), see §5. `GameEventPublisher` must
   expose a `JumpAccepted` event separate from `MoveAccepted`.
+- **Documented, accepted gap:** `state_config.py`'s `_require` does not
+  validate that `frames_per_sec > 0`. A `frames_per_sec` of `0` does
+  not crash anything (`PieceAnimator.advance()`'s `frames_elapsed`
+  stays `0` forever), but silently "freezes" that state's animation on
+  frame 0 instead of erroring. A real vendored asset would never have
+  this, so it is left as a documented, accepted gap rather than an
+  urgent fix.
 
 ## 11. Integrating Animation Assets from the CTD26 Repo (Asset Import)
 

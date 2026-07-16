@@ -81,6 +81,14 @@ class PhysicsConfig:
 
 @dataclass(frozen=True)
 class GraphicsConfig:
+    """frames_per_sec is intentionally NOT validated to be > 0 here or
+    in _require below (documented, accepted gap - see client_spec.md
+    §10): a real vendored asset never has frames_per_sec=0, and a 0
+    value doesn't crash anything downstream - PieceAnimator.advance()
+    simply keeps frames_elapsed at 0 forever, silently freezing that
+    state's animation on frame 0 instead of erroring. Left as a known
+    gap rather than an urgent fix."""
+
     frames_per_sec: int
     is_loop: bool
 
