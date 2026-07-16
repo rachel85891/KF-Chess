@@ -187,6 +187,10 @@ class Img:
 
         region = self._array[y : y + sprite_h, x : x + sprite_w]
 
+        # Documented, accepted gap (client_spec.md §10): assumes 3 (BGR) or
+        # 4 (BGRA) channels - a genuinely single-channel/grayscale sprite
+        # would raise a bare IndexError here instead of a named error. All
+        # real vendored assets are confirmed RGBA, so this is left as-is.
         if sprite._array.shape[2] == 4:
             alpha = sprite._array[:, :, 3].astype(np.float32) / 255.0
             for channel in range(3):

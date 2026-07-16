@@ -270,6 +270,14 @@ to UI":
   frame 0 instead of erroring. A real vendored asset would never have
   this, so it is left as a documented, accepted gap rather than an
   urgent fix.
+- **Documented, accepted gap:** `Img.paste()`
+  (`kungfu_chess/client/surface/img.py`) assumes every sprite has
+  either 3 (BGR) or 4 (BGRA) channels. A genuinely single-channel/
+  grayscale sprite would raise a bare `IndexError` from
+  `sprite._array.shape[2]` instead of a named `ImgSurfaceError`
+  subclass. All real vendored assets (Stage 1) are confirmed RGBA, so
+  this is a documented, accepted gap, not an urgent fix - same
+  treatment as the `frames_per_sec=0` gap above.
 
 ## 11. Integrating Animation Assets from the CTD26 Repo (Asset Import)
 
