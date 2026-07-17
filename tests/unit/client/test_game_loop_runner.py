@@ -126,6 +126,22 @@ def test_run_one_frame_does_not_raise_and_advances_a_moving_pieces_animation():
     assert animator.elapsed_ms_in_state > 0
 
 
+def test_request_jump_transitions_the_targeted_pieces_animator_to_jump():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+
+    runner = GameLoopRunner(board, window_name="TestJump", headless=True)
+
+    # _request_jump is MouseAdapter's on_jump_requested callback,
+    # invoked exactly as a real right-click would - see mouse_adapter's
+    # own tests for the click -> cell mapping itself.
+    runner._request_jump(Position(row=0, col=0))
+
+    assert runner.piece_animator_registry.animator_for(rook.id).current_state == AnimationState.JUMP
+
+
 def test_non_headless_construction_creates_a_real_window_when_a_display_is_available():
     # The one test that exercises the REAL, non-headless path (window
     # creation, mouse-callback attachment) at least once on a machine

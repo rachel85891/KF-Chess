@@ -95,6 +95,21 @@ same "test the real logic through a fake/skipped boundary" principle
 every prior stage already used, applied to this one's own boundary
 (cv2's GUI layer).
 
+JUMP (Stage 11a): a real ExtraEngine (kungfu_chess/extra/extra_engine.py)
+is now constructed here too, wrapping the same `engine`, and passed
+into GameEventPublisher in place of the bare GameEngine it used to take
+(see event_publisher.py's own docstring for the full reasoning - in
+short, GameEventPublisher.wait() must now drive ExtraEngine.wait(), not
+GameEngine.wait() directly, or a started jump would never land).
+MouseAdapter's new on_jump_requested callback is wired to a tiny
+private method (_request_jump) that calls
+self.publisher.request_jump(cell) - kept as its own named method,
+mirroring _mark_game_over's own reasoning, rather than a bare lambda,
+so it has a name a debugger/traceback can show, and so it can freely
+ignore request_jump's bool return value (MouseAdapter's callback type
+is Callable[[Position], None] - a right-click has nowhere to display a
+rejection reason even if there were one to show).
+
 ERROR HANDLING: no new exception type is introduced in this file, and
 none is needed. Every failure mode reachable through this class's own
 code already has a more specific, existing exception raised by the
@@ -127,8 +142,10 @@ from kungfu_chess.client.surface.img import Img
 from kungfu_chess.client.surface.img_surface import ImgSurface
 from kungfu_chess.client.ui.hud_renderer import HudRenderer
 from kungfu_chess.engine.game_engine import GameEngine
+from kungfu_chess.extra.extra_engine import ExtraEngine
 from kungfu_chess.input.controller import Controller
 from kungfu_chess.model.board import Board
+from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
 from kungfu_chess.view.renderer import Renderer, build_snapshot
 
@@ -190,7 +207,8 @@ class GameLoopRunner:
         self._headless = headless
 
         self.engine = GameEngine(board)
-        self.publisher = GameEventPublisher(self.engine)
+        self.extra_engine = ExtraEngine(self.engine)
+        self.publisher = GameEventPublisher(self.extra_engine)
 
         # Two independent registries, snapshotting the SAME initial
         # board separately - Stage 8's PieceRegistry (kind/color
@@ -237,7 +255,7 @@ class GameLoopRunner:
         # (0, 0) maps window-pixel (0, 0) to image-pixel (0, 0), and
         # scale 1.0 means one window pixel is one image pixel.
         mapper = ScreenToImageMapper(window_origin=(0, 0), window_scale=1.0)
-        self.mouse_adapter = MouseAdapter(mapper, self.controller)
+        self.mouse_adapter = MouseAdapter(mapper, self.controller, on_jump_requested=self._request_jump)
         if not headless:
             self.mouse_adapter.attach(window_name)
 
@@ -247,6 +265,13 @@ class GameLoopRunner:
         debugger/traceback can show."""
 
         self._game_over = True
+
+    def _request_jump(self, cell: Position) -> None:
+        """MouseAdapter's on_jump_requested callback (see module
+        docstring for why this is its own named method, not a
+        lambda)."""
+
+        self.publisher.request_jump(cell)
 
     def run(self) -> None:
         """Run the real-time loop until one of the three exit
