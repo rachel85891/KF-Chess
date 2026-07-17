@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import sys
+
 import cv2
+import pytest
 
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.loop.game_loop import GameLoopRunner
@@ -19,11 +23,19 @@ from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
 # window loop - the wiring, the event-driven game-over flag, and one
 # isolated frame of _run_one_frame - is what these tests cover.
 #
-# GameLoopRunner.__init__ does create a real (small, briefly-visible)
-# OpenCV window via cv2.namedWindow/MouseAdapter.attach - this is an
-# accepted, necessary side effect of constructing the real thing rather
-# than a fake; every test below calls cv2.destroyAllWindows() itself
-# afterward so no window is left open once the test finishes.
+# Every test below except the last constructs GameLoopRunner with
+# headless=True: cv2.namedWindow/imshow/waitKey/getWindowProperty all
+# require a real GUI backend, and on a machine with no display (this
+# project's own CI/sandbox environment, confirmed directly) calling
+# any of them ABORTS THE WHOLE PROCESS rather than raising a catchable
+# exception - so constructing a non-headless GameLoopRunner here would
+# crash the entire pytest run, not just fail one test. headless=True
+# still exercises every real wiring/event/rendering/animation-
+# advancement behavior this class provides (see game_loop.py's own
+# module docstring) - it only skips the calls that actually touch
+# cv2's GUI layer, which these tests were never testing in the first
+# place. No cv2.destroyAllWindows() cleanup is needed in these tests
+# either, for the same reason: headless mode never creates a window.
 
 
 def _empty_grid(rows: int, cols: int) -> list[list[None]]:
@@ -34,6 +46,21 @@ def _piece(color: Color, kind: PieceKind, cell: Position) -> Piece:
     return Piece(color=color, kind=kind, cell=cell)
 
 
+def _display_available() -> bool:
+    """Best-effort heuristic for whether a real GUI backend is likely
+    usable here. Cannot be a perfect check - cv2's failure mode on a
+    truly headless machine is a hard process abort, not a catchable
+    exception, so this can only reduce the chance of hitting one, not
+    eliminate it (the real, non-headless test below still wraps
+    construction in a try/except cv2.error as a second line of
+    defense for platforms where cv2 does raise a catchable error
+    instead of aborting)."""
+
+    if sys.platform in ("win32", "darwin"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def test_construction_wires_all_three_observers_to_real_published_events():
     grid = _empty_grid(3, 3)
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
@@ -42,28 +69,26 @@ def test_construction_wires_all_three_observers_to_real_published_events():
     grid[0][1] = pawn
     board = Board(grid)
 
-    runner = GameLoopRunner(board, window_name="TestWiring")
-    try:
-        result = runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
-        assert result.is_accepted is True
+    runner = GameLoopRunner(board, window_name="TestWiring", headless=True)
 
-        # PieceAnimatorRegistry subscription: the rook's own animator
-        # really transitioned to MOVE in reaction to the real event.
-        assert runner.piece_animator_registry.animator_for(rook.id).current_state == AnimationState.MOVE
+    result = runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is True
 
-        runner.publisher.wait(MS_PER_SQUARE)
+    # PieceAnimatorRegistry subscription: the rook's own animator
+    # really transitioned to MOVE in reaction to the real event.
+    assert runner.piece_animator_registry.animator_for(rook.id).current_state == AnimationState.MOVE
 
-        # ScoreObserver subscription: white really gained the pawn's
-        # real PIECE_VALUES score (1), not just "subscribe() was called".
-        score = runner.score_observer.snapshot()
-        assert score.score_by_color[Color.WHITE] == 1
+    runner.publisher.wait(MS_PER_SQUARE)
 
-        # MovesLogObserver subscription: a real move entry and a real
-        # capture entry were both actually recorded.
-        entries = runner.moves_log_observer.snapshot().entries
-        assert len(entries) == 2
-    finally:
-        cv2.destroyAllWindows()
+    # ScoreObserver subscription: white really gained the pawn's
+    # real PIECE_VALUES score (1), not just "subscribe() was called".
+    score = runner.score_observer.snapshot()
+    assert score.score_by_color[Color.WHITE] == 1
+
+    # MovesLogObserver subscription: a real move entry and a real
+    # capture entry were both actually recorded.
+    entries = runner.moves_log_observer.snapshot().entries
+    assert len(entries) == 2
 
 
 def test_game_over_listener_sets_the_flag_on_a_real_game_over_event():
@@ -74,16 +99,13 @@ def test_game_over_listener_sets_the_flag_on_a_real_game_over_event():
     grid[0][1] = king
     board = Board(grid)
 
-    runner = GameLoopRunner(board, window_name="TestGameOver")
-    try:
-        assert runner._game_over is False
+    runner = GameLoopRunner(board, window_name="TestGameOver", headless=True)
+    assert runner._game_over is False
 
-        runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
-        runner.publisher.wait(MS_PER_SQUARE)
+    runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    runner.publisher.wait(MS_PER_SQUARE)
 
-        assert runner._game_over is True
-    finally:
-        cv2.destroyAllWindows()
+    assert runner._game_over is True
 
 
 def test_run_one_frame_does_not_raise_and_advances_a_moving_pieces_animation():
@@ -92,15 +114,38 @@ def test_run_one_frame_does_not_raise_and_advances_a_moving_pieces_animation():
     grid[0][0] = rook
     board = Board(grid)
 
-    runner = GameLoopRunner(board, window_name="TestOneFrame")
+    runner = GameLoopRunner(board, window_name="TestOneFrame", headless=True)
+
+    runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=2))
+    animator = runner.piece_animator_registry.animator_for(rook.id)
+    assert animator.current_state == AnimationState.MOVE
+    assert animator.elapsed_ms_in_state == 0
+
+    runner._run_one_frame(50)  # no exception == success
+
+    assert animator.elapsed_ms_in_state > 0
+
+
+def test_non_headless_construction_creates_a_real_window_when_a_display_is_available():
+    # The one test that exercises the REAL, non-headless path (window
+    # creation, mouse-callback attachment) at least once on a machine
+    # that actually has a display - skipped rather than run on a
+    # likely-headless one, per _display_available's own docstring.
+    if not _display_available():
+        pytest.skip("no display available in this environment")
+
+    grid = _empty_grid(2, 2)
+    king = _piece(Color.WHITE, PieceKind.KING, Position(row=0, col=0))
+    grid[0][0] = king
+    board = Board(grid)
+
     try:
-        runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=2))
-        animator = runner.piece_animator_registry.animator_for(rook.id)
-        assert animator.current_state == AnimationState.MOVE
-        assert animator.elapsed_ms_in_state == 0
+        runner = GameLoopRunner(board, window_name="TestRealWindow", headless=False)
+    except cv2.error as exc:
+        pytest.skip(f"cv2 GUI backend unavailable in this environment: {exc}")
 
-        runner._run_one_frame(50)  # no exception == success
-
-        assert animator.elapsed_ms_in_state > 0
+    try:
+        assert runner._headless is False
+        runner._run_one_frame(16)
     finally:
         cv2.destroyAllWindows()

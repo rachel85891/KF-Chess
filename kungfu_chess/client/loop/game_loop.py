@@ -68,6 +68,33 @@ underlying fact.
   game isn't over, but the user asked to stop anyway.
 Any one of these can happen without either of the other two.
 
+WHY `headless`: cv2.namedWindow/cv2.imshow/cv2.waitKey/
+cv2.getWindowProperty all require a real GUI backend - on a machine
+with no display (this project's own CI/sandbox environment, confirmed
+directly), calling any of them doesn't raise a catchable Python
+exception, it ABORTS THE WHOLE PROCESS. Every earlier stage already
+established the pattern of testing real logic against a fake boundary
+instead of a real window (Stage 6/9's fake/spy Img, Stage 7's stubbed
+cv2.setMouseCallback) - GameLoopRunner needs the equivalent: a way to
+exercise every real wiring/event/rendering/animation-advancement
+behavior it provides, using REAL Renderer/ImgSurface/HudRenderer
+drawing onto a REAL in-memory Img canvas, without ever calling into
+cv2's GUI layer at all. `headless=True` skips exactly the calls that
+touch that layer (window creation, mouse-callback attachment, on-
+screen display, key polling, window-visibility polling) and nothing
+else - every other line of __init__/_run_one_frame runs identically
+either way. In headless mode, only ONE of the three exit conditions
+above still applies: GameOver. The other two structurally cannot apply
+without a real window - there is no window to close (so no visibility
+check makes sense to run), and no keyboard events are ever polled (no
+cv2.waitKey call happens), so `self._quit_requested` can never become
+True in headless mode - it stays present in the code path (still a
+real, checkable attribute) purely for symmetry/consistency, it's just
+never set. This is not a workaround papering over the crash - it's the
+same "test the real logic through a fake/skipped boundary" principle
+every prior stage already used, applied to this one's own boundary
+(cv2's GUI layer).
+
 ERROR HANDLING: no new exception type is introduced in this file, and
 none is needed. Every failure mode reachable through this class's own
 code already has a more specific, existing exception raised by the
@@ -136,7 +163,7 @@ class _GameOverListener:
 class GameLoopRunner:
     """The composition root - see module docstring."""
 
-    def __init__(self, board: Board, window_name: str = DEFAULT_WINDOW_NAME) -> None:
+    def __init__(self, board: Board, window_name: str = DEFAULT_WINDOW_NAME, headless: bool = False) -> None:
         """Wire every client-layer component together against one
         initial `board`, in the order client_spec.md §4 implies
         (engine -> publisher -> registries/observers -> subscriptions
@@ -144,16 +171,23 @@ class GameLoopRunner:
         behind the two non-obvious choices here: build_snapshot vs.
         Controller each getting a different object, and why the
         game-over listener is a subscribed Observer rather than a
-        polled flag.
+        polled flag - and for `headless`, see the module docstring's
+        own dedicated section.
 
         Args:
             board: The initial Board to play on.
             window_name: The OpenCV window title - also the identifier
                 MouseAdapter.attach registers its callback against.
+            headless: If True, skip real window creation and mouse-
+                callback attachment entirely - defaults to False so
+                real usage (client_spec.md §4's actual game loop) is
+                completely unaffected.
 
         Returns:
             None.
         """
+
+        self._headless = headless
 
         self.engine = GameEngine(board)
         self.publisher = GameEventPublisher(self.engine)
@@ -191,7 +225,8 @@ class GameLoopRunner:
         self._canvas_height = board.height * CELL_SIZE
 
         self._window_name = window_name
-        cv2.namedWindow(window_name)
+        if not headless:
+            cv2.namedWindow(window_name)
 
         # A freshly created OpenCV window (WINDOW_AUTOSIZE, the
         # default - never resized/dragged yet) has its client area's
@@ -203,7 +238,8 @@ class GameLoopRunner:
         # scale 1.0 means one window pixel is one image pixel.
         mapper = ScreenToImageMapper(window_origin=(0, 0), window_scale=1.0)
         self.mouse_adapter = MouseAdapter(mapper, self.controller)
-        self.mouse_adapter.attach(window_name)
+        if not headless:
+            self.mouse_adapter.attach(window_name)
 
     def _mark_game_over(self) -> None:
         """The _GameOverListener's callback - kept as its own tiny
@@ -215,7 +251,9 @@ class GameLoopRunner:
     def run(self) -> None:
         """Run the real-time loop until one of the three exit
         conditions is met (see module docstring), then close the
-        window.
+        window. In headless mode, only GameOver can end this loop
+        (see module docstring's `headless` section) - and there is no
+        window to close, so the closing call is skipped too.
 
         Returns:
             None.
@@ -228,7 +266,8 @@ class GameLoopRunner:
             last_time = now
             self._run_one_frame(delta_ms)
 
-        cv2.destroyAllWindows()
+        if not self._headless:
+            cv2.destroyAllWindows()
 
     def _run_one_frame(self, delta_ms: int) -> None:
         """Run exactly one iteration of client_spec.md §4's execution
@@ -242,6 +281,13 @@ class GameLoopRunner:
         directly, in a test - the same reasoning as every other Stage
         in this codebase that separates "the logic" from "the loop/
         window shell around it."
+
+        In headless mode (see module docstring), every real step still
+        runs - publisher.wait, advance_all, and real Renderer/
+        ImgSurface/HudRenderer drawing onto a real in-memory canvas -
+        only the final on-screen display and key-poll are skipped,
+        since those are the two calls that actually touch cv2's GUI
+        backend.
 
         Args:
             delta_ms: Milliseconds of logical/wall-clock time since
@@ -262,6 +308,9 @@ class GameLoopRunner:
 
         HudRenderer(canvas).render(self.score_observer.snapshot(), self.moves_log_observer.snapshot())
 
+        if self._headless:
+            return
+
         canvas.show(self._window_name)
 
         # 1ms, not 0 (which blocks indefinitely waiting for a keypress
@@ -278,9 +327,15 @@ class GameLoopRunner:
 
     def _should_exit(self) -> bool:
         """True if any of the three documented exit conditions (see
-        module docstring) currently holds."""
+        module docstring) currently holds. In headless mode, only
+        GameOver/quit_requested are even checkable - there is no real
+        window, so no window-visibility check is made (see module
+        docstring's `headless` section)."""
 
         if self._game_over or self._quit_requested:
             return True
+
+        if self._headless:
+            return False
 
         return cv2.getWindowProperty(self._window_name, cv2.WND_PROP_VISIBLE) < 1
