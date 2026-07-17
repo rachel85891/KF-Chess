@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import pytest
 
+from kungfu_chess.client.animation.animation_state import AnimationState
+from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
 from kungfu_chess.client.events.event_publisher import GameEventPublisher, MotionNotFoundError
-from kungfu_chess.client.events.game_events import GameOver, MoveAccepted, MoveRejected, PieceArrived
+from kungfu_chess.client.events.game_events import GameOver, JumpAccepted, MoveAccepted, MoveRejected, PieceArrived
 from kungfu_chess.engine.game_engine import GameEngine
+from kungfu_chess.extra.extra_engine import ExtraEngine
+from kungfu_chess.extra.jump import JUMP_COOLDOWN_MS, JUMP_DURATION_MS
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
@@ -33,7 +37,7 @@ def test_all_subscribed_observers_receive_the_same_event():
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
     grid[0][0] = rook
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     observer_a, observer_b = RecordingObserver(), RecordingObserver()
     publisher.subscribe(observer_a)
     publisher.subscribe(observer_b)
@@ -49,7 +53,7 @@ def test_request_move_accepted_publishes_move_accepted_with_correct_fields():
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
     grid[0][0] = rook
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     observer = RecordingObserver()
     publisher.subscribe(observer)
 
@@ -73,7 +77,7 @@ def test_request_move_rejected_publishes_move_rejected_with_real_reason():
     grid[0][0] = rook
     grid[0][1] = friendly
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     observer = RecordingObserver()
     publisher.subscribe(observer)
 
@@ -91,7 +95,7 @@ def test_wait_converts_multiple_arrival_events_to_piece_arrived_in_order():
     grid[0][0] = near_rook
     grid[2][0] = far_rook
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     observer = RecordingObserver()
     publisher.subscribe(observer)
     publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
@@ -114,7 +118,7 @@ def test_wait_publishes_piece_arrived_with_captured_piece_id():
     grid[0][0] = attacker
     grid[0][1] = victim
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     observer = RecordingObserver()
     publisher.subscribe(observer)
     publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
@@ -134,7 +138,7 @@ def test_wait_publishes_game_over_after_piece_arrived_on_king_capture():
     grid[0][0] = rook
     grid[0][1] = king
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     observer = RecordingObserver()
     publisher.subscribe(observer)
     publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
@@ -155,7 +159,7 @@ def test_default_ordering_policy_preserves_engine_fifo_order():
     grid[0][0] = near_rook
     grid[2][0] = far_rook
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     observer = RecordingObserver()
     publisher.subscribe(observer)
     publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
@@ -176,7 +180,7 @@ def test_custom_ordering_policy_changes_publish_order_observably():
     grid[2][0] = far_rook
     engine = GameEngine(Board(grid))
     reverse_policy = lambda events: list(reversed(events))  # noqa: E731
-    publisher = GameEventPublisher(engine, ordering_policy=reverse_policy)
+    publisher = GameEventPublisher(ExtraEngine(engine), ordering_policy=reverse_policy)
     observer = RecordingObserver()
     publisher.subscribe(observer)
     publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
@@ -194,7 +198,7 @@ def test_request_move_return_value_is_the_original_move_result_unchanged():
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
     grid[0][0] = rook
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
 
     result = publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
 
@@ -207,7 +211,7 @@ def test_wait_return_value_is_the_original_arrival_events_list_unchanged():
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
     grid[0][0] = rook
     engine = GameEngine(Board(grid))
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
     publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
 
     events = publisher.wait(MS_PER_SQUARE)
@@ -230,7 +234,7 @@ def test_request_move_raises_motion_not_found_error_when_no_matching_motion_exis
     grid[0][0] = rook
     engine = GameEngine(Board(grid))
     engine.arbiter.active_motions = lambda: ()
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
 
     with pytest.raises(MotionNotFoundError) as exc_info:
         publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
@@ -242,7 +246,80 @@ def test_board_property_returns_the_wrapped_engines_board():
     grid = _empty_grid(3, 3)
     board = Board(grid)
     engine = GameEngine(board)
-    publisher = GameEventPublisher(engine)
+    publisher = GameEventPublisher(ExtraEngine(engine))
 
     assert publisher.board is engine.board
     assert publisher.board is board
+
+
+def test_request_jump_accepted_publishes_real_jump_accepted_with_same_cell():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+
+    accepted = publisher.request_jump(Position(row=0, col=0))
+
+    assert accepted is True
+    assert observer.events == [
+        JumpAccepted(
+            piece_id=rook.id,
+            from_cell=Position(row=0, col=0),
+            to_cell=Position(row=0, col=0),
+            duration_ms=JUMP_DURATION_MS,
+        )
+    ]
+
+
+def test_request_jump_end_to_end_transitions_a_subscribed_piece_animator_to_jump():
+    # End-to-end proof, not a mock check: a real ExtraEngine+Board, a
+    # real PieceAnimatorRegistry subscribed as an Observer, and a real
+    # published JumpAccepted actually driving Stage 5's already-built
+    # JUMP transition for the first time.
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    engine = GameEngine(board)
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    registry = PieceAnimatorRegistry.from_board(board)
+    publisher.subscribe(registry)
+
+    accepted = publisher.request_jump(Position(row=0, col=0))
+
+    assert accepted is True
+    assert registry.animator_for(rook.id).current_state == AnimationState.JUMP
+
+
+def test_request_jump_rejected_on_empty_cell_returns_false_and_publishes_nothing():
+    grid = _empty_grid(3, 3)
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+
+    accepted = publisher.request_jump(Position(row=0, col=0))
+
+    assert accepted is False
+    assert observer.events == []
+
+
+def test_wait_drives_extra_engines_jump_landing_and_cooldown():
+    # Proves wait() is genuinely calling ExtraEngine.wait (which drives
+    # JumpTracker.resolve_due), not just GameEngine.wait directly - if
+    # it weren't, a jump would start but never land, and
+    # available_at_ms would never be set.
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    publisher.request_jump(Position(row=0, col=0))
+    assert rook.available_at_ms == 0
+
+    publisher.wait(JUMP_DURATION_MS)
+
+    assert rook.available_at_ms == JUMP_DURATION_MS + JUMP_COOLDOWN_MS

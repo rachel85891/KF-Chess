@@ -7,17 +7,49 @@ contracts (ISP, spec §6/§10): Observer has one method, and
 EventOrderingPolicy is a plain callable, not a class - both injectable
 (DIP), neither hardcoded here.
 
-JUMP: ExtraEngine.request_jump (kungfu_chess/extra/extra_engine.py)
-currently returns a bare bool, and JumpTracker (extra/jump.py) never
-moves the piece (it stays airborne "at its own cell") - neither exposes
-piece_id/from_cell/to_cell/duration_ms the way GameEngine.request_move's
-MoveResult + RealTimeArbiter.Motion do for MoveAccepted. Wrapping
-ExtraEngine automatically would mean inventing fields client_spec.md
-§5/§6 explicitly says must come from the real source, not be guessed.
-publish_jump_accepted() below is therefore a deliberate stub: it lets a
-future stage publish a real JumpAccepted once ExtraEngine exposes
-enough to fill it in honestly, without GameEventPublisher's public
-shape needing to change again then.
+JUMP (Stage 11a - wired for real): the constructor now takes a real
+ExtraEngine (kungfu_chess/extra/extra_engine.py), not a bare GameEngine
+- request_jump needs it directly, and wait() needs it too (see wait's
+own docstring for why). GameEventPublisher derives its own GameEngine
+reference from `extra_engine.engine` rather than taking both an engine
+and an extra_engine as two separate parameters that could be passed
+mismatched - a single source of truth for the one GameEngine either
+object ever refers to. request_move is completely untouched by this
+(verified via diff) - it never needed anything JUMP-specific.
+
+request_jump(cell) publishes a real JumpAccepted on success, reusing
+the existing publish_jump_accepted() helper (no longer a stub - see
+its own docstring) with from_cell == to_cell == cell: ExtraEngine.
+request_jump (re-verified directly) takes a single cell and never
+moves the piece there or anywhere else - a jump has no "from/to" the
+way a move does, so JumpAccepted's existing from_cell/to_cell fields
+are simply both set to the one cell involved, rather than adding a new
+single-cell field to JumpAccepted (kungfu_chess/client/events/
+game_events.py, deliberately left untouched) or a new event type: the
+existing shape already accommodates this, and PieceAnimator's own
+JumpAccepted handling (Stage 5) never reads from_cell/to_cell at all,
+only piece_id - so nothing downstream needs a shape change to make the
+real event work. is_jump remains the actual, explicit discriminator
+other consumers (MovesLogObserver, Stage 8) already use to distinguish
+a jump from a move - not field-counting or from_cell==to_cell as an
+implicit signal.
+
+NOTE - a deliberate, documented side effect of wiring ExtraEngine: this
+project's own established convention (main.py/app.py, per the model
+layer's migration) already treats JUMP and Promotion as one bundled
+"extras" stack via ExtraEngine, never wired separately. Once wait()
+calls ExtraEngine.wait() (required for jump landing/interception to
+work at all - see wait's own docstring), Promotion
+(kungfu_chess/extra/promotion.py)'s apply_promotions also starts
+running as part of every wait() call, where it previously never ran
+through GameEventPublisher at all (GameEventPublisher.wait() used to
+call GameEngine.wait() directly, bypassing ExtraEngine, and therefore
+Promotion, entirely). This is consistent with how ExtraEngine is used
+everywhere else in this codebase (never JUMP-without-Promotion) and
+does not change any EXISTING test's observable output (none exercise a
+pawn reaching the promotion row), but is flagged here explicitly
+rather than left as a silent side effect for a future reader to
+discover by surprise.
 
 GameEventPublisherError/MotionNotFoundError follow the same
 one-class-per-failure-mode convention as
@@ -44,7 +76,9 @@ from kungfu_chess.client.events.game_events import (
     MoveRejected,
     PieceArrived,
 )
-from kungfu_chess.engine.game_engine import GameEngine, MoveResult
+from kungfu_chess.engine.game_engine import MoveResult
+from kungfu_chess.extra.extra_engine import ExtraEngine
+from kungfu_chess.extra.jump import JUMP_DURATION_MS
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.motion import ArrivalEvent
@@ -77,14 +111,21 @@ def default_event_ordering_policy(events: Sequence[object]) -> Sequence[object]:
 
 
 class GameEventPublisher:
-    def __init__(self, engine: GameEngine, ordering_policy: EventOrderingPolicy = default_event_ordering_policy):
-        """Wrap an existing GameEngine (Decorator/composition, per the
-        module docstring) so its outputs can also be published as
-        client-layer events to subscribed Observers.
+    def __init__(
+        self, extra_engine: ExtraEngine, ordering_policy: EventOrderingPolicy = default_event_ordering_policy
+    ):
+        """Wrap an existing ExtraEngine (Decorator/composition, per the
+        module docstring) so its outputs - and its wrapped GameEngine's
+        - can also be published as client-layer events to subscribed
+        Observers.
 
         Args:
-            engine: The GameEngine instance to wrap. Never modified,
-                subclassed, or replaced - all calls delegate to it.
+            extra_engine: The ExtraEngine instance to wrap. Never
+                modified or subclassed - all calls delegate to it (and,
+                via `extra_engine.engine`, to the GameEngine it itself
+                wraps). See this module's own docstring for why this
+                constructor takes ExtraEngine rather than GameEngine
+                directly (a breaking change from before Stage 11a).
             ordering_policy: Callable applied to the batch of events
                 built inside wait() before publishing them (see
                 default_event_ordering_policy and client_spec.md
@@ -93,7 +134,8 @@ class GameEventPublisher:
                 GameEventPublisher itself changing.
         """
 
-        self._engine = engine
+        self._extra_engine = extra_engine
+        self._engine = extra_engine.engine
         self._ordering_policy = ordering_policy
         self._observers: List[Observer] = []
 
@@ -207,23 +249,43 @@ class GameEventPublisher:
         return result
 
     def wait(self, ms: int) -> List[ArrivalEvent]:
-        """Advance the wrapped GameEngine's clock by ms, and publish a
+        """Advance the wrapped engine's clock by ms, and publish a
         PieceArrived (and a GameOver, if a king was captured) for each
         resulting ArrivalEvent, in the order this publisher's
         EventOrderingPolicy produces.
 
         Args:
             ms: Milliseconds of logical time to advance, forwarded
-                as-is to GameEngine.wait.
+                as-is to ExtraEngine.wait.
 
         Returns:
-            The original list[ArrivalEvent] from GameEngine.wait,
+            The arrival_events element of ExtraEngine.wait's 3-tuple,
             unchanged - callers that only use the return value (not
             events) keep working exactly as if GameEventPublisher
-            weren't in the call path at all.
+            weren't in the call path at all. Identical to what
+            GameEngine.wait(ms) alone would have returned whenever no
+            JUMP is in flight (ExtraEngine.wait's own
+            JumpTracker.resolve_due call is then a no-op) - i.e.
+            unchanged for every scenario this class's existing tests
+            already cover.
+
+        Calls ExtraEngine.wait(ms), NOT GameEngine.wait(ms) directly
+        (re-verified from extra_engine.py fresh before making this
+        change): ExtraEngine.wait already calls self.engine.wait(ms)
+        as part of its own implementation, ordered around driving
+        JumpTracker.resolve_due against the same target clock - calling
+        GameEngine.wait(ms) here as well would advance the clock twice
+        in one call. This is also what actually makes JUMP landing/
+        interception happen at all (see module docstring) - without
+        this, an accepted jump would start but never resolve.
+        interception_events and promoted (ExtraEngine.wait's other two
+        return values) are deliberately not turned into published
+        events here - out of this stage's JUMP-only scope; a future
+        stage can add InterceptionEvent/PromotionEvent-style events the
+        same way this one adds JumpAccepted.
         """
 
-        arrival_events = self._engine.wait(ms)
+        _interception_events, arrival_events, _promoted = self._extra_engine.wait(ms)
 
         pending: List[object] = []
         for arrival in arrival_events:
@@ -241,11 +303,52 @@ class GameEventPublisher:
 
         return arrival_events
 
+    def request_jump(self, cell: Position) -> bool:
+        """Request a JUMP for whichever piece occupies `cell`, via the
+        wrapped ExtraEngine, and publish a real JumpAccepted if it
+        succeeds.
+
+        Args:
+            cell: The cell the piece to jump currently occupies - a
+                single cell, not a from/to pair (see module docstring
+                for why: ExtraEngine.request_jump itself only takes
+                one cell, since a jump never moves the piece anywhere).
+
+        Returns:
+            The original bool from ExtraEngine.request_jump, unchanged
+            - True if accepted, False for every rejection case (game
+            over, out of bounds, no piece there, already airborne,
+            mid-motion, still on cooldown - all re-verified directly
+            from ExtraEngine.request_jump's own logic). No
+            MoveRejected-style event is published on False:
+            MoveRejected's `reason` field is populated from
+            RuleEngine's move-legality reasons (kungfu_chess/rules/
+            rule_engine.py's MoveValidation.reason strings) -
+            ExtraEngine.request_jump exposes no such reason string, only
+            a bare bool, so there is nothing honest to put in a
+            MoveRejected.reason here without inventing text ExtraEngine
+            itself never produced (the same "don't guess/invent fields"
+            principle this module's docstring already applies to
+            JumpAccepted's own fields). The bool return value already
+            communicates the outcome safely to any caller that checks
+            it, the same way a plain False already does today for
+            ExtraEngine.request_jump's own direct callers.
+        """
+
+        piece = self._engine.board.piece_at(cell)
+        accepted = self._extra_engine.request_jump(cell)
+
+        if accepted:
+            self.publish_jump_accepted(piece_id=piece.id, from_cell=cell, to_cell=cell, duration_ms=JUMP_DURATION_MS)
+
+        return accepted
+
     def publish_jump_accepted(self, piece_id: int, from_cell: Position, to_cell: Position, duration_ms: int) -> None:
-        """STUB - not called from anywhere yet. See module docstring:
-        no current ExtraEngine/JumpTracker call site can honestly fill
-        in these fields, so nothing wires into this automatically. A
-        future stage should call this once request_jump/JumpTracker
-        exposes real piece_id/cells/duration for an accepted jump."""
+        """No longer a stub (Stage 11a) - called by request_jump above
+        for a real accepted jump, with from_cell == to_cell == the
+        jumping piece's own cell (see module docstring for why).
+        Kept as its own public method, not inlined into request_jump,
+        so the "build and publish a JumpAccepted" concern stays in one
+        place regardless of how many call sites eventually trigger it."""
 
         self._notify(JumpAccepted(piece_id=piece_id, from_cell=from_cell, to_cell=to_cell, duration_ms=duration_ms))
