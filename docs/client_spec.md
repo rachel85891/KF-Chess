@@ -100,8 +100,15 @@ tests/unit/client/            # unit tests mirroring every component above
 | `Observer` (protocol) | Single method `on_event(event)` | — |
 | `MovesLogObserver` | Builds a read-only `MovesLogSnapshot` from events | `Observer` |
 | `ScoreObserver` | Builds a read-only `ScoreSnapshot` from events, using `PIECE_VALUES` | `Observer`, `score_table` |
-| `HudRenderer` | Draws log/score/player names onto the canvas, from snapshots only | `Surface`, `MovesLogSnapshot`, `ScoreSnapshot` |
+| `HudRenderer` | Draws log/score/player names onto the canvas, from snapshots only | `Img`, `MovesLogSnapshot`, `ScoreSnapshot` |
 | `GameLoopRunner` | The only high-level component that knows all the others; the composition root | all of the above |
+
+`HudRenderer` depends on `Img` directly, not on the `Surface` protocol:
+`Surface` (`kungfu_chess/view/image_view.py`) is a fixed contract
+shared with the logic layer's own tests (`RecordingSurface`), and
+extending it with HUD-specific methods would leak a client-only
+concern into a cross-layer contract that doesn't need it - `Img`
+already provides everything `HudRenderer` needs (Stage 6).
 
 `GameLoopRunner` is the sole component at the top level that is aware
 of every other component — exactly like `app_extra.py` in the logic
