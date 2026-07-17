@@ -17,29 +17,36 @@ ISP: this class's public surface is exactly the Surface Protocol's 4
 methods (draw_grid, draw_piece, draw_selection_highlight,
 draw_game_over_message) - nothing extra Renderer doesn't already call.
 
-STATIC IDLE SPRITE - TEMPORARY, PENDING STAGE 10: PieceAnimator (Stage
-5) is not wired to a GameEventPublisher or to this class yet (that
-wiring is Stage 10's GameLoopRunner composition root). Without a live
-PieceAnimator per piece, draw_piece has no current animation
-state/frame to draw from - so, for THIS stage only, every piece is
-drawn using its <KIND><COLOR>'s AnimationState.IDLE state, frame 0
-(sprite_paths[0]), regardless of the piece's actual model PieceState.
-Note the deliberate distinction: PieceSnapshot.state is
-model.piece.PieceState (idle/moving/captured, a 3-value enum from the
-LOGIC layer) - NOT client_spec.md's 5-value AnimationState (the CLIENT
-layer's animation states) - these are different enums with similarly-
-named members and must not be confused; this class currently ignores
-PieceSnapshot.state entirely, which is exactly the gap Stage 10 closes
-by wiring a real PieceAnimator.current_sprite_path() per piece instead
-of this hardcoded idle lookup.
+LIVE VS. STATIC-IDLE SPRITE SELECTION (Stage 10 gap, now closed WHEN a
+registry is supplied): draw_piece draws a piece's real, live animation
+frame via piece_animator_registry.animator_for(piece.id).
+current_sprite_path() whenever a PieceAnimatorRegistry (Stage 10a) is
+injected at construction. Note the deliberate distinction:
+PieceSnapshot.state is model.piece.PieceState (idle/moving/captured, a
+3-value enum from the LOGIC layer) - NOT client_spec.md's 5-value
+AnimationState (the CLIENT layer's animation states) - these are
+different enums with similarly-named members and must not be confused;
+this class still never reads PieceSnapshot.state itself either way -
+the live path asks the registry's PieceAnimator for its own current
+frame instead.
+
+The no-registry static-idle fallback (every piece drawn at its
+<KIND><COLOR>'s AnimationState.IDLE, frame 0) is DELIBERATELY RETAINED,
+not leftover dead code: it is what keeps this class fully usable in
+isolation - without wiring up a whole GameEngine +
+GameEventPublisher + PieceAnimatorRegistry - for anything that only
+needs a static board render (this class's own unit tests, and a manual
+demo script). See draw_piece's own docstring for exactly which path
+runs when.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from kungfu_chess.client.animation.animation_state import AnimationState
+from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
 from kungfu_chess.client.animation.state_config import PIECES_ROOT, StateConfig, load_piece_states
 from kungfu_chess.client.surface.asset_cache import AssetCache
 from kungfu_chess.client.surface.img import Img, ImgSurfaceError
@@ -73,7 +80,12 @@ class ImgSurface:
     """Surface Protocol implementation backed by a real Img canvas and
     an AssetCache."""
 
-    def __init__(self, canvas: Img, asset_cache: AssetCache) -> None:
+    def __init__(
+        self,
+        canvas: Img,
+        asset_cache: AssetCache,
+        piece_animator_registry: Optional[PieceAnimatorRegistry] = None,
+    ) -> None:
         """Construct an ImgSurface.
 
         Args:
@@ -83,6 +95,14 @@ class ImgSurface:
                 this class's own knowledge.
             asset_cache: The AssetCache used to load/cache piece
                 sprites.
+            piece_animator_registry: Optional PieceAnimatorRegistry
+                (Stage 10a), injected exactly like canvas/asset_cache
+                (DIP) - never constructed here. Defaults to None so
+                every caller that already constructs an ImgSurface
+                with just (canvas, asset_cache) - Stage 6's own tests
+                and demo script included - keeps working unchanged;
+                see draw_piece's own docstring for the behavior this
+                selects between.
 
         Returns:
             None.
@@ -90,6 +110,7 @@ class ImgSurface:
 
         self._canvas = canvas
         self._asset_cache = asset_cache
+        self._piece_animator_registry = piece_animator_registry
         self._piece_states_cache: Dict[str, Dict[AnimationState, StateConfig]] = {}
 
     def _kind_color_key(self, piece: PieceSnapshot) -> str:
@@ -160,8 +181,7 @@ class ImgSurface:
                 self._canvas.draw_rectangle(col * CELL_SIZE, row * CELL_SIZE, CELL_SIZE, CELL_SIZE, color)
 
     def draw_piece(self, piece: PieceSnapshot) -> None:
-        """Draw one piece's static idle sprite at its snapshot pixel
-        position (see module docstring's "static idle sprite" note).
+        """Draw one piece's sprite at its snapshot pixel position.
 
         Args:
             piece: The PieceSnapshot to draw. piece.x/piece.y are
@@ -172,11 +192,39 @@ class ImgSurface:
         Returns:
             None.
 
+        Two paths, chosen by whether a PieceAnimatorRegistry was
+        injected at construction (both are real, supported behavior,
+        not one superseding the other - see module docstring):
+        - WITH a registry: the piece's own live PieceAnimator supplies
+          current_sprite_path() - the real animation frame for
+          whatever state/frame that piece is actually in right now.
+        - WITHOUT one (the default): falls back to the static
+          idle-frame-0 lookup (_idle_sprite_path) this class has always
+          used - kept so this class stays usable on its own (its own
+          tests, a manual demo script) without requiring a full
+          GameEngine + GameEventPublisher + PieceAnimatorRegistry just
+          to render one static frame.
+
         Raises:
-            UnknownPieceAssetError: See _idle_sprite_path.
+            UnknownPieceAssetError: See _idle_sprite_path (no-registry
+                path only).
+            UnknownPieceIdError (kungfu_chess.client.animation.
+                piece_animator_registry): propagated as-is (with-
+                registry path only) if piece.id has no PieceAnimator in
+                the injected registry - a piece this class was asked to
+                draw that the registry never built an animator for is a
+                real wiring bug upstream (e.g. the registry was built
+                from a different/stale Board snapshot), the same
+                "surface the specific upstream exception, don't mask
+                it" reasoning already used for UnknownPieceAssetError
+                and every prior stage's registry-lookup failures.
         """
 
-        sprite_path = self._idle_sprite_path(piece)
+        if self._piece_animator_registry is not None:
+            sprite_path = self._piece_animator_registry.animator_for(piece.id).current_sprite_path()
+        else:
+            sprite_path = self._idle_sprite_path(piece)
+
         sprite = self._asset_cache.get(sprite_path)
         self._canvas.paste(sprite, piece.x, piece.y)
 

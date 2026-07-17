@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import pytest
 
+from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry, UnknownPieceIdError
 from kungfu_chess.client.animation.state_config import PIECES_ROOT
+from kungfu_chess.client.events.game_events import MoveAccepted
 from kungfu_chess.client.surface.asset_cache import AssetCache
 from kungfu_chess.client.surface.img_surface import ImgSurface, UnknownPieceAssetError
+from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
-from kungfu_chess.model.piece import PieceKind, PieceState
+from kungfu_chess.model.piece import Piece, PieceKind, PieceState
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
 from kungfu_chess.view.renderer import PieceSnapshot
@@ -123,3 +126,48 @@ def test_draw_game_over_message_draws_text_on_the_canvas():
     call = canvas.calls[0]
     assert call[0] == "draw_text"
     assert call[1] == "GAME OVER"
+
+
+def _board_with_one_white_queen() -> tuple[Board, Piece]:
+    grid = [[None, None, None] for _ in range(3)]
+    queen = Piece(color=Color.WHITE, kind=PieceKind.QUEEN, cell=Position(row=0, col=0))
+    grid[0][0] = queen
+    return Board(grid), queen
+
+
+def test_draw_piece_with_registry_uses_the_live_animator_frame_not_static_idle():
+    board, queen = _board_with_one_white_queen()
+    registry = PieceAnimatorRegistry.from_board(board)
+    registry.on_event(
+        MoveAccepted(piece_id=queen.id, from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=1), duration_ms=1000)
+    )
+    asset_cache = AssetCache()
+    canvas = SpyImg()
+    surface = ImgSurface(canvas, asset_cache, registry)
+    piece_snapshot = PieceSnapshot(id=queen.id, kind=PieceKind.QUEEN, color=Color.WHITE, x=200, y=300, state=PieceState.MOVING)
+
+    surface.draw_piece(piece_snapshot)
+
+    assert len(canvas.calls) == 1
+    call_name, pasted_sprite, x, y = canvas.calls[0]
+    assert call_name == "paste"
+    assert x == 200
+    assert y == 300
+
+    idle_sprite = asset_cache.get(PIECES_ROOT / "QW" / "states" / "idle" / "sprites" / "1.png")
+    move_sprite = asset_cache.get(PIECES_ROOT / "QW" / "states" / "move" / "sprites" / "1.png")
+    assert pasted_sprite is move_sprite
+    assert pasted_sprite is not idle_sprite
+
+
+def test_draw_piece_with_registry_raises_unknown_piece_id_error_for_id_the_registry_never_built():
+    board, _queen = _board_with_one_white_queen()
+    registry = PieceAnimatorRegistry.from_board(board)
+    canvas = SpyImg()
+    surface = ImgSurface(canvas, AssetCache(), registry)
+    unknown_piece = PieceSnapshot(id=999999, kind=PieceKind.ROOK, color=Color.BLACK, x=0, y=0, state=PieceState.IDLE)
+
+    with pytest.raises(UnknownPieceIdError) as exc_info:
+        surface.draw_piece(unknown_piece)
+
+    assert "999999" in str(exc_info.value)
