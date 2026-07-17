@@ -236,3 +236,13 @@ def test_request_move_raises_motion_not_found_error_when_no_matching_motion_exis
         publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
 
     assert f"piece_id={rook.id}" in str(exc_info.value)
+
+
+def test_board_property_returns_the_wrapped_engines_board():
+    grid = _empty_grid(3, 3)
+    board = Board(grid)
+    engine = GameEngine(board)
+    publisher = GameEventPublisher(engine)
+
+    assert publisher.board is engine.board
+    assert publisher.board is board

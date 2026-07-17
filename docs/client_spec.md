@@ -285,6 +285,18 @@ to UI":
   subclass. All real vendored assets (Stage 1) are confirmed RGBA, so
   this is a documented, accepted gap, not an urgent fix - same
   treatment as the `frames_per_sec=0` gap above.
+- **Documented, accepted gap:** `HudRenderer`'s fixed top-left text
+  position (Stage 9) currently overlaps the board's own top-left
+  corner cells when both are drawn on the same canvas (Stage 10's
+  `GameLoopRunner` sizes the canvas to exactly `board.width/height *
+  CELL_SIZE`, with no extra HUD margin). This is COSMETIC ONLY -
+  gameplay is unaffected, since `ImgSurface`/`Renderer` and
+  `HudRenderer` still each draw correctly, just into the same pixel
+  region. A future improvement could give `HudRenderer` a configurable
+  region or reserve a dedicated canvas strip, but that would mean
+  changing `HudRenderer`'s already-merged fixed constants again - out
+  of scope for Stage 10, so deferred rather than fixed silently or
+  ignored outright.
 
 ## 11. Integrating Animation Assets from the CTD26 Repo (Asset Import)
 

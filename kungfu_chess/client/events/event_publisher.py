@@ -45,6 +45,7 @@ from kungfu_chess.client.events.game_events import (
     PieceArrived,
 )
 from kungfu_chess.engine.game_engine import GameEngine, MoveResult
+from kungfu_chess.model.board import Board
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.motion import ArrivalEvent
 
@@ -95,6 +96,36 @@ class GameEventPublisher:
         self._engine = engine
         self._ordering_policy = ordering_policy
         self._observers: List[Observer] = []
+
+    @property
+    def board(self) -> Board:
+        """Expose the wrapped GameEngine's board, read-only.
+
+        Returns:
+            self._engine.board.
+
+        This is the ONE piece of surface area GameEventPublisher needs
+        to add for kungfu_chess.input.controller.Controller to accept
+        a GameEventPublisher wherever it currently accepts a
+        GameEngine: Controller.click reads `self.game_engine.board`
+        directly and calls `self.game_engine.request_move(...)` - and
+        request_move already exists on GameEventPublisher (it's the
+        whole point of this class). board + request_move is therefore
+        the COMPLETE set Controller needs, nothing more - .state and
+        .arbiter are deliberately NOT added here, even though
+        GameEngine has them too: nothing in Controller reads either,
+        and the one other consumer that does need them
+        (view.renderer.build_snapshot, for engine.state.clock_ms and
+        engine.arbiter.active_motions()) is designed to receive the
+        real GameEngine directly, not go through this publisher at all
+        (see kungfu_chess.client.loop.game_loop's own docstring for
+        why). Adding .state/.arbiter here anyway would just be unused,
+        speculative surface area on a class whose whole design
+        principle is wrapping GameEngine, not becoming a second
+        GameEngine.
+        """
+
+        return self._engine.board
 
     def subscribe(self, observer: Observer) -> None:
         """Register an Observer to receive every event this publisher
