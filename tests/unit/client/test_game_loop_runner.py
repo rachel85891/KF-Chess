@@ -126,6 +126,25 @@ def test_run_one_frame_does_not_raise_and_advances_a_moving_pieces_animation():
     assert animator.elapsed_ms_in_state > 0
 
 
+def test_cooldown_tracker_is_subscribed_and_reflects_a_real_piece_arrived():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+
+    runner = GameLoopRunner(board, window_name="TestCooldown", headless=True)
+    assert runner.cooldown_tracker.remaining_ratio(rook.id, current_clock_ms=0) == 0.0
+
+    # _run_one_frame is what actually tells cooldown_tracker the
+    # correct clock_ms before driving publisher.wait() - see
+    # game_loop.py's own "COOLDOWN TIMER" docstring section.
+    runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    runner._run_one_frame(MS_PER_SQUARE)
+
+    ratio = runner.cooldown_tracker.remaining_ratio(rook.id, current_clock_ms=runner.engine.state.clock_ms)
+    assert ratio == 1.0
+
+
 def test_request_jump_transitions_the_targeted_pieces_animator_to_jump():
     grid = _empty_grid(3, 3)
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))

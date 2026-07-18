@@ -110,6 +110,31 @@ ignore request_jump's bool return value (MouseAdapter's callback type
 is Callable[[Position], None] - a right-click has nowhere to display a
 rejection reason even if there were one to show).
 
+COOLDOWN TIMER (Stage 12): a CooldownTracker is subscribed exactly
+like the other three Observers. Its set_current_clock_ms() must be
+called with the clock value the upcoming publisher.wait(delta_ms) call
+will produce - engine.state.clock_ms + delta_ms, computed BEFORE that
+call, since wait()'s only clock mutation is a plain += ms (see
+CooldownTracker's own docstring for the full reasoning on why this
+ordering is required, not just convenient). A fresh
+CooldownOverlayRenderer is constructed every frame in _run_one_frame,
+exactly mirroring HudRenderer's own already-established per-frame
+construction (Stage 9/10c) - both are stateless wrappers around
+whatever canvas is current this frame, so rebuilding either costs
+nothing real.
+
+Render order: board (Renderer) -> cooldown bars
+(CooldownOverlayRenderer) -> HUD (HudRenderer). Cooldown bars are
+drawn AFTER the board but BEFORE HudRenderer, not after: a bar is
+semantically part of the BOARD layer (it sits on a specific piece's
+cell, tied to board geometry, the same as a selection highlight would
+be) - HudRenderer's fixed-corner text is a separate, always-on-top
+administrative overlay (client_spec.md §10's already-documented
+cosmetic top-left overlap). Drawing HUD text last guarantees it always
+stays fully legible even where it happens to overlap the board, rather
+than potentially being partially covered by a cooldown bar if the
+order were reversed.
+
 ERROR HANDLING: no new exception type is introduced in this file, and
 none is needed. Every failure mode reachable through this class's own
 code already has a more specific, existing exception raised by the
@@ -130,6 +155,7 @@ import time
 
 import cv2
 
+from kungfu_chess.client.events.cooldown_tracker import CooldownTracker
 from kungfu_chess.client.events.event_publisher import GameEventPublisher
 from kungfu_chess.client.events.game_events import GameOver
 from kungfu_chess.client.events.observers import MovesLogObserver, ScoreObserver
@@ -140,6 +166,7 @@ from kungfu_chess.client.input.screen_mapper import ScreenToImageMapper
 from kungfu_chess.client.surface.asset_cache import AssetCache
 from kungfu_chess.client.surface.img import Img
 from kungfu_chess.client.surface.img_surface import ImgSurface
+from kungfu_chess.client.ui.cooldown_overlay_renderer import CooldownOverlayRenderer
 from kungfu_chess.client.ui.hud_renderer import HudRenderer
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.extra.extra_engine import ExtraEngine
@@ -221,10 +248,12 @@ class GameLoopRunner:
 
         self.score_observer = ScoreObserver(self.piece_registry)
         self.moves_log_observer = MovesLogObserver(self.piece_registry)
+        self.cooldown_tracker = CooldownTracker()
 
         self.publisher.subscribe(self.piece_animator_registry)
         self.publisher.subscribe(self.score_observer)
         self.publisher.subscribe(self.moves_log_observer)
+        self.publisher.subscribe(self.cooldown_tracker)
 
         self._game_over = False
         self._quit_requested = False
@@ -322,6 +351,10 @@ class GameLoopRunner:
             None.
         """
 
+        # Told BEFORE wait() runs, not after - see module docstring's
+        # "COOLDOWN TIMER" section for why this ordering is required.
+        self.cooldown_tracker.set_current_clock_ms(self.engine.state.clock_ms + delta_ms)
+
         self.publisher.wait(delta_ms)
         self.piece_animator_registry.advance_all(delta_ms)
 
@@ -330,6 +363,11 @@ class GameLoopRunner:
 
         snapshot = build_snapshot(self.engine, self.controller)
         Renderer(surface).render(snapshot)
+
+        # Board layer (cooldown bars), then HUD layer - see module
+        # docstring's "Render order" note for why this order, not the
+        # reverse.
+        CooldownOverlayRenderer(canvas).render(self.engine.board, self.cooldown_tracker, self.engine.state.clock_ms)
 
         HudRenderer(canvas).render(self.score_observer.snapshot(), self.moves_log_observer.snapshot())
 

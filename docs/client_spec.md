@@ -297,6 +297,20 @@ to UI":
   changing `HudRenderer`'s already-merged fixed constants again - out
   of scope for Stage 10, so deferred rather than fixed silently or
   ignored outright.
+- **Documented, accepted gap:** Stage 12's `CooldownTracker`
+  (`kungfu_chess/client/events/cooldown_tracker.py`) only tracks the
+  ordinary move-arrival cooldown (`COOLDOWN_MS`, via `PieceArrived`) -
+  it does NOT track JUMP's own post-landing cooldown
+  (`JUMP_COOLDOWN_MS`, `kungfu_chess/extra/jump.py`). Reason: JUMP
+  landings are resolved entirely inside `JumpTracker.resolve_due`
+  (called from `ExtraEngine.wait`), which currently publishes no
+  client-visible event marking when a landing (and its cooldown)
+  actually starts - there is nothing for a client-side tracker to
+  react to. Closing this gap would require a future stage to add a new
+  published event from `ExtraEngine`/`JumpTracker` for a jump landing,
+  which is out of Stage 12's scope; until then, a piece that just
+  landed from a JUMP shows no cooldown bar even though it is real and
+  enforced by `GameEngine.request_move`'s own `cooldown_active` guard.
 
 ## 11. Integrating Animation Assets from the CTD26 Repo (Asset Import)
 
