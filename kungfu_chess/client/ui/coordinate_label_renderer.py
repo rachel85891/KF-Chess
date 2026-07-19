@@ -39,7 +39,18 @@ from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
 
 LABEL_MARGIN = 30
 LABEL_FONT_SCALE = 0.5
-LABEL_COLOR = (0, 0, 0)
+# Light gray, not black: Stage 13c's dark navy/black canvas backdrop
+# would swallow black text entirely. Matches SidePanelRenderer's own
+# TABLE_TEXT_COLOR (kungfu_chess/client/ui/side_panel_renderer.py) -
+# same value, redefined here rather than imported (keeping this module
+# decoupled from SidePanelRenderer's own constants, per SRP - the same
+# "redefined, not imported" choice SidePanelRenderer itself already
+# made for its own TITLE_BOX_BORDER_COLOR/ImgSurface.HIGHLIGHT_COLOR
+# pair) - chosen over SidePanelRenderer's brighter pure-white
+# TITLE_TEXT_COLOR/SCORE_TEXT_COLOR because coordinate labels are the
+# same kind of small, secondary, utility text as a panel's table rows,
+# not a title, so the same visual weight is the more consistent match.
+LABEL_COLOR = (220, 220, 220)
 LABEL_THICKNESS = 1
 
 # cv2.getTextSize("a", FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_THICKNESS)
