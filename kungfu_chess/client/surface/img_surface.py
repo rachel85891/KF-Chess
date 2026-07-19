@@ -63,6 +63,23 @@ GAME_OVER_TEXT_COLOR = (0, 0, 255)
 GAME_OVER_FONT_SCALE = 1.5
 GAME_OVER_TEXT_THICKNESS = 3
 
+# A piece drawn at its sprite's native resolution, pasted at a cell's
+# raw top-left corner (this class's pre-Stage-13a behavior), leaves it
+# small and jammed into one corner of its CELL_SIZE cell rather than
+# filling and centering it - Stage 13a's fix. 0.88 (88% of CELL_SIZE)
+# is chosen to leave a small, deliberate margin around every piece
+# (the reference screenshot's proportions this stage targets are not a
+# full bleed to the cell edge) while still reading clearly as
+# "filling" the cell, not floating inside it. PIECE_RENDER_OFFSET is
+# the even margin (both axes, by construction: PIECE_RENDER_SIZE is
+# derived from one square ratio) added to a piece's snapshot pixel
+# position to center it - integer floor division means an odd leftover
+# pixel (if any) is absorbed on the bottom/right edge, an unnoticeable,
+# accepted asymmetry rather than a reason to introduce sub-pixel math.
+PIECE_FILL_RATIO = 0.88
+PIECE_RENDER_SIZE = round(CELL_SIZE * PIECE_FILL_RATIO)
+PIECE_RENDER_OFFSET = (CELL_SIZE - PIECE_RENDER_SIZE) // 2
+
 
 class UnknownPieceAssetError(ImgSurfaceError):
     """draw_piece was given a PieceSnapshot whose kind+color combo has
@@ -112,6 +129,7 @@ class ImgSurface:
         self._asset_cache = asset_cache
         self._piece_animator_registry = piece_animator_registry
         self._piece_states_cache: Dict[str, Dict[AnimationState, StateConfig]] = {}
+        self._rendered_sprite_cache: Dict[str, Img] = {}
 
     def _kind_color_key(self, piece: PieceSnapshot) -> str:
         """Build the <KIND><COLOR> directory-name key for a piece.
@@ -159,6 +177,38 @@ class ImgSurface:
 
         return self._piece_states_cache[key][AnimationState.IDLE].sprite_paths[0]
 
+    def _rendered_sprite(self, sprite_path: Path) -> Img:
+        """Return the display-ready (PIECE_RENDER_SIZE x
+        PIECE_RENDER_SIZE) Img for `sprite_path`, resizing and caching
+        it on first request for that path.
+
+        Args:
+            sprite_path: Path to the native-resolution sprite file (as
+                resolved by the idle or live-animator lookup above).
+
+        Returns:
+            A resized Img, distinct from the native-resolution Img
+            AssetCache.get(sprite_path) itself returns/caches.
+
+        A single small cv2.resize() call is cheap enough to redo every
+        frame - but a piece typically stays on the same sprite_path for
+        several consecutive frames (one animation frame lasts multiple
+        _run_one_frame calls at typical FPS/frames_per_sec ratios), so
+        caching by path avoids repeating an identical resize for every
+        one of those frames. This is a SEPARATE cache from AssetCache
+        (asset_cache.py), not layered into it: AssetCache's own
+        contract (one native-resolution Img per path, shared and
+        read-only) stays completely unchanged - this cache only ever
+        holds ImgSurface's own derived, render-sized copies, keyed the
+        same resolved-path way AssetCache itself already uses.
+        """
+
+        key = str(sprite_path.resolve())
+        if key not in self._rendered_sprite_cache:
+            native_sprite = self._asset_cache.get(sprite_path)
+            self._rendered_sprite_cache[key] = native_sprite.resize(PIECE_RENDER_SIZE, PIECE_RENDER_SIZE)
+        return self._rendered_sprite_cache[key]
+
     def draw_grid(self, width: int, height: int) -> None:
         """Draw a width x height checkerboard grid of board cells.
 
@@ -186,8 +236,17 @@ class ImgSurface:
         Args:
             piece: The PieceSnapshot to draw. piece.x/piece.y are
                 already pixel coordinates (build_snapshot has already
-                done cell-to-pixel and in-flight-motion interpolation
-                - this method only pastes at the position it's given).
+                done cell-to-pixel and in-flight-motion interpolation)
+                - this method resizes the sprite to PIECE_RENDER_SIZE
+                and pastes it PIECE_RENDER_OFFSET pixels right/down of
+                that position on both axes, centering it within its
+                CELL_SIZE cell (see the module-level PIECE_FILL_RATIO/
+                PIECE_RENDER_SIZE/PIECE_RENDER_OFFSET docstring for the
+                sizing/centering math). The offset is a constant added
+                to whatever position it's given, so this centers
+                correctly whether the piece is sitting still at a
+                cell's exact top-left or mid-flight along an
+                interpolated path between two cells.
 
         Returns:
             None.
@@ -225,8 +284,8 @@ class ImgSurface:
         else:
             sprite_path = self._idle_sprite_path(piece)
 
-        sprite = self._asset_cache.get(sprite_path)
-        self._canvas.paste(sprite, piece.x, piece.y)
+        sprite = self._rendered_sprite(sprite_path)
+        self._canvas.paste(sprite, piece.x + PIECE_RENDER_OFFSET, piece.y + PIECE_RENDER_OFFSET)
 
     def draw_selection_highlight(self, cell: Position) -> None:
         """Draw a highlighted border around the selected cell.
