@@ -155,6 +155,41 @@ class Img:
             raise ImageLoadError(f"{path}: cannot load image (missing or unreadable)")
         return cls(array)
 
+    def resize(self, width: int, height: int) -> "Img":
+        """Return a new Img with this image scaled to (width, height).
+        Does not mutate this Img - safe to call on a shared, cached
+        sprite Img (e.g. one returned by AssetCache.get()) without
+        affecting any other holder of that same instance.
+
+        Args:
+            width: Target width in pixels.
+            height: Target height in pixels.
+
+        Returns:
+            A new Img wrapping the resized array. The alpha channel
+            (if this image has one) is resized along with the color
+            channels - cv2.resize operates over every channel at once,
+            so a paste()'d BGRA result still alpha-blends correctly.
+
+        Interpolation is chosen per-call rather than fixed to one mode:
+        cv2.INTER_AREA (best for shrinking, per OpenCV's own docs and
+        this project's established downscaling convention - see
+        assets/README.md's sprite-resize note) when the target is not
+        larger than the source on either axis, else cv2.INTER_LINEAR
+        (better for enlarging - INTER_AREA falls back to a
+        nearest-neighbor-like result when magnifying, which introduces
+        visible blockiness). Needed because callers may resize toward a
+        fixed on-screen target size that is smaller OR larger than
+        whatever a given vendored sprite set's native resolution
+        happens to be - both directions are real, exercised cases here
+        (see img_surface.py's PIECE_RENDER_SIZE).
+        """
+
+        shrinking = width <= self.width and height <= self.height
+        interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+        resized_array = cv2.resize(self._array, (width, height), interpolation=interpolation)
+        return Img(resized_array)
+
     def paste(self, sprite: "Img", x: int, y: int) -> None:
         """Paste `sprite` onto this image at pixel position (x, y),
         alpha-blending if sprite has a 4th (alpha) channel. Mutates

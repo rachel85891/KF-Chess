@@ -6,7 +6,12 @@ from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorR
 from kungfu_chess.client.animation.state_config import PIECES_ROOT
 from kungfu_chess.client.events.game_events import MoveAccepted
 from kungfu_chess.client.surface.asset_cache import AssetCache
-from kungfu_chess.client.surface.img_surface import ImgSurface, UnknownPieceAssetError
+from kungfu_chess.client.surface.img_surface import (
+    PIECE_RENDER_OFFSET,
+    PIECE_RENDER_SIZE,
+    ImgSurface,
+    UnknownPieceAssetError,
+)
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind, PieceState
@@ -73,7 +78,7 @@ def test_draw_grid_draws_checkerboard_rectangles_using_cell_size():
     assert canvas.calls[1][1:5] == (CELL_SIZE, 0, CELL_SIZE, CELL_SIZE)
 
 
-def test_draw_piece_pastes_the_real_qw_idle_sprite_at_the_snapshot_position():
+def test_draw_piece_pastes_the_real_qw_idle_sprite_resized_and_centered_in_its_cell():
     asset_cache = AssetCache()
     canvas = SpyImg()
     surface = ImgSurface(canvas, asset_cache)
@@ -84,11 +89,37 @@ def test_draw_piece_pastes_the_real_qw_idle_sprite_at_the_snapshot_position():
     assert len(canvas.calls) == 1
     call_name, pasted_sprite, x, y = canvas.calls[0]
     assert call_name == "paste"
-    assert x == 200
-    assert y == 300
+    # Centered: the snapshot position plus the fixed centering offset,
+    # not the raw top-left corner (Stage 13a).
+    assert x == 200 + PIECE_RENDER_OFFSET
+    assert y == 300 + PIECE_RENDER_OFFSET
 
+    # Resized: PIECE_RENDER_SIZE, not the sprite's native 64x64 - and
+    # therefore a genuinely different Img than AssetCache's own cached,
+    # native-resolution instance (identity, not just equal dimensions,
+    # confirms this is ImgSurface's own resized copy, not a mutated
+    # shared AssetCache entry - AssetCache's caching contract is
+    # untouched).
+    assert pasted_sprite.width == PIECE_RENDER_SIZE
+    assert pasted_sprite.height == PIECE_RENDER_SIZE
     expected_sprite_path = PIECES_ROOT / "QW" / "states" / "idle" / "sprites" / "1.png"
-    assert pasted_sprite is asset_cache.get(expected_sprite_path)
+    native_sprite = asset_cache.get(expected_sprite_path)
+    assert pasted_sprite is not native_sprite
+    assert native_sprite.width == 64 and native_sprite.height == 64
+
+
+def test_draw_piece_reuses_the_cached_resized_sprite_on_a_second_call_for_the_same_path():
+    asset_cache = AssetCache()
+    canvas = SpyImg()
+    surface = ImgSurface(canvas, asset_cache)
+    piece = PieceSnapshot(id=1, kind=PieceKind.QUEEN, color=Color.WHITE, x=0, y=0, state=PieceState.IDLE)
+
+    surface.draw_piece(piece)
+    surface.draw_piece(piece)
+
+    first_sprite = canvas.calls[0][1]
+    second_sprite = canvas.calls[1][1]
+    assert first_sprite is second_sprite
 
 
 def test_draw_piece_raises_unknown_piece_asset_error_for_unmatched_kind_color():
@@ -151,13 +182,15 @@ def test_draw_piece_with_registry_uses_the_live_animator_frame_not_static_idle()
     assert len(canvas.calls) == 1
     call_name, pasted_sprite, x, y = canvas.calls[0]
     assert call_name == "paste"
-    assert x == 200
-    assert y == 300
+    assert x == 200 + PIECE_RENDER_OFFSET
+    assert y == 300 + PIECE_RENDER_OFFSET
 
     idle_sprite = asset_cache.get(PIECES_ROOT / "QW" / "states" / "idle" / "sprites" / "1.png")
     move_sprite = asset_cache.get(PIECES_ROOT / "QW" / "states" / "move" / "sprites" / "1.png")
-    assert pasted_sprite is move_sprite
+    assert pasted_sprite is not move_sprite  # ImgSurface's own resized copy, not AssetCache's native instance
     assert pasted_sprite is not idle_sprite
+    assert pasted_sprite.width == PIECE_RENDER_SIZE
+    assert pasted_sprite.height == PIECE_RENDER_SIZE
 
 
 def test_draw_piece_with_registry_raises_unknown_piece_id_error_for_id_the_registry_never_built():

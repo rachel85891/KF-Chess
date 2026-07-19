@@ -58,3 +58,29 @@ def test_paste_a_real_sprite_onto_a_canvas_does_not_raise():
     sprite = Img.load(QW_IDLE_FRAME_0)
 
     canvas.paste(sprite, 10, 10)  # no exception == success; pixel-level rendering is not asserted here
+
+
+def test_resize_returns_a_new_img_of_the_requested_size_and_leaves_the_original_unchanged():
+    sprite = Img.load(QW_IDLE_FRAME_0)  # native 64x64
+
+    shrunk = sprite.resize(32, 32)
+    grown = sprite.resize(96, 96)
+
+    assert shrunk.width == 32 and shrunk.height == 32
+    assert grown.width == 96 and grown.height == 96
+    assert sprite.width == 64 and sprite.height == 64  # original untouched
+
+
+def test_resize_of_a_real_bgra_sprite_still_pastes_without_raising():
+    # Img exposes no pixel-read-back API (by design - see img.py's own
+    # SOLID boundary docstring), so this cannot assert alpha values
+    # pixel-by-pixel; it does confirm resize()'s output is still a
+    # valid 4-channel image paste() can alpha-blend, not something
+    # paste()'s own alpha branch would choke on.
+    sprite = Img.load(QW_IDLE_FRAME_0)  # native BGRA
+    canvas = Img.blank_canvas(50, 50)
+
+    resized = sprite.resize(20, 20)
+    canvas.paste(resized, 5, 5)  # no exception == success
+
+    assert resized.width == 20 and resized.height == 20
