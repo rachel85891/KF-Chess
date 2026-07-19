@@ -8,11 +8,13 @@ import pytest
 
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.loop.game_loop import GameLoopRunner
+from kungfu_chess.client.ui.coordinate_label_renderer import LABEL_MARGIN
+from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
-from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
+from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE, MS_PER_SQUARE
 
 # A full real-time loop with a live cv2 window (the blocking while-loop
 # in run(), real mouse events, real window-close detection) is not
@@ -157,6 +159,87 @@ def test_request_jump_transitions_the_targeted_pieces_animator_to_jump():
     # invoked exactly as a real right-click would - see mouse_adapter's
     # own tests for the click -> cell mapping itself.
     runner._request_jump(Position(row=0, col=0))
+
+    assert runner.piece_animator_registry.animator_for(rook.id).current_state == AnimationState.JUMP
+
+
+def test_canvas_layout_matches_the_documented_stage_13c_formula():
+    grid = _empty_grid(8, 8)
+    board = Board(grid)
+
+    runner = GameLoopRunner(board, window_name="TestLayout", headless=True)
+
+    assert runner._board_pixel_width == 8 * CELL_SIZE
+    assert runner._board_pixel_height == 8 * CELL_SIZE
+    assert runner._board_origin_x == PANEL_WIDTH + LABEL_MARGIN
+    assert runner._board_origin_y == 0
+    assert runner._total_canvas_width == runner._board_origin_x + runner._board_pixel_width + PANEL_WIDTH
+    assert runner._total_canvas_height == runner._board_pixel_height + LABEL_MARGIN
+
+
+def test_run_one_frame_does_not_raise_with_pieces_at_all_four_board_corners():
+    # A real regression check for the new board_canvas -> main_canvas
+    # paste(): a wrong total_canvas_width/height or a wrong
+    # board_origin_x/y would surface here as a real
+    # PasteOutOfBoundsError, the same failure mode the asset-swap
+    # sprite-sizing fix (assets/README.md) was originally caught by.
+    grid = _empty_grid(8, 8)
+    grid[0][0] = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][7] = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=7))
+    grid[7][0] = _piece(Color.BLACK, PieceKind.ROOK, Position(row=7, col=0))
+    grid[7][7] = _piece(Color.BLACK, PieceKind.ROOK, Position(row=7, col=7))
+    board = Board(grid)
+    runner = GameLoopRunner(board, window_name="TestCorners", headless=True)
+
+    runner._run_one_frame(16)  # no exception == success
+
+
+def test_left_click_correctly_selects_the_piece_under_the_cursor_despite_the_panel_offset():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    runner = GameLoopRunner(board, window_name="TestClickOffset", headless=True)
+
+    # A raw window-pixel click inside cell (0, 0) - only correct once
+    # board_origin_x/y is applied via the mapper's window_origin (see
+    # module docstring's "CLICK OFFSET" section).
+    window_x = runner._board_origin_x + CELL_SIZE // 2
+    window_y = runner._board_origin_y + CELL_SIZE // 2
+    runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, window_x, window_y, 0, None)
+
+    assert runner.controller.selected == Position(row=0, col=0)
+
+
+def test_left_click_at_the_pre_13c_raw_origin_no_longer_hits_the_board():
+    # Demonstrates the offset fix actually matters: a click at the OLD
+    # (pre-Stage-13c) identity-mapping position now lands inside the
+    # left panel/label margin, not on the board at all.
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    runner = GameLoopRunner(board, window_name="TestClickOffsetRegression", headless=True)
+
+    runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, CELL_SIZE // 2, CELL_SIZE // 2, 0, None)
+
+    assert runner.controller.selected is None
+
+
+def test_right_click_jump_request_also_respects_the_board_origin_offset():
+    # The right-click/jump path shares the SAME injected
+    # ScreenToImageMapper as the left-click path (see module
+    # docstring's "CLICK OFFSET" section) - verified here through the
+    # real on_mouse_event chain, not by calling _request_jump directly.
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    runner = GameLoopRunner(board, window_name="TestJumpOffset", headless=True)
+
+    window_x = runner._board_origin_x + CELL_SIZE // 2
+    window_y = runner._board_origin_y + CELL_SIZE // 2
+    runner.mouse_adapter.on_mouse_event(cv2.EVENT_RBUTTONDOWN, window_x, window_y, 0, None)
 
     assert runner.piece_animator_registry.animator_for(rook.id).current_state == AnimationState.JUMP
 
