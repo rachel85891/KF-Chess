@@ -311,6 +311,23 @@ to UI":
   which is out of Stage 12's scope; until then, a piece that just
   landed from a JUMP shows no cooldown bar even though it is real and
   enforced by `GameEngine.request_move`'s own `cooldown_active` guard.
+- **Temporary architectural decision (not permanent):** Score/
+  MovesLog computation currently lives entirely client-side —
+  `ScoreObserver`/`MovesLogObserver`
+  (`kungfu_chess/client/events/observers.py`) derive both purely from
+  `GameEventPublisher`'s own event stream, with no server-side
+  authority involved. This is expected to change once real networked
+  multiplayer is designed (planned by the project owner, not yet
+  designed as of this note): two independently-connected clients must
+  agree on a single trusted score/move log rather than each computing
+  its own from locally-received events, so that responsibility will
+  likely need to move to the authoritative server side at that point.
+  `GameEventPublisher`'s own event-stream design (`MoveAccepted`/
+  `JumpAccepted`/`PieceArrived`/`GameOver`/`PromotionEvent`) is
+  expected to translate naturally to whatever the server sends over
+  the network, minimizing rework — but this is a documentation note
+  only, no logic change here; revisit once the server architecture is
+  actually planned.
 
 ## 11. Integrating Animation Assets from the CTD26 Repo (Asset Import)
 
