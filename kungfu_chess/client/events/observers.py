@@ -88,13 +88,26 @@ class ScoreObserver:
 
 @dataclass(frozen=True)
 class MoveLogEntry:
-    """One MoveAccepted/JumpAccepted."""
+    """One MoveAccepted/JumpAccepted.
+
+    recorded_at_clock_ms (Stage 13b): the logical clock_ms at which
+    this entry was recorded - added for SidePanelRenderer's "Time"
+    column (client_spec.md's reference-image side panels need
+    something to show there; nothing pre-13b did). Defaults to 0
+    rather than being required, so every pre-13b construction of this
+    dataclass (this file's own defaults included, and every existing
+    caller/test that built one without this field) keeps working
+    unchanged - a real value is only ever populated by MovesLogObserver
+    itself, via set_current_clock_ms() (see that method's own
+    docstring for why 0 is never actually observed in practice once a
+    real GameLoopRunner is driving it)."""
 
     piece_kind: PieceKind
     piece_color: Color
     from_cell: Position
     to_cell: Position
     is_jump: bool
+    recorded_at_clock_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -119,6 +132,9 @@ class CaptureLogEntry:
     cell: Position
     captured_piece_kind: PieceKind
     captured_piece_color: Color
+    # See MoveLogEntry.recorded_at_clock_ms's own docstring - same
+    # field, same default, same reason, added to this entry type too.
+    recorded_at_clock_ms: int = 0
 
 
 MovesLogEntry = Union[MoveLogEntry, CaptureLogEntry]
@@ -140,6 +156,32 @@ class MovesLogObserver:
 
         self._registry = registry
         self._entries: List[MovesLogEntry] = []
+        self._current_clock_ms: int = 0
+
+    def set_current_clock_ms(self, current_clock_ms: int) -> None:
+        """Tell this observer what the current logical clock is, for
+        the recorded_at_clock_ms this observer stamps every entry it
+        records from here on (Stage 13b's "Time" column) - the exact
+        same mechanism CooldownTracker already established (Stage 12,
+        kungfu_chess/client/events/cooldown_tracker.py), reused here
+        rather than reinvented: both are Observers that need to know
+        "what time is it" at the moment an event fires, and neither the
+        events themselves (re-checked: MoveAccepted/JumpAccepted/
+        PieceArrived carry no timestamp) nor a live engine reference
+        (DIP - this class deliberately holds none, see module
+        docstring) can supply it - only the composition root
+        (GameLoopRunner) can, by calling this before publisher.wait(),
+        exactly as it already does for CooldownTracker.
+
+        Args:
+            current_clock_ms: The clock_ms value to stamp onto any
+                entry recorded by on_event until this is called again.
+
+        Returns:
+            None.
+        """
+
+        self._current_clock_ms = current_clock_ms
 
     def on_event(self, event: object) -> None:
         """MoveRejected/GameOver are deliberately ignored: client_spec.md
@@ -166,6 +208,7 @@ class MovesLogObserver:
                 from_cell=event.from_cell,
                 to_cell=event.to_cell,
                 is_jump=isinstance(event, JumpAccepted),
+                recorded_at_clock_ms=self._current_clock_ms,
             )
         )
 
@@ -183,6 +226,7 @@ class MovesLogObserver:
                 cell=event.cell,
                 captured_piece_kind=captured_info.kind,
                 captured_piece_color=captured_info.color,
+                recorded_at_clock_ms=self._current_clock_ms,
             )
         )
 

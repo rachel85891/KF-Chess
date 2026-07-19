@@ -2,6 +2,24 @@
 per client_spec.md §3 (corrected: depends on Img directly, not the
 Surface Protocol - see that section's footnote for why).
 
+DEPRECATED (Stage 13b): the reference image's visual redesign replaces
+this fixed-corner-overlay HUD with bordered per-player side panels -
+see kungfu_chess/client/ui/side_panel_renderer.py's SidePanelRenderer,
+which is the intended long-term replacement for this whole class. This
+file is KEPT, not deleted, in Stage 13b specifically because
+GameLoopRunner._run_one_frame still calls HudRenderer(canvas).
+render(...) every real frame, and Stage 13b's own scope deliberately
+excludes touching that wiring or the canvas sizing SidePanelRenderer's
+two-panels-plus-board layout needs (see SidePanelRenderer's own module
+docstring's LAYOUT CONTRACT) - deleting this class now would break a
+currently-working, currently-tested render path with nothing wired in
+to replace it. Stage 13c (expected to own GameLoopRunner's canvas/
+render-pipeline wiring) is the right place to swap the
+HudRenderer(canvas).render(...) call for two SidePanelRenderer(canvas)
+.render(...) calls and then delete this file outright - there is no
+third, in-between state intended for this class beyond "still wired,
+now superseded."
+
 SRP: this class only turns ScoreSnapshot/MovesLogSnapshot into text on
 a canvas - it never computes score or maintains a log itself (Stage
 8's ScoreObserver/MovesLogObserver own that), and never draws the

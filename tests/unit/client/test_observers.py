@@ -132,6 +132,60 @@ def test_moves_log_observer_ignores_move_rejected_and_game_over():
     assert observer.snapshot().entries == ()
 
 
+def test_moves_log_observer_stamps_recorded_at_clock_ms_from_set_current_clock_ms():
+    observer = MovesLogObserver(_registry())
+    observer.set_current_clock_ms(4200)
+
+    observer.on_event(
+        MoveAccepted(
+            piece_id=WHITE_QUEEN_ID,
+            from_cell=Position(row=0, col=0),
+            to_cell=Position(row=0, col=3),
+            duration_ms=1000,
+        )
+    )
+
+    entries = observer.snapshot().entries
+    assert entries[0].recorded_at_clock_ms == 4200
+
+
+def test_moves_log_observer_stamps_capture_entries_too_and_updates_on_a_later_call():
+    observer = MovesLogObserver(_registry())
+    observer.set_current_clock_ms(1000)
+    observer.on_event(
+        MoveAccepted(
+            piece_id=WHITE_QUEEN_ID,
+            from_cell=Position(row=0, col=0),
+            to_cell=Position(row=0, col=3),
+            duration_ms=1000,
+        )
+    )
+
+    observer.set_current_clock_ms(2500)
+    observer.on_event(
+        PieceArrived(piece_id=WHITE_QUEEN_ID, cell=Position(row=0, col=3), captured_piece_id=BLACK_ROOK_ID)
+    )
+
+    entries = observer.snapshot().entries
+    assert entries[0].recorded_at_clock_ms == 1000
+    assert entries[1].recorded_at_clock_ms == 2500
+
+
+def test_moves_log_observer_defaults_recorded_at_clock_ms_to_zero_when_never_told():
+    observer = MovesLogObserver(_registry())
+
+    observer.on_event(
+        MoveAccepted(
+            piece_id=WHITE_QUEEN_ID,
+            from_cell=Position(row=0, col=0),
+            to_cell=Position(row=0, col=3),
+            duration_ms=1000,
+        )
+    )
+
+    assert observer.snapshot().entries[0].recorded_at_clock_ms == 0
+
+
 def test_moves_log_observer_full_move_then_capture_sequence():
     observer = MovesLogObserver(_registry())
 

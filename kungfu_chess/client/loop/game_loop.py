@@ -110,13 +110,20 @@ ignore request_jump's bool return value (MouseAdapter's callback type
 is Callable[[Position], None] - a right-click has nowhere to display a
 rejection reason even if there were one to show).
 
-COOLDOWN TIMER (Stage 12): a CooldownTracker is subscribed exactly
-like the other three Observers. Its set_current_clock_ms() must be
-called with the clock value the upcoming publisher.wait(delta_ms) call
-will produce - engine.state.clock_ms + delta_ms, computed BEFORE that
-call, since wait()'s only clock mutation is a plain += ms (see
-CooldownTracker's own docstring for the full reasoning on why this
-ordering is required, not just convenient). A fresh
+COOLDOWN TIMER (Stage 12) / MOVES LOG TIMESTAMPS (Stage 13b): a
+CooldownTracker is subscribed exactly like the other three Observers.
+Its set_current_clock_ms() must be called with the clock value the
+upcoming publisher.wait(delta_ms) call will produce -
+engine.state.clock_ms + delta_ms, computed BEFORE that call, since
+wait()'s only clock mutation is a plain += ms (see CooldownTracker's
+own docstring for the full reasoning on why this ordering is
+required, not just convenient). moves_log_observer.set_current_clock_ms()
+is called with that exact same precomputed value, right alongside it -
+Stage 13b's SidePanelRenderer needs a per-entry timestamp
+(MoveLogEntry/CaptureLogEntry's new recorded_at_clock_ms field) for
+the same reason CooldownTracker needs "what time is it", so this
+reuses the identical mechanism/value rather than computing it twice or
+inventing a second way to thread a clock value in. A fresh
 CooldownOverlayRenderer is constructed every frame in _run_one_frame,
 exactly mirroring HudRenderer's own already-established per-frame
 construction (Stage 9/10c) - both are stateless wrappers around
@@ -353,7 +360,14 @@ class GameLoopRunner:
 
         # Told BEFORE wait() runs, not after - see module docstring's
         # "COOLDOWN TIMER" section for why this ordering is required.
-        self.cooldown_tracker.set_current_clock_ms(self.engine.state.clock_ms + delta_ms)
+        # moves_log_observer gets the exact same value for the exact
+        # same reason (Stage 13b's "Time" column) - see
+        # MovesLogObserver.set_current_clock_ms's own docstring for why
+        # this reuses CooldownTracker's already-established mechanism
+        # rather than inventing a second one.
+        upcoming_clock_ms = self.engine.state.clock_ms + delta_ms
+        self.cooldown_tracker.set_current_clock_ms(upcoming_clock_ms)
+        self.moves_log_observer.set_current_clock_ms(upcoming_clock_ms)
 
         self.publisher.wait(delta_ms)
         self.piece_animator_registry.advance_all(delta_ms)
