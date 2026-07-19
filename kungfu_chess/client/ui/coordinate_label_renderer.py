@@ -9,19 +9,25 @@ never draws the board/pieces/highlights (ImgSurface's job), the HUD
 and it has no knowledge of PieceSnapshot/Board/model types at all -
 just two integer dimensions and one integer origin.
 
-CANVAS MARGIN (for Stage 13c, which owns real canvas sizing - NOT
-touched by this stage, see below): this renderer needs LABEL_MARGIN
-(30px) of empty canvas reserved on the LEFT of the board (for rank
-numbers) and LABEL_MARGIN (30px) reserved BELOW the board (for file
-letters). Nothing is drawn above or to the right of the board, so no
-margin is needed on those two sides. render() takes board_origin_x/
-board_origin_y explicitly (where the board's own pixel (0, 0) actually
-starts on the canvas) rather than assuming the board starts at the
-canvas's own (0, 0) - this is what lets Stage 13c decide the real
-canvas layout (e.g. shift the whole board right by LABEL_MARGIN to
-make room for rank numbers) without this class needing to change; this
-stage deliberately does not touch GameLoopRunner's canvas construction
-or size itself, per the task's own scope boundary.
+CANVAS MARGIN (for GameLoopRunner, which owns real canvas sizing - NOT
+touched by this class, see below): this renderer needs LABEL_MARGIN
+(30px) of empty canvas reserved on ALL FOUR sides of the board now
+(Stage 15 - previously only the LEFT and BELOW, Stage 13a/13c; the
+reference image shows rank numbers on both the left AND right, and
+file letters on both the top AND bottom, matching a real chess board's
+own common convention of being readable from either player's seat).
+The same LABEL_MARGIN constant is reused symmetrically for all four
+sides - no separate, asymmetric constant was needed: the reference
+image's margins read as visually uniform on every side, and there is
+no content-driven reason (e.g. wider text on one side) for them to
+differ. render() takes board_origin_x/board_origin_y explicitly (where
+the board's own pixel (0, 0) actually starts on the canvas) rather than
+assuming the board starts at the canvas's own (0, 0) - this is what
+lets GameLoopRunner decide the real canvas layout (shift the whole
+board by LABEL_MARGIN on more than one side now, to make room for
+labels on all four) without this class needing to change; this class
+deliberately does not touch GameLoopRunner's canvas construction or
+size itself.
 
 ORIENTATION: files run left-to-right as 'a'..'z' starting at column 0
 (board_width capped at 26 by this scheme); ranks are numbered
@@ -29,7 +35,11 @@ bottom-to-top - row (board_height - 1) is rank 1, row 0 is rank
 board_height - matching the standard chess board convention (rank 1 on
 the side closer to White's starting position) rather than a raw
 top-to-bottom row index, since this is what a chess player expects a
-labeled board to show.
+labeled board to show. The SAME file letters are drawn both above and
+below the board, and the SAME rank numbers both left and right (not a
+mirrored/reversed second scheme) - a board only has one real
+column-to-letter and row-to-number mapping; drawing it twice is purely
+so it is readable from either side, not two different labelings.
 """
 
 from __future__ import annotations
@@ -76,16 +86,17 @@ class CoordinateLabelRenderer:
         self._canvas = canvas
 
     def render(self, board_width: int, board_height: int, board_origin_x: int, board_origin_y: int) -> None:
-        """Draw every file label (below the board) and rank label (left
-        of the board).
+        """Draw every file label (above AND below the board) and rank
+        label (left AND right of the board) - see module docstring's
+        ORIENTATION note for why both sides get the same labels.
 
         Args:
             board_width: Board width, in cells.
             board_height: Board height, in cells.
             board_origin_x: The pixel x where the board's own column 0
                 starts on this renderer's canvas (see module docstring
-                - deliberately not assumed to be 0, so Stage 13c can
-                position the board anywhere it decides on the real
+                - deliberately not assumed to be 0, so GameLoopRunner
+                can position the board anywhere it decides on the real
                 canvas without this class changing).
             board_origin_y: The pixel y where the board's own row 0
                 starts on this renderer's canvas.
@@ -102,31 +113,54 @@ class CoordinateLabelRenderer:
         """
 
         self._draw_file_labels(board_width, board_height, board_origin_x, board_origin_y)
-        self._draw_rank_labels(board_height, board_origin_x, board_origin_y)
+        self._draw_rank_labels(board_width, board_height, board_origin_x, board_origin_y)
 
     def _draw_file_labels(self, board_width: int, board_height: int, board_origin_x: int, board_origin_y: int) -> None:
-        """Draws 'a', 'b', 'c'... left-to-right, in the margin band
-        directly below the board - see module docstring's ORIENTATION
-        note."""
+        """Draws 'a', 'b', 'c'... left-to-right, in the margin bands
+        both directly below AND directly above the board (Stage 15 -
+        previously below only) - see module docstring's ORIENTATION
+        note. below_y/above_y mirror each other around the board: each
+        is positioned at its own margin band's start edge (the bottom
+        band starts where the board ends; the top band starts
+        LABEL_MARGIN pixels before the board begins) plus the same
+        `+ LABEL_MARGIN // 2 + APPROX_HALF_CHAR_HEIGHT` offset used to
+        roughly vertically center text within a LABEL_MARGIN-tall band
+        (see module-level APPROX_HALF_CHAR_HEIGHT's own comment)."""
 
-        label_y = board_origin_y + board_height * CELL_SIZE + LABEL_MARGIN // 2 + APPROX_HALF_CHAR_HEIGHT
+        below_y = board_origin_y + board_height * CELL_SIZE + LABEL_MARGIN // 2 + APPROX_HALF_CHAR_HEIGHT
+        above_y = board_origin_y - LABEL_MARGIN + LABEL_MARGIN // 2 + APPROX_HALF_CHAR_HEIGHT
         for col in range(board_width):
             letter = chr(ord("a") + col)
             label_x = board_origin_x + col * CELL_SIZE + CELL_SIZE // 2 - APPROX_HALF_CHAR_WIDTH
             self._canvas.draw_text(
-                letter, label_x, label_y, color=LABEL_COLOR, font_scale=LABEL_FONT_SCALE, thickness=LABEL_THICKNESS
+                letter, label_x, below_y, color=LABEL_COLOR, font_scale=LABEL_FONT_SCALE, thickness=LABEL_THICKNESS
+            )
+            self._canvas.draw_text(
+                letter, label_x, above_y, color=LABEL_COLOR, font_scale=LABEL_FONT_SCALE, thickness=LABEL_THICKNESS
             )
 
-    def _draw_rank_labels(self, board_height: int, board_origin_x: int, board_origin_y: int) -> None:
-        """Draws '1'..board_height bottom-to-top, in the margin band
-        directly left of the board - see module docstring's
-        ORIENTATION note for why rank 1 is the bottom row, not row 0."""
+    def _draw_rank_labels(self, board_width: int, board_height: int, board_origin_x: int, board_origin_y: int) -> None:
+        """Draws '1'..board_height bottom-to-top, in the margin bands
+        both directly left of AND directly right of the board
+        (Stage 15 - previously left only) - see module docstring's
+        ORIENTATION note for why rank 1 is the bottom row, not row 0.
+        left_x/right_x mirror each other the same way below_y/above_y
+        do in _draw_file_labels: each sits at its own margin band's
+        start edge (the left band starts LABEL_MARGIN pixels before
+        the board; the right band starts where the board ends) plus
+        the same small `+ APPROX_HALF_CHAR_WIDTH` left-padding within
+        that band."""
 
-        label_x = board_origin_x - LABEL_MARGIN + APPROX_HALF_CHAR_WIDTH
+        left_x = board_origin_x - LABEL_MARGIN + APPROX_HALF_CHAR_WIDTH
+        right_x = board_origin_x + board_width * CELL_SIZE + APPROX_HALF_CHAR_WIDTH
         for row in range(board_height):
             rank_number = board_height - row
             label_y = board_origin_y + row * CELL_SIZE + CELL_SIZE // 2 + APPROX_HALF_CHAR_HEIGHT
             self._canvas.draw_text(
-                str(rank_number), label_x, label_y, color=LABEL_COLOR, font_scale=LABEL_FONT_SCALE,
+                str(rank_number), left_x, label_y, color=LABEL_COLOR, font_scale=LABEL_FONT_SCALE,
+                thickness=LABEL_THICKNESS,
+            )
+            self._canvas.draw_text(
+                str(rank_number), right_x, label_y, color=LABEL_COLOR, font_scale=LABEL_FONT_SCALE,
                 thickness=LABEL_THICKNESS,
             )

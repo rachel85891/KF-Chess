@@ -147,45 +147,55 @@ neither is part of the board's own sub-canvas content (both are
 Stage 13a/13b components that already take an explicit position/origin
 of their own, per each one's own LAYOUT CONTRACT).
 
-VISUAL LAYOUT (Stage 13c - assembles 13a's CoordinateLabelRenderer and
-13b's SidePanelRenderer around the board for the first time):
+VISUAL LAYOUT (Stage 13c originally assembled 13a's
+CoordinateLabelRenderer and 13b's SidePanelRenderer around the board;
+Stage 15 extends the margin to all four sides, not just left+bottom -
+every number below is the CURRENT, post-Stage-15 formula):
 
 - board_origin_x = PANEL_WIDTH + LABEL_MARGIN (left panel, then the
-  rank-number label margin, then the board starts). board_origin_y = 0
-  - re-confirmed directly against both CoordinateLabelRenderer's own
-  "CANVAS MARGIN" docstring (Stage 13a: LABEL_MARGIN needed on the
-  LEFT and BELOW only, nothing above) and SidePanelRenderer's own
-  "LAYOUT CONTRACT" docstring (Stage 13b: panels run the canvas's full
-  height starting at y=0, no top margin of their own) - the two agree
-  with each other and with board_origin_y = 0; there is no conflict to
-  reconcile here.
-- total_canvas_width = board_origin_x + board_pixel_width + PANEL_WIDTH
-  - the board's own width, plus a panel on each side. The RIGHT panel
-  needs no additional label margin: CoordinateLabelRenderer's own
-  docstring is explicit that "[n]othing is drawn above or to the right
-  of the board," so PANEL_WIDTH alone (not PANEL_WIDTH + LABEL_MARGIN)
-  is correct on that side.
-- total_canvas_height = board_pixel_height + LABEL_MARGIN (room for the
-  file-letter row below the board). SidePanelRenderer's own panels run
-  the FULL canvas height (self._canvas.height, read directly by that
-  class) - so each panel ends up board_pixel_height + LABEL_MARGIN
-  tall, a few pixels TALLER than the board sub-canvas alone. This is
-  the deliberate, documented reconciliation the task called for: a
-  panel's bottom edge is allowed to run past the board's own bottom
-  edge, down to the same y the file-label row's bottom sits at - which
-  reads as entirely natural (the panel simply spans the same total
-  vertical extent everything else on the canvas does), not a mismatch
-  to paper over, since panels are drawn straight onto main_canvas, not
-  onto the board's own sub-canvas (see "Render order" above) - there is
-  no shared sub-canvas whose size the two would need to literally
-  agree on.
-- CANVAS_BACKGROUND_COLOR: a dark navy-brown BGR tuple, deliberately
-  darker than SidePanelRenderer's own PANEL_BACKGROUND_COLOR on every
-  channel (see this module's own constant definition, near the top of
-  this file, for the exact value and that specific reasoning) - so the
-  board and both panels read as distinct elements layered on top of
-  the backdrop, matching the reference image's own layered look, not a
-  flat single-color scene.
+  rank-number label margin, then the board starts) - UNCHANGED by
+  Stage 15.
+- board_origin_y = LABEL_MARGIN (Stage 15 - was 0): re-confirmed
+  directly against CoordinateLabelRenderer's own updated "CANVAS
+  MARGIN" docstring, which now reserves LABEL_MARGIN on all four sides
+  (including above the board, for the new top row of file letters) -
+  the board must now start LABEL_MARGIN pixels down from the canvas's
+  own top edge to make room for that row, exactly mirroring
+  board_origin_x's own left-side reasoning.
+- total_canvas_width = board_origin_x + board_pixel_width +
+  LABEL_MARGIN + PANEL_WIDTH (Stage 15 - gained one more LABEL_MARGIN
+  term before the right panel starts; was just `+ PANEL_WIDTH`).
+  CoordinateLabelRenderer's own docstring now reserves LABEL_MARGIN on
+  the right too (for the new right-side rank numbers), so the right
+  panel can no longer start immediately where the board ends - it must
+  now start LABEL_MARGIN pixels further right, with the label margin
+  band sitting between the board's own right edge and the right
+  panel's own left edge.
+- total_canvas_height = board_pixel_height + LABEL_MARGIN + LABEL_MARGIN
+  (Stage 15 - gained one more LABEL_MARGIN term for the new top file
+  row; was just `+ LABEL_MARGIN` for the bottom one alone).
+  SidePanelRenderer's own panels still run the FULL canvas height
+  (self._canvas.height, read directly by that class, unchanged) - so
+  each panel is now board_pixel_height + 2*LABEL_MARGIN tall, taller
+  than the board sub-canvas on BOTH ends now (top and bottom), not just
+  the bottom - the exact same "panel simply spans the same total
+  vertical extent everything else on the canvas does" reconciliation
+  Stage 13c originally established, just with one more margin band
+  included in it. No conflict between CoordinateLabelRenderer's now-
+  four-sided margin and SidePanelRenderer's own top-margin-free
+  LAYOUT CONTRACT: SidePanelRenderer never claimed exclusive use of
+  y=0..LABEL_MARGIN, it only claimed it needs no margin OF ITS OWN
+  there - CoordinateLabelRenderer's top file-letter row and each
+  panel's own top edge coexist at the same y range on main_canvas
+  without either needing to change because of the other.
+- CANVAS_BACKGROUND_COLOR: pure black, (0, 0, 0) BGR (Stage 15 -
+  previously a dark navy-brown tuple) - matches the reference image's
+  own backdrop exactly, rather than only approximating it. Still
+  visibly distinct from SidePanelRenderer's own, lighter
+  PANEL_BACKGROUND_COLOR, so the board and both panels still read as
+  layered elements sitting on top of the backdrop, not blending into
+  it - the same reasoning Stage 13c originally established for this
+  constant, just with a more precise target color now.
 - White panel on the LEFT (x=0), Black panel on the RIGHT
   (x=total_canvas_width - PANEL_WIDTH): the reference image does not
   specify a side, so this follows the broader convention already
@@ -232,6 +242,17 @@ already-existing constructor call, using the abstraction Stage 2
 already built for precisely this kind of "screen space differs from
 image space" problem, rather than bolting a second, redundant offset
 concept onto a class further down the chain.
+
+RE-VERIFIED, NOT JUST ASSUMED, AFTER STAGE 15 CHANGED board_origin_y
+(0 -> LABEL_MARGIN): this fix's own correctness does not depend on
+board_origin_y's specific VALUE at all - `window_origin` is read
+directly from `self._board_origin_x`/`self._board_origin_y` (above),
+never a hardcoded literal, so a changed board_origin_y is picked up
+automatically with no code change needed here. Re-run/extended the
+existing click-regression tests (test_game_loop_runner.py) with the
+new value specifically to confirm this claim empirically, not just
+reason about it from the code alone - see that file's own click-offset
+tests for the concrete before/after-Stage-15 verification.
 
 SOUND EFFECTS (Stage 14): SoundManager (kungfu_chess/client/audio/
 sound_manager.py) is subscribed exactly like the other four Observers
@@ -311,12 +332,15 @@ from kungfu_chess.view.renderer import Renderer, build_snapshot
 DEFAULT_WINDOW_NAME = "Kung Fu Chess"
 QUIT_KEY = "q"
 
-# Dark navy-brown backdrop for the reference image's redesigned layout
-# (Stage 13c) - noticeably darker than SidePanelRenderer's own
-# PANEL_BACKGROUND_COLOR (48, 33, 20) on every channel, deliberately:
-# the panels (and the board itself) should read as distinct, layered
-# elements sitting ON TOP of this backdrop, not blend into it.
-CANVAS_BACKGROUND_COLOR = (24, 16, 10)
+# Pure black backdrop for the reference image's redesigned layout
+# (Stage 15 - was a dark navy-brown approximation in Stage 13c; the
+# reference image's own backdrop is exactly black, so this now matches
+# it precisely instead of only approximating it). Still noticeably
+# darker than SidePanelRenderer's own PANEL_BACKGROUND_COLOR
+# (48, 33, 20) on every channel, so the panels (and the board itself)
+# still read as distinct, layered elements sitting ON TOP of this
+# backdrop, not blending into it.
+CANVAS_BACKGROUND_COLOR = (0, 0, 0)
 
 
 class _GameOverListener:
@@ -421,9 +445,9 @@ class GameLoopRunner:
         self._board_pixel_width = board.width * CELL_SIZE
         self._board_pixel_height = board.height * CELL_SIZE
         self._board_origin_x = PANEL_WIDTH + LABEL_MARGIN
-        self._board_origin_y = 0
-        self._total_canvas_width = self._board_origin_x + self._board_pixel_width + PANEL_WIDTH
-        self._total_canvas_height = self._board_pixel_height + LABEL_MARGIN
+        self._board_origin_y = LABEL_MARGIN
+        self._total_canvas_width = self._board_origin_x + self._board_pixel_width + LABEL_MARGIN + PANEL_WIDTH
+        self._total_canvas_height = self._board_pixel_height + LABEL_MARGIN + LABEL_MARGIN
 
         self._window_name = window_name
         if not headless:

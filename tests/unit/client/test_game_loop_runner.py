@@ -165,7 +165,10 @@ def test_request_jump_transitions_the_targeted_pieces_animator_to_jump():
     assert runner.piece_animator_registry.animator_for(rook.id).current_state == AnimationState.JUMP
 
 
-def test_canvas_layout_matches_the_documented_stage_13c_formula():
+def test_canvas_layout_matches_the_documented_stage_15_formula():
+    # Stage 15 reserves LABEL_MARGIN on all four sides (was left+bottom
+    # only, Stage 13c) - see game_loop.py's own "VISUAL LAYOUT"
+    # docstring section for the full reasoning behind every term below.
     grid = _empty_grid(8, 8)
     board = Board(grid)
 
@@ -174,9 +177,11 @@ def test_canvas_layout_matches_the_documented_stage_13c_formula():
     assert runner._board_pixel_width == 8 * CELL_SIZE
     assert runner._board_pixel_height == 8 * CELL_SIZE
     assert runner._board_origin_x == PANEL_WIDTH + LABEL_MARGIN
-    assert runner._board_origin_y == 0
-    assert runner._total_canvas_width == runner._board_origin_x + runner._board_pixel_width + PANEL_WIDTH
-    assert runner._total_canvas_height == runner._board_pixel_height + LABEL_MARGIN
+    assert runner._board_origin_y == LABEL_MARGIN
+    assert runner._total_canvas_width == (
+        runner._board_origin_x + runner._board_pixel_width + LABEL_MARGIN + PANEL_WIDTH
+    )
+    assert runner._total_canvas_height == runner._board_pixel_height + LABEL_MARGIN + LABEL_MARGIN
 
 
 def test_run_one_frame_does_not_raise_with_pieces_at_all_four_board_corners():
@@ -224,6 +229,35 @@ def test_left_click_at_the_pre_13c_raw_origin_no_longer_hits_the_board():
     runner = GameLoopRunner(board, window_name="TestClickOffsetRegression", headless=True)
 
     runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, CELL_SIZE // 2, CELL_SIZE // 2, 0, None)
+
+    assert runner.controller.selected is None
+
+
+def test_left_click_at_the_pre_stage_15_y_origin_no_longer_hits_the_board():
+    # Stage 15 specifically: board_origin_y moved from 0 to
+    # LABEL_MARGIN (a new top label row was added) - a click using the
+    # correct (post-13c) X offset but the OLD (pre-Stage-15) y=0
+    # assumption must now ALSO miss the board, exactly the kind of
+    # off-by-LABEL_MARGIN bug this test exists to catch (see
+    # game_loop.py's own "RE-VERIFIED, NOT JUST ASSUMED" docstring
+    # note).
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    runner = GameLoopRunner(board, window_name="TestClickYOffsetRegression", headless=True)
+
+    # window_y=0: under the OLD (pre-Stage-15) assumption board_origin_y
+    # was 0, so the board's very top row began right at the window's
+    # own y=0 - a click there used to land squarely in row 0. Under the
+    # CURRENT mapper (board_origin_y=LABEL_MARGIN), this maps to
+    # image_y = 0 - LABEL_MARGIN = -30, i.e. row -1: genuinely out of
+    # bounds, not just a different in-bounds cell (LABEL_MARGIN=30 is
+    # smaller than CELL_SIZE=100, so a smaller/arbitrary y offset could
+    # coincidentally still land inside row 0 by luck - this specific
+    # y value is chosen so the assertion cannot pass by coincidence).
+    window_x = runner._board_origin_x + CELL_SIZE // 2
+    runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, window_x, 0, 0, None)
 
     assert runner.controller.selected is None
 

@@ -37,16 +37,24 @@ table):
 - PromotionEvent -> "promotion" (Stage 14 also adds this event itself,
   kungfu_chess/client/events/game_events.py - see that file's own
   docstring for why it did not exist before this stage).
-- MoveRejected -> nothing. This project already established the
-  "MoveRejected is not this Observer's concern" pattern for
-  MovesLogObserver (kungfu_chess/client/events/observers.py's own
-  docstring: "a rejected move never actually happened... there is
-  nothing for a MOVE log to record") - the same reasoning applies
-  identically here: nothing audible should happen for an action that
-  never actually took place on the board, and a "rejection buzz" was
-  not requested by this stage's own scope (client_spec.md's audio
-  extension names successful actions and game-state changes, not
-  input-validation feedback).
+- MoveRejected -> "illegal_move" (Stage 15 - REVERSED from Stage 14's
+  original "nothing" mapping). Stage 14 reasoned MoveRejected wasn't
+  this Observer's concern, mirroring MovesLogObserver's own "a
+  rejected move never actually happened" logic - but that reasoning
+  was about whether a MOVE LOG entry belonged (a log records the
+  game's history, and a rejected move has none to add), which is not
+  the same question as whether a player should hear feedback for an
+  input they just tried and had refused. What actually changed since
+  Stage 14 is not the reasoning, but the assets available: the project
+  owner has now explicitly provided an "illegal_move" sound
+  (assets/sounds/illegal_move.wav, person-provided per Stage 15,
+  assets/sounds/README.md) for exactly this case - once a real,
+  intentional sound exists for it, staying silent on a rejected move
+  is no longer "out of this stage's scope" the way it was when no such
+  asset existed at all.
+
+MoveRejected is the only mapping this stage changes - every other row
+above is unchanged from Stage 14.
 
 ERROR HANDLING: no new exception type is introduced here, and none is
 needed - the same "match on the relevant types, ignore the rest"
@@ -68,6 +76,7 @@ from kungfu_chess.client.events.game_events import (
     GameOver,
     JumpAccepted,
     MoveAccepted,
+    MoveRejected,
     PieceArrived,
     PromotionEvent,
 )
@@ -84,6 +93,7 @@ SOUND_PATHS: Dict[str, Path] = {
     "game_start": SOUNDS_ROOT / "game_start.wav",
     "game_over": SOUNDS_ROOT / "game_over.wav",
     "promotion": SOUNDS_ROOT / "promotion.wav",
+    "illegal_move": SOUNDS_ROOT / "illegal_move.wav",
 }
 
 
@@ -117,6 +127,8 @@ class SoundManager:
             self._play("game_over")
         elif isinstance(event, PromotionEvent):
             self._play("promotion")
+        elif isinstance(event, MoveRejected):
+            self._play("illegal_move")
 
     def play_game_start(self) -> None:
         """Play the "game_start" cue - a public method, not routed

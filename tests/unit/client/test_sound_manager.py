@@ -104,17 +104,17 @@ def test_promotion_event_plays_the_promotion_sound():
     assert audio.played == [SOUND_PATHS["promotion"]]
 
 
-def test_move_rejected_plays_nothing():
-    # See sound_manager.py's own docstring: the same "not this
-    # Observer's concern" reasoning MovesLogObserver already
-    # established for MoveRejected (Stage 8) applies here too - nothing
-    # audible for an action that never actually happened on the board.
+def test_move_rejected_plays_the_illegal_move_sound():
+    # Stage 15 - REVERSED from Stage 14's original "plays nothing"
+    # behavior: see sound_manager.py's own updated docstring for why
+    # (an illegal_move.wav asset now exists - that is what actually
+    # changed, not the underlying reasoning).
     audio = FakeAudioPlayer()
     manager = SoundManager(audio)
 
     manager.on_event(MoveRejected(reason="cooldown_active"))
 
-    assert audio.played == []
+    assert audio.played == [SOUND_PATHS["illegal_move"]]
 
 
 def test_play_game_start_plays_the_game_start_sound():
