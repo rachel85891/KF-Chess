@@ -7,6 +7,8 @@ import cv2
 import pytest
 
 from kungfu_chess.client.animation.animation_state import AnimationState
+from kungfu_chess.client.audio.audio_player import AudioPlayer
+from kungfu_chess.client.audio.sound_manager import SOUND_PATHS
 from kungfu_chess.client.loop.game_loop import GameLoopRunner
 from kungfu_chess.client.ui.coordinate_label_renderer import LABEL_MARGIN
 from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH
@@ -242,6 +244,73 @@ def test_right_click_jump_request_also_respects_the_board_origin_offset():
     runner.mouse_adapter.on_mouse_event(cv2.EVENT_RBUTTONDOWN, window_x, window_y, 0, None)
 
     assert runner.piece_animator_registry.animator_for(rook.id).current_state == AnimationState.JUMP
+
+
+def test_sound_manager_is_subscribed_and_reacts_to_a_real_move_accepted_event(monkeypatch):
+    # AudioPlayer.play is patched at the CLASS level (not an instance
+    # attribute) so it intercepts every AudioPlayer instance -
+    # including the one GameLoopRunner constructs internally - without
+    # ever reaching the real winsound call underneath (see
+    # test_audio_player.py for that layer's own, separate coverage).
+    # This deliberately bypasses `enabled` entirely: this test verifies
+    # SoundManager's real dispatch logic actually fires, independent of
+    # whether headless mode would have suppressed real playback.
+    played: list = []
+    monkeypatch.setattr(AudioPlayer, "play", lambda self, path: played.append(path))
+
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    runner = GameLoopRunner(board, window_name="TestSound", headless=True)
+    played.clear()  # discard the game_start call already made at construction
+
+    runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
+
+    assert played == [SOUND_PATHS["move"]]
+
+
+def test_game_start_sound_plays_exactly_once_at_construction_not_per_frame(monkeypatch):
+    played: list = []
+    monkeypatch.setattr(AudioPlayer, "play", lambda self, path: played.append(path))
+
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+
+    runner = GameLoopRunner(board, window_name="TestGameStart", headless=True)
+
+    assert played == [SOUND_PATHS["game_start"]]
+
+    runner._run_one_frame(16)
+    runner._run_one_frame(16)
+    runner._run_one_frame(16)
+
+    assert played.count(SOUND_PATHS["game_start"]) == 1  # still exactly once, not once per frame
+
+
+def test_audio_player_is_disabled_in_headless_mode_so_no_real_playback_is_attempted(monkeypatch):
+    # Unlike the two tests above (which patch AudioPlayer.play itself
+    # to bypass `enabled`), this one verifies the `enabled` wiring
+    # directly: headless=True must produce an AudioPlayer that would
+    # decline to call winsound at all, even for a real event.
+    import kungfu_chess.client.audio.audio_player as audio_player_module
+
+    class _FailIfCalled:
+        def PlaySound(self, *args, **kwargs):
+            raise AssertionError("real winsound.PlaySound must never be called in headless mode")
+
+    monkeypatch.setattr(audio_player_module, "_winsound", _FailIfCalled())
+
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    runner = GameLoopRunner(board, window_name="TestHeadlessAudio", headless=True)
+
+    runner.publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    runner._run_one_frame(16)  # no AssertionError raised == success
 
 
 def test_non_headless_construction_creates_a_real_window_when_a_display_is_available():

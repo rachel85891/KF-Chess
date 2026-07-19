@@ -46,10 +46,12 @@ through GameEventPublisher at all (GameEventPublisher.wait() used to
 call GameEngine.wait() directly, bypassing ExtraEngine, and therefore
 Promotion, entirely). This is consistent with how ExtraEngine is used
 everywhere else in this codebase (never JUMP-without-Promotion) and
-does not change any EXISTING test's observable output (none exercise a
-pawn reaching the promotion row), but is flagged here explicitly
-rather than left as a silent side effect for a future reader to
-discover by surprise.
+does not change any EXISTING (pre-Stage-14) test's observable output
+(none exercise a pawn reaching the promotion row), but is flagged here
+explicitly rather than left as a silent side effect for a future
+reader to discover by surprise. Stage 14 is the first stage to make a
+real promotion observably visible to Observers at all - see wait()'s
+own docstring for the new PromotionEvent this now publishes.
 
 GameEventPublisherError/MotionNotFoundError follow the same
 one-class-per-failure-mode convention as
@@ -75,6 +77,7 @@ from kungfu_chess.client.events.game_events import (
     MoveAccepted,
     MoveRejected,
     PieceArrived,
+    PromotionEvent,
 )
 from kungfu_chess.engine.game_engine import MoveResult
 from kungfu_chess.extra.extra_engine import ExtraEngine
@@ -278,14 +281,26 @@ class GameEventPublisher:
         in one call. This is also what actually makes JUMP landing/
         interception happen at all (see module docstring) - without
         this, an accepted jump would start but never resolve.
-        interception_events and promoted (ExtraEngine.wait's other two
-        return values) are deliberately not turned into published
-        events here - out of this stage's JUMP-only scope; a future
-        stage can add InterceptionEvent/PromotionEvent-style events the
-        same way this one adds JumpAccepted.
+        interception_events (ExtraEngine.wait's other return value) is
+        deliberately not turned into a published event here - out of
+        this stage's JUMP-only scope; a future stage can add an
+        InterceptionEvent-style event the same way this one adds
+        JumpAccepted. `promoted` (ExtraEngine.wait's third return
+        value) IS now turned into a published PromotionEvent (Stage
+        14) - previously discarded entirely (`_promoted`), since
+        nothing consumed it before Stage 14's SoundManager needed a
+        real, distinguishable promotion trigger. Each promoted piece is
+        matched back to its own arrival by piece_id (below) and
+        published as a PromotionEvent right after that arrival's own
+        PieceArrived - safe to match this way because apply_promotions
+        (kungfu_chess/extra/promotion.py, re-verified directly) only
+        ever appends a piece it found by iterating this exact
+        arrival_events batch, so every id in `promoted` is guaranteed
+        to belong to exactly one arrival already in this loop.
         """
 
-        _interception_events, arrival_events, _promoted = self._extra_engine.wait(ms)
+        _interception_events, arrival_events, promoted = self._extra_engine.wait(ms)
+        promoted_piece_ids = {piece.id for piece in promoted}
 
         pending: List[object] = []
         for arrival in arrival_events:
@@ -297,6 +312,14 @@ class GameEventPublisher:
             )
             if arrival.king_captured:
                 pending.append(GameOver(winner_color=arrival.captured_piece.color.opposite))
+            if arrival.piece.id in promoted_piece_ids:
+                # arrival.piece.kind is already the promoted kind here:
+                # apply_promotions (inside ExtraEngine.wait, above)
+                # mutates it in place before returning - re-verified
+                # directly in extra/promotion.py.
+                pending.append(
+                    PromotionEvent(piece_id=arrival.piece.id, cell=arrival.destination, new_kind=arrival.piece.kind)
+                )
 
         for event in self._ordering_policy(pending):
             self._notify(event)

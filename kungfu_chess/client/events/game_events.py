@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from kungfu_chess.model.color import Color
+from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 
 
@@ -75,3 +76,26 @@ class GameOver:
     captured."""
 
     winner_color: Color
+
+
+@dataclass(frozen=True)
+class PromotionEvent:
+    """A pawn (piece_id) arrived on its color's back rank and was
+    promoted to new_kind, per extra/promotion.py's apply_promotions
+    (Stage 14 - previously computed but never published, see
+    GameEventPublisher.wait()'s own docstring for why). Always
+    published alongside a PieceArrived for the same arrival - a
+    promotion cannot happen without the arrival that triggers it, so
+    this is deliberately a second, separate event rather than a field
+    added onto PieceArrived (matching CaptureLogEntry's own precedent,
+    kungfu_chess/client/events/observers.py: a materially different
+    fact about the same moment is a second event, not an optional
+    field that most PieceArrived events would never set). new_kind is
+    apply_promotions's own real, current result (always QUEEN today,
+    per spec.md §2), not hardcoded here - if promotion rules ever
+    allow choosing a piece kind, this event's shape already
+    accommodates it with no change needed."""
+
+    piece_id: int
+    cell: Position
+    new_kind: PieceKind

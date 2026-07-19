@@ -233,6 +233,36 @@ already built for precisely this kind of "screen space differs from
 image space" problem, rather than bolting a second, redundant offset
 concept onto a class further down the chain.
 
+SOUND EFFECTS (Stage 14): SoundManager (kungfu_chess/client/audio/
+sound_manager.py) is subscribed exactly like the other four Observers
+- it reacts to MoveAccepted/JumpAccepted/PieceArrived/GameOver/
+PromotionEvent entirely on its own, with no per-frame involvement from
+this class. The one sound this class DOES trigger directly is
+"game_start" - not itself a published event (see SoundManager.
+play_game_start's own docstring for why not) - called exactly once, at
+the very end of __init__ (after every other wire-up, so audio_player/
+sound_manager already exist), not inside run() or _run_one_frame:
+__init__ runs exactly once per GameLoopRunner instance, the same
+"exactly once" cardinality game-start itself has, and (unlike run(),
+an infinite real-time loop no test in this suite calls directly - see
+this module's own "WHY headless" section above) __init__ is already
+exercised by every existing headless test, making it both the
+semantically obvious place (a game starts the moment its runner
+finishes being built) and the only one this project's own established
+testing convention can actually verify runs exactly once.
+
+AudioPlayer is constructed with `enabled=not headless` - see
+AudioPlayer's own docstring for the full reasoning, but in short: real
+OS-level sound playback must not happen during a headless test run
+(most of this suite triggers real events, which SoundManager reacts to
+regardless of headless), while SoundManager's own event -> sound
+dispatch LOGIC must still run and be verifiable either way - `enabled`
+lives on AudioPlayer as a plain, headless-agnostic mute switch, with
+GameLoopRunner (the one place that already knows what "headless"
+means) deciding when to set it, matching Stage 10c's own established
+"headless is a composition-root decision, not a concept sub-components
+need to know about" pattern exactly.
+
 ERROR HANDLING: no new exception type is introduced in this file, and
 none is needed. Every failure mode reachable through this class's own
 code already has a more specific, existing exception raised by the
@@ -253,6 +283,8 @@ import time
 
 import cv2
 
+from kungfu_chess.client.audio.audio_player import AudioPlayer
+from kungfu_chess.client.audio.sound_manager import SoundManager
 from kungfu_chess.client.events.cooldown_tracker import CooldownTracker
 from kungfu_chess.client.events.event_publisher import GameEventPublisher
 from kungfu_chess.client.events.game_events import GameOver
@@ -357,10 +389,20 @@ class GameLoopRunner:
         self.moves_log_observer = MovesLogObserver(self.piece_registry)
         self.cooldown_tracker = CooldownTracker()
 
+        # enabled=not headless - see AudioPlayer's own docstring for
+        # why this (not a "headless" concept inside AudioPlayer itself)
+        # is the correct place to gate real OS-level playback: every
+        # headless test that triggers a real event must not attempt a
+        # real winsound call, while SoundManager's own event->sound
+        # dispatch logic still runs and is still fully verifiable.
+        self.audio_player = AudioPlayer(enabled=not headless)
+        self.sound_manager = SoundManager(self.audio_player)
+
         self.publisher.subscribe(self.piece_animator_registry)
         self.publisher.subscribe(self.score_observer)
         self.publisher.subscribe(self.moves_log_observer)
         self.publisher.subscribe(self.cooldown_tracker)
+        self.publisher.subscribe(self.sound_manager)
 
         self._game_over = False
         self._quit_requested = False
@@ -402,6 +444,18 @@ class GameLoopRunner:
         self.mouse_adapter = MouseAdapter(mapper, self.controller, on_jump_requested=self._request_jump)
         if not headless:
             self.mouse_adapter.attach(window_name)
+
+        # Played exactly once, HERE - the end of __init__ - not inside
+        # run() or _run_one_frame. See module docstring's "SOUND
+        # EFFECTS" section for the full reasoning; in short: a game
+        # starts the moment this class finishes wiring one up, and
+        # __init__ (unlike run(), an infinite real-time loop this
+        # project's own tests never call directly - see this module's
+        # "WHY headless" section) is the one place already exercised by
+        # every existing headless test, so this is both the
+        # semantically correct AND the only practically testable place
+        # for a true "exactly once, at construction" event.
+        self.sound_manager.play_game_start()
 
     def _mark_game_over(self) -> None:
         """The _GameOverListener's callback - kept as its own tiny

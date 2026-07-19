@@ -5,7 +5,14 @@ import pytest
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
 from kungfu_chess.client.events.event_publisher import GameEventPublisher, MotionNotFoundError
-from kungfu_chess.client.events.game_events import GameOver, JumpAccepted, MoveAccepted, MoveRejected, PieceArrived
+from kungfu_chess.client.events.game_events import (
+    GameOver,
+    JumpAccepted,
+    MoveAccepted,
+    MoveRejected,
+    PieceArrived,
+    PromotionEvent,
+)
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.extra.extra_engine import ExtraEngine
 from kungfu_chess.extra.jump import JUMP_COOLDOWN_MS, JUMP_DURATION_MS
@@ -150,6 +157,43 @@ def test_wait_publishes_game_over_after_piece_arrived_on_king_capture():
         PieceArrived(piece_id=rook.id, cell=Position(row=0, col=1), captured_piece_id=king.id),
         GameOver(winner_color=Color.WHITE),
     ]
+
+
+def test_wait_publishes_promotion_event_after_piece_arrived_when_a_pawn_reaches_the_back_rank():
+    grid = _empty_grid(3, 3)
+    pawn = _piece(Color.WHITE, PieceKind.PAWN, Position(row=1, col=0))
+    grid[1][0] = pawn
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+    publisher.request_move(Position(row=1, col=0), Position(row=0, col=0))
+    observer.events.clear()
+
+    publisher.wait(MS_PER_SQUARE)
+
+    assert observer.events == [
+        PieceArrived(piece_id=pawn.id, cell=Position(row=0, col=0), captured_piece_id=None),
+        PromotionEvent(piece_id=pawn.id, cell=Position(row=0, col=0), new_kind=PieceKind.QUEEN),
+    ]
+    assert pawn.kind == PieceKind.QUEEN
+
+
+def test_wait_publishes_no_promotion_event_for_an_ordinary_arrival():
+    grid = _empty_grid(4, 1)
+    pawn = _piece(Color.WHITE, PieceKind.PAWN, Position(row=2, col=0))
+    grid[2][0] = pawn
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+    publisher.request_move(Position(row=2, col=0), Position(row=1, col=0))  # forward one, not yet the back rank
+    observer.events.clear()
+
+    publisher.wait(MS_PER_SQUARE)
+
+    assert observer.events == [PieceArrived(piece_id=pawn.id, cell=Position(row=1, col=0), captured_piece_id=None)]
+    assert pawn.kind == PieceKind.PAWN
 
 
 def test_default_ordering_policy_preserves_engine_fifo_order():
