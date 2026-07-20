@@ -284,6 +284,44 @@ means) deciding when to set it, matching Stage 10c's own established
 "headless is a composition-root decision, not a concept sub-components
 need to know about" pattern exactly.
 
+EVENTBUS WIRING (Stage A3, server track): this class now constructs
+one real kungfu_chess.bus.EventBus (Stage A1) and passes it into
+GameEventPublisher's own `event_bus` constructor parameter (Stage A2),
+which already accepts and optionally publishes onto one - see
+event_publisher.py's own "EVENTBUS INTEGRATION" docstring section for
+that half of the wiring. This class's own contribution is purely
+compositional: construct one instance, hand it to the publisher,
+expose it. Nothing new is subscribed to it here, and nothing about
+this class's own logic changes - it is additive wiring only, proven
+by the tests in test_game_loop_runner_bus_wiring.py rather than by any
+new inline printer/logger "just to see it work."
+
+WHY `self.event_bus` is a public attribute, not a private local
+variable inside __init__: unlike every other object __init__
+constructs (asset_cache, mouse_adapter, etc.), which this class is the
+sole consumer of, event_bus's entire purpose is to be reached from
+OUTSIDE this class by a future stage - a server-side WS layer that
+will subscribe a broadcaster to it (e.g.
+`runner.event_bus.subscribe(MoveAccepted, broadcaster.on_event)`) once
+that layer exists. A local variable discarded at the end of __init__
+could never serve that purpose; every other attribute this class
+already exposes publicly (`publisher`, `engine`, `controller`, etc.)
+follows the exact same "the composition root exposes what outside code
+will need to reach" pattern, so this is not a new convention, just
+this stage's own instance of it.
+
+WHY no subscriber is attached to event_bus in this stage: this stage's
+entire scope is proving the CONNECTION is real, not deciding what a
+future consumer of it should look like. Adding even a minimal
+logger/example handler here would bake in a first, throwaway design for
+"what subscribes to this bus" that a future Stage B (the real WS
+broadcaster) would then have to either keep, ignore, or actively
+remove - none of which is this stage's decision to make. Leaving it at
+"constructed, wired into the publisher, exposed, empty" is therefore
+the correct stopping point: connected and provably alive (see this
+module's own bus-wiring tests), but with zero opinions imposed on
+whatever subscribes to it next.
+
 ERROR HANDLING: no new exception type is introduced in this file, and
 none is needed. Every failure mode reachable through this class's own
 code already has a more specific, existing exception raised by the
@@ -304,6 +342,7 @@ import time
 
 import cv2
 
+from kungfu_chess.bus.event_bus import EventBus
 from kungfu_chess.client.audio.audio_player import AudioPlayer
 from kungfu_chess.client.audio.sound_manager import SoundManager
 from kungfu_chess.client.events.cooldown_tracker import CooldownTracker
@@ -398,7 +437,17 @@ class GameLoopRunner:
 
         self.engine = GameEngine(board)
         self.extra_engine = ExtraEngine(self.engine)
-        self.publisher = GameEventPublisher(self.extra_engine)
+
+        # Stage A3 (server track) - see module docstring's "EVENTBUS
+        # WIRING" section for the full reasoning: a public attribute
+        # (not a private local variable) since a future server-side
+        # stage must be able to reach this exact instance from OUTSIDE
+        # this class to subscribe a WS broadcaster to it. Nothing is
+        # subscribed to it here - this stage only proves the wiring is
+        # real, deliberately leaving it an unused-but-connected bus for
+        # that future stage to be the first real consumer of.
+        self.event_bus = EventBus()
+        self.publisher = GameEventPublisher(self.extra_engine, event_bus=self.event_bus)
 
         # Two independent registries, snapshotting the SAME initial
         # board separately - Stage 8's PieceRegistry (kind/color
