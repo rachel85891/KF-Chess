@@ -7,9 +7,17 @@ a structured ParsedMoveCommand.
 SRP, and why this is its own module, not inlined in the WS handler:
 this is a pure parser with no networking/GameSession/ConnectionManager
 knowledge - independently unit-testable on its own (per this stage's
-own requirement), exactly like server/algebraic_notation.py (which it
-depends on for the two square conversions) stays independent of this
-module in turn.
+own requirement), exactly like kungfu_chess/notation/algebraic_notation.py
+(which it depends on for the two square conversions) stays independent
+of this module in turn.
+
+STAGE B5 UPDATE: the square<->Position conversion this module depends
+on now lives at kungfu_chess/notation/algebraic_notation.py, not
+server/algebraic_notation.py - relocated so a client (which must never
+import from server/) can share the exact same logic to build outgoing
+commands. server/algebraic_notation.py still exists, as a thin
+re-export shim, purely for backward-compatible imports (see its own
+docstring) - this module now imports from the new location directly.
 
 WHY the piece-kind letter is parsed here but NOT validated against a
 real board here: per this project's own established convention, the
@@ -45,7 +53,7 @@ from dataclasses import dataclass
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
-from server.algebraic_notation import algebraic_to_position
+from kungfu_chess.notation.algebraic_notation import algebraic_to_position
 
 _COMMAND_LENGTH = 6
 
