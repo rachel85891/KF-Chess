@@ -134,6 +134,35 @@ completely agnostic to "how many games exist" today. This stage
 deliberately does not build any dict-of-rooms/room-id parsing now -
 there is exactly one real caller (this stage's own tests and
 server/main.py) and no real second room to design against yet.
+
+BUGFIX - INITIAL BOARD STATE ON JOIN: a real usability gap found during
+manual testing, fixed here. WHY THE GAP EXISTED: `_on_game_event` (the
+broadcaster) is only ever invoked by the event_bus in reaction to a
+real game EVENT (MoveAccepted/MoveRejected/PieceArrived/GameOver) -
+joining a connection is not itself one of those four events, so a
+freshly-joined client received only its own `assigned_color:...`
+message and then genuine silence until somebody (possibly not even
+them) made the very first move anywhere in the game, with no way to
+know where any piece was in the meantime. WHY THE FIX POINT IS HERE, IN
+`handle_connection`: this is already the one place that both (a) knows
+this is one specific, just-joined connection (not "broadcast to
+everyone") and (b) already sends that connection a direct,
+point-to-point message (`assigned_color:...` via `_safe_send`) -
+reusing that exact same single-connection send path for the current
+board state, right after it, needed no new connection-tracking
+mechanism at all. `_current_board_text()` is a new, tiny private
+helper - the exact `BoardPrinter().print(self._session.engine.board)`
+call `_on_game_event` already made, factored out and now called from
+BOTH places, so there is still only ONE board-serialization code path
+in this class, not two. This is a point-to-point send to the
+just-joined connection ONLY (a plain `_safe_send` call, not
+`_broadcast`) - an already-connected opponent does not need or want a
+redundant duplicate board state just because a second player joined.
+The "server_full" rejection branch (above, in this same method) returns
+before this new send is ever reached, so it is completely unaffected -
+re-verified directly, and covered by
+tests/integration/server/test_initial_board_state_on_join.py's own
+dedicated rejection test.
 """
 
 from __future__ import annotations
@@ -220,6 +249,10 @@ class GameServer:
         # Color.value ("w"/"b") the wire protocol itself uses - this
         # message is for a human/log to read, not parsed by anything.
         await self._safe_send(connection, f"assigned_color:{color.name.lower()}")
+        # See module docstring's "BUGFIX - INITIAL BOARD STATE ON
+        # JOIN" - a direct, point-to-point send to THIS connection
+        # only, not a broadcast to every connection.
+        await self._safe_send(connection, self._current_board_text())
 
         try:
             async for message in connection:
@@ -310,8 +343,23 @@ class GameServer:
             None.
         """
 
-        board_text = BoardPrinter().print(self._session.engine.board)
-        asyncio.create_task(self._broadcast(board_text))
+        asyncio.create_task(self._broadcast(self._current_board_text()))
+
+    def _current_board_text(self) -> str:
+        """The exact board-serialization call used for both the
+        event-driven broadcaster (above) and the join-time send (see
+        handle_connection and module docstring's "BUGFIX - INITIAL
+        BOARD STATE ON JOIN") - kept as the single place this class
+        turns the current board into wire text, so there is exactly
+        one board-serialization code path, not two.
+
+        Returns:
+            The current board, serialized via the existing
+            BoardPrinter - the same textual convention this project's
+            tests already rely on for board assertions.
+        """
+
+        return BoardPrinter().print(self._session.engine.board)
 
     async def _broadcast(self, text: str) -> None:
         """Send `text` to every currently-tracked connection.
