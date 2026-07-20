@@ -96,6 +96,25 @@ class _BackgroundTestServer:
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
 
 
+def _window_pixel(runner: NetworkGameLoopRunner, cell: Position) -> tuple[int, int]:
+    """Convert a logical cell to a WINDOW pixel coordinate a real mouse
+    click at that cell would produce - i.e. the board's own offset
+    within the window (runner._board_origin_x/_y) plus the cell's own
+    pixel position within the board, mirroring
+    tests/unit/client/test_game_loop_runner.py's own established click-
+    offset-aware test pattern exactly (see that file's own
+    test_left_click_correctly_selects_the_piece_under_the_cursor_
+    despite_the_panel_offset). Passing raw board-relative pixels
+    directly (without this offset) would click the wrong cell, since
+    ScreenToImageMapper.to_image subtracts window_origin before
+    resolving a cell - the same real bug class that test file's own
+    click-offset regression tests exist to catch."""
+
+    window_x = runner._board_origin_x + cell.col * CELL_SIZE + CELL_SIZE // 2
+    window_y = runner._board_origin_y + cell.row * CELL_SIZE + CELL_SIZE // 2
+    return window_x, window_y
+
+
 def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> None:
     """Repeatedly call runner.poll_and_process() (real sleeps, real
     time) until predicate(runner) is True or timeout_s elapses -
@@ -137,9 +156,9 @@ def test_a_click_sequence_on_the_local_players_own_piece_sends_a_real_move_and_i
 
         e2 = Position(row=6, col=4)
         e4 = Position(row=4, col=4)
-        window_x, window_y = e2.col * CELL_SIZE + CELL_SIZE // 2, e2.row * CELL_SIZE + CELL_SIZE // 2
+        window_x, window_y = _window_pixel(runner, e2)
         runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, window_x, window_y, 0, None)
-        window_x, window_y = e4.col * CELL_SIZE + CELL_SIZE // 2, e4.row * CELL_SIZE + CELL_SIZE // 2
+        window_x, window_y = _window_pixel(runner, e4)
         runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, window_x, window_y, 0, None)
 
         def arrived(r: NetworkGameLoopRunner) -> bool:
@@ -181,7 +200,7 @@ def test_click_on_the_opponents_piece_does_not_send_a_move():
         runner.network_client.send_move = lambda *args, **kwargs: sent.append((args, kwargs))
 
         black_pawn = Position(row=1, col=4)
-        window_x, window_y = black_pawn.col * CELL_SIZE + CELL_SIZE // 2, black_pawn.row * CELL_SIZE + CELL_SIZE // 2
+        window_x, window_y = _window_pixel(runner, black_pawn)
         runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, window_x, window_y, 0, None)
 
         assert sent == []
