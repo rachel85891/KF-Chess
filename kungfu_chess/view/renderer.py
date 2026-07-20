@@ -20,6 +20,44 @@ pixel positions (top-left corner of each cell, i.e. col*CELL_SIZE /
 row*CELL_SIZE - the same anchor convention BoardMapper already uses).
 A piece not currently in an active motion renders at its own cell's
 pixel position directly.
+
+build_snapshot_from_board (Stage B6, server track): a SECOND, additive
+snapshot builder, alongside build_snapshot above - not a replacement
+for it, and build_snapshot/Renderer/GameSnapshot/PieceSnapshot are all
+otherwise completely unchanged by this addition (re-verified via diff
+before committing). Needed because kungfu_chess/client/loop/
+network_game_loop_runner.py's NetworkGameLoopRunner has no GameEngine/
+Controller/RealTimeArbiter at all - the server, not this process, is
+the sole source of truth (matching every other network-track stage's
+own design: B2's GameSession, B3's GameServer) - it only ever has a
+plain Board, parsed via BoardParser from a server board-state
+broadcast. build_snapshot itself cannot be reused as-is for this: it
+unconditionally reads engine.state.clock_ms and
+engine.arbiter.active_motions() to interpolate in-flight motion, and
+network mode has neither a real engine nor a real arbiter to ask.
+
+SCOPE DECISION (Stage B6, explicit and accepted - do not relitigate):
+the server's existing broadcast (Stage B3) sends a full board-as-text
+snapshot at two points per move (MoveAccepted = pre-move, PieceArrived
+= post-move), not the rich, continuous animation-frame event stream
+PieceAnimatorRegistry expects locally. Building smooth cross-network
+animation is explicitly OUT OF SCOPE for Stage B6 and left to a
+separate future stage. build_snapshot_from_board therefore never
+interpolates - every piece renders statically at its own cell's pixel
+position (Piece.state itself, always PieceState.IDLE for anything
+BoardParser ever produces, is used as-is; there is no live animation
+state to ask for in network mode either).
+
+`game_over` defaults to False and is never inferred from the Board
+itself: raw board-state broadcast text carries no explicit game-over
+signal at all (GameServer's own broadcaster sends identical board text
+regardless of which of MoveAccepted/MoveRejected/PieceArrived/GameOver
+triggered it) - a documented, accepted gap, not something this function
+can silently paper over by guessing (e.g. "a missing king" would be an
+inference, not a fact this function was told). A future stage wanting
+real game-over detection in network mode would need either a
+distinguishable server message or explicit client-side board diffing;
+out of scope here.
 """
 
 from __future__ import annotations
@@ -29,6 +67,7 @@ from typing import Optional
 
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.input.controller import Controller
+from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind, PieceState
 from kungfu_chess.model.position import Position
@@ -97,6 +136,51 @@ def build_snapshot(engine: GameEngine, controller: Controller) -> GameSnapshot:
         pieces=tuple(pieces),
         game_over=engine.state.game_over,
         selected=controller.selected,
+    )
+
+
+def build_snapshot_from_board(
+    board: Board,
+    selected: Optional[Position] = None,
+    game_over: bool = False,
+) -> GameSnapshot:
+    """Build a GameSnapshot directly from a plain Board - no
+    GameEngine/Controller/RealTimeArbiter involved. See module
+    docstring's "build_snapshot_from_board (Stage B6...)" section for
+    the full reasoning (why this exists, and its explicit no-
+    interpolation scope decision).
+
+    Args:
+        board: The Board to snapshot - e.g. one just parsed via
+            BoardParser from a server board-state broadcast.
+        selected: The currently-selected cell, if any (same role as
+            Controller.selected for build_snapshot above) - passed
+            through to GameSnapshot as-is.
+        game_over: Whether to mark the snapshot as game-over. Defaults
+            to False - see module docstring for why this can never be
+            inferred from `board` itself.
+
+    Returns:
+        A GameSnapshot with every piece rendered statically at its own
+        cell's pixel position (no in-flight interpolation).
+    """
+
+    pieces = []
+    for row in range(board.height):
+        for col in range(board.width):
+            piece = board.piece_at(Position(row=row, col=col))
+            if piece is None:
+                continue
+
+            x, y = _cell_pixel(piece.cell)
+            pieces.append(PieceSnapshot(id=piece.id, kind=piece.kind, color=piece.color, x=x, y=y, state=piece.state))
+
+    return GameSnapshot(
+        board_width=board.width,
+        board_height=board.height,
+        pieces=tuple(pieces),
+        game_over=game_over,
+        selected=selected,
     )
 
 
