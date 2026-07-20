@@ -22,6 +22,84 @@ fields + what a class deliberately does NOT depend on):
 - Holds no class-level or module-level mutable state: every field
   below is a per-instance attribute, set in __init__.
 
+BUGFIX - PieceArrived FORCES MOVE/JUMP TO IDLE (an architectural
+correction, not just a patch): before this fix, on_event had NO
+reaction to PieceArrived at all - the ONLY way to leave MOVE/JUMP was
+advance()'s own frame-exhaustion branch (frames_elapsed >=
+frame_count), which depends entirely on the CURRENT StateConfig's own
+frames_per_sec/frame_count - a config-time, rendering detail
+(state_config.py's StateConfig.graphics) with NO guaranteed
+relationship to the real game motion's own actual duration_ms (derived
+from real board distance and PIECE_SPEED, docs/spec.md §10). These are
+two genuinely independent timing sources that were never actually
+coupled by any enforced invariant - whenever they drifted apart, or
+whenever a state was configured with is_loop=True (a state that, by
+`advance`'s own logic, NEVER exhausts on its own - re-verified
+directly), the animator would remain stuck in MOVE/JUMP forever after
+the piece had ALREADY arrived. Confirmed this is not a rare corner
+case: the real vendored assets
+(assets/pieces/RW/states/move/config.json) configure MOVE with
+is_loop=true, meaning a Rook's own real MOVE animation could never end
+on its own at all, with or without any timing drift - PieceArrived was
+the only correct authority to end it.
+
+THE FIX: PieceArrived is the real game engine's own authoritative
+signal (via RealTimeArbiter/GameEventPublisher.wait, confirmed
+directly: published for both move and jump completion, from the same
+code path) that a motion has genuinely finished - on_event now reacts
+to it by forcing an unconditional transition to AnimationState.IDLE,
+regardless of the current state's is_loop value, elapsed_ms_in_state,
+or frame count. This removes the previous implicit, unenforced
+coupling between two independent timing sources by making the exit
+transition EVENT-DRIVEN, exactly matching how MOVE/JUMP's own ENTRY
+transitions already work (event-driven via MoveAccepted/JumpAccepted,
+never timing-inferred) - the state machine's entry and exit are now
+symmetric in kind, both authoritative-event-driven, with
+advance()'s own frame-exhaustion mechanism demoted from "the only way
+out of MOVE/JUMP" to "a second, lower-priority way out" (still fully
+correct and necessary - see below).
+
+advance()'s existing frame-exhaustion logic is completely UNCHANGED,
+and still matters: it is what advances the frame index while MOVE/JUMP
+is still genuinely in progress (a real, necessary responsibility this
+fix does not touch), and it remains the ONLY exit mechanism for states
+that have no corresponding real game event marking their own end - see
+the next paragraph.
+
+WHY PieceArrived ONLY forces IDLE when current_state is ACTUALLY
+MOVE or JUMP - not from every state (the answer to this fix's own
+"what about other states" question, resolved by re-reading
+client_spec.md §5 and the real vendored config chain directly, not
+guessed): SHORT_REST and LONG_REST are purely visual, config-chained
+post-landing recovery states with NO corresponding "it's over" game
+event of their own - re-verified directly against the real assets
+(assets/pieces/RW/states/): JUMP's own config chains
+jump -> short_rest -> long_rest -> idle entirely via
+next_state_when_finished, with no game-engine involvement in that
+chain at all once the jump's own PieceArrived has already fired. This
+is exactly the same category client_spec.md's own architecture already
+uses for capture/hit-reaction-style animations that have no matching
+event: frame-exhaustion is their ONLY legitimate way to transition, by
+design. Forcing IDLE from mid-SHORT_REST/LONG_REST on a (redundant or
+merely late-arriving) PieceArrived would truncate a deliberate visual
+flourish that has nothing further to do with the real motion, which
+has already concluded by the time SHORT_REST is even reached. This
+also means IDLE itself is left alone too (a PieceArrived while already
+IDLE is a pre-existing, harmless no-op, unchanged by this fix - see
+tests/unit/client/test_piece_animator.py's own
+test_irrelevant_event_types_for_own_piece_id_are_ignored, which already
+covers exactly this case and needed no edits for this fix to keep
+passing).
+
+PieceAnimatorRegistry (piece_animator_registry.py) needed NO changes
+for this fix - re-confirmed directly, not assumed: its own on_event
+routing only ever checks `event.piece_id` and forwards to the matching
+PieceAnimator's own on_event unconditionally, with zero branching on
+event TYPE (OCP, per that file's own docstring) - PieceArrived already
+flows through the exact same routing path MoveAccepted/JumpAccepted
+already use, reaching the right PieceAnimator's own (now fixed)
+on_event with no registry-level change required at all.
+
 Fields (per spec.md §5's convention of stating fields for every
 class):
 - piece_id: int - identifies which Piece this animator tracks;
@@ -46,7 +124,7 @@ from typing import Dict
 
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.animation.state_config import StateConfig
-from kungfu_chess.client.events.game_events import JumpAccepted, MoveAccepted
+from kungfu_chess.client.events.game_events import JumpAccepted, MoveAccepted, PieceArrived
 
 
 class PieceAnimatorError(Exception):
@@ -190,18 +268,23 @@ class PieceAnimator:
     def on_event(self, event: object) -> None:
         """Observer callback (Stage 3's Observer protocol): react to
         MoveAccepted/JumpAccepted events carrying this instance's own
-        piece_id by transitioning into MOVE/JUMP; ignore everything
-        else.
+        piece_id by transitioning into MOVE/JUMP, and to a matching
+        PieceArrived by forcing a transition back to IDLE - see module
+        docstring's "BUGFIX - PieceArrived FORCES MOVE/JUMP TO IDLE"
+        section for the full reasoning, and "WHY PieceArrived ONLY
+        forces IDLE when current_state is ACTUALLY MOVE or JUMP" for
+        why every other state (including IDLE itself) is left alone.
+        Ignore everything else.
 
         Args:
             event: Any published client-layer event
                 (kungfu_chess/client/events/game_events.py). Events
                 for a different piece_id, and event types this
-                animator has no reaction to (PieceArrived, GameOver,
-                MoveRejected, MoveRequested, or any future type), are
-                silently no-ops - not an error, just normal operation
-                for an Observer that only cares about a subset of
-                events (ISP, client_spec.md §6).
+                animator has no reaction to (GameOver, MoveRejected,
+                MoveRequested, or any future type), are silently
+                no-ops - not an error, just normal operation for an
+                Observer that only cares about a subset of events
+                (ISP, client_spec.md §6).
 
         Returns:
             None.
@@ -214,6 +297,9 @@ class PieceAnimator:
             self._transition_to(AnimationState.MOVE)
         elif isinstance(event, JumpAccepted):
             self._transition_to(AnimationState.JUMP)
+        elif isinstance(event, PieceArrived):
+            if self.current_state in (AnimationState.MOVE, AnimationState.JUMP):
+                self._transition_to(AnimationState.IDLE)
 
     def advance(self, delta_ms: int) -> None:
         """Advance this animator's logical clock by delta_ms, and
