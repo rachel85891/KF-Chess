@@ -94,6 +94,19 @@ def test_legal_move_from_correct_color_client_is_accepted_and_broadcast_to_both_
                 # White's e-pawn double-step opening move - 2 squares.
                 await client1.send("WPe2e4")
 
+                # Two broadcasts arrive per accepted move, not one:
+                # MoveAccepted fires (and is broadcast) the instant the
+                # motion STARTS - showing the board still in its
+                # pre-move state, since the board only mutates on real
+                # arrival (docs/spec.md's own "board changes only after
+                # a moving piece has actually reached its destination"
+                # rule) - then PieceArrived fires (and is broadcast)
+                # once the tick loop has advanced enough real time for
+                # the motion to complete. The first recv() per client is
+                # therefore drained and discarded here; the SECOND is
+                # the one that reflects the actual, final board state.
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
 
@@ -142,6 +155,11 @@ def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid
                 # afterward - proven by a real, subsequent legal move
                 # still working normally.
                 await client1.send("WPe2e4")
+                # Drain the immediate MoveAccepted broadcast (pre-move
+                # board) before the later PieceArrived one (see the
+                # sibling test above for the full reasoning).
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
 
@@ -168,6 +186,12 @@ def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_
 
                 started_at = time.perf_counter()
                 await client1.send("WPe2e4")  # 2 squares = 2 * MS_PER_SQUARE of real motion time
+                # First broadcast = MoveAccepted, near-instant (pre-move
+                # board) - drained, not timed. Second = PieceArrived,
+                # only produced once the tick loop's real elapsed time
+                # actually covers the motion's full duration; THAT one
+                # is what this test times.
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 elapsed_s = time.perf_counter() - started_at
 
