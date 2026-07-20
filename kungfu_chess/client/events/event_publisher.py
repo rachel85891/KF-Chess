@@ -65,12 +65,51 @@ would let a raw StopIteration escape if that invariant were ever
 violated, which is a confusing, unnamed failure for any caller to
 debug. Failing loudly with a named, specific exception instead costs
 nothing on the (currently unreachable) happy-invariant path.
+
+EVENTBUS INTEGRATION (Stage A2, server track): the constructor now
+also accepts an OPTIONAL `event_bus: Optional[EventBus] = None`
+(kungfu_chess/bus/event_bus.py, Stage A1 - a generic, layer-agnostic
+pub/sub core, fully independent of this class and of chess). This is
+NOT a replacement for the existing `_observers`/`subscribe`/`on_event`
+mechanism GameLoopRunner already relies on (ScoreObserver,
+MovesLogObserver, PieceAnimatorRegistry, SoundManager,
+CooldownTracker) - it is a second, additional destination for the
+exact same events, for a future server-side WS layer to subscribe to
+independently, without that layer ever needing to know the Observer
+mechanism exists at all (and vice versa - neither mechanism knows
+about the other).
+
+Defaulting to None, not a required parameter: every existing call site
+(GameLoopRunner included) constructs this class without knowing
+`event_bus` exists yet, and must keep working completely unmodified -
+`event_bus=None` byte-for-byte matches this class's pre-A2 behavior
+(re-verified directly: `_notify`'s new `if self._event_bus is not
+None` guard means the EventBus code path is not merely "harmless" when
+None, it never executes a single instruction).
+
+Hooked at exactly ONE call site - `_notify` - not at each of
+request_move/wait/request_jump/publish_jump_accepted individually.
+Re-read this file fresh before making this change specifically to find
+every place events currently reach `_observers`: all four of those
+methods already funnel through this same private `_notify(event)`
+helper (never call `observer.on_event` directly themselves) - so
+`_notify` is the one true "an event was produced" decision point in
+this class. Adding the EventBus publish call there, right alongside
+the existing `for observer in self._observers` loop, is therefore the
+only change needed to reach every event this class ever produces, and
+guarantees the two delivery mechanisms can never disagree about which
+events fired or in what order: there is no second, parallel place that
+decides this independently to fall out of sync with the first.
+`ordering_policy` (see wait()'s own docstring) is applied once, before
+`_notify` is ever called per event - both destinations therefore also
+agree on ORDER, not just on which events occurred.
 """
 
 from __future__ import annotations
 
 from typing import Callable, List, Optional, Protocol, Sequence
 
+from kungfu_chess.bus.event_bus import EventBus
 from kungfu_chess.client.events.game_events import (
     GameOver,
     JumpAccepted,
@@ -115,7 +154,10 @@ def default_event_ordering_policy(events: Sequence[object]) -> Sequence[object]:
 
 class GameEventPublisher:
     def __init__(
-        self, extra_engine: ExtraEngine, ordering_policy: EventOrderingPolicy = default_event_ordering_policy
+        self,
+        extra_engine: ExtraEngine,
+        ordering_policy: EventOrderingPolicy = default_event_ordering_policy,
+        event_bus: Optional[EventBus] = None,
     ):
         """Wrap an existing ExtraEngine (Decorator/composition, per the
         module docstring) so its outputs - and its wrapped GameEngine's
@@ -135,11 +177,21 @@ class GameEventPublisher:
                 §10). Defaults to FIFO/identity; injectable (DIP) so a
                 caller can supply a different policy without
                 GameEventPublisher itself changing.
+            event_bus: Optional kungfu_chess.bus.EventBus (Stage A1) to
+                ALSO publish every event onto, in addition to the
+                existing Observer mechanism below - see this module's
+                own docstring's "EVENTBUS INTEGRATION" section for the
+                full reasoning. Defaults to None, which is a strict
+                no-op (Stage A2 backward-compatibility requirement):
+                every existing caller that doesn't pass this argument
+                keeps behaving exactly as before. Injected (DIP), never
+                constructed internally by this class.
         """
 
         self._extra_engine = extra_engine
         self._engine = extra_engine.engine
         self._ordering_policy = ordering_policy
+        self._event_bus = event_bus
         self._observers: List[Observer] = []
 
     @property
@@ -189,7 +241,9 @@ class GameEventPublisher:
 
     def _notify(self, event: object) -> None:
         """Deliver one event to every currently-subscribed Observer,
-        in subscription order.
+        in subscription order - and, if an EventBus was injected (see
+        __init__'s `event_bus` param and this module's "EVENTBUS
+        INTEGRATION" docstring section), ALSO publish it there.
 
         Args:
             event: The event instance to deliver (one of the frozen
@@ -197,10 +251,20 @@ class GameEventPublisher:
 
         Returns:
             None.
+
+        This is the SINGLE call site every public method on this class
+        (request_move, wait, publish_jump_accepted) already routes
+        through to reach _observers - adding the EventBus publish call
+        here, rather than at each of those call sites individually,
+        is what guarantees the two delivery mechanisms can never
+        observe a different set/order of events from one another.
         """
 
         for observer in self._observers:
             observer.on_event(event)
+
+        if self._event_bus is not None:
+            self._event_bus.publish(event)
 
     def request_move(self, from_cell: Position, to_cell: Position) -> MoveResult:
         """Request a move via the wrapped GameEngine, and publish
