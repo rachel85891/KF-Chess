@@ -130,6 +130,28 @@ relitigate; each is documented again at its own point of use below):
    width/height from yet. This assumption is never revisited after
    construction, exactly like GameLoopRunner itself never resizes its
    own canvas after construction either.
+
+RESIZABLE WINDOW (bugfix, applied identically to GameLoopRunner - see
+that class's own module docstring's "RESIZABLE WINDOW" section for the
+full reasoning, which applies here unchanged): `cv2.namedWindow(...)`
+now passes `cv2.WINDOW_NORMAL` (was the default WINDOW_AUTOSIZE, which
+disables user resizing outright), and every non-headless frame
+re-queries the window's real current size
+(cv2.getWindowImageRect), computes a real scale/origin via
+kungfu_chess.client.input.window_fit.compute_fit_scale_and_origin (the
+same new, shared, pure module GameLoopRunner uses - not duplicated
+math, per this fix's own DRY requirement), rebuilds ScreenToImageMapper
+from those real values, and resizes+letterboxes the rendered canvas to
+match before showing it. Exactly like GameLoopRunner: headless mode
+skips this whole block entirely (the construction-time
+window_scale=1.0 mapper is used unchanged), and a degenerate/minimized
+window size skips the mapper refresh for that frame, reusing the last
+known-good mapper. ScreenToImageMapper/MouseAdapter/
+NetworkClickController are all completely untouched by this fix - the
+mapper is refreshed by direct reassignment of
+`self.mouse_adapter._mapper`, the same mechanism GameLoopRunner uses,
+for the same reason (MouseAdapter re-reads `self._mapper` fresh on
+every click, so no setter method needs to be added to it).
 """
 
 from __future__ import annotations
@@ -141,6 +163,7 @@ import cv2
 from kungfu_chess.client.events.observers import MovesLogSnapshot, ScoreSnapshot
 from kungfu_chess.client.input.mouse_adapter import MouseAdapter
 from kungfu_chess.client.input.screen_mapper import ScreenToImageMapper
+from kungfu_chess.client.input.window_fit import compute_fit_scale_and_origin
 from kungfu_chess.client.network.network_click_controller import NetworkClickController
 from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.client.surface.asset_cache import AssetCache
@@ -236,7 +259,7 @@ class NetworkGameLoopRunner:
         self._total_canvas_height = self._board_pixel_height + LABEL_MARGIN + LABEL_MARGIN
 
         if not headless:
-            cv2.namedWindow(window_name)
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
         mapper = ScreenToImageMapper(window_origin=(self._board_origin_x, self._board_origin_y), window_scale=1.0)
         # NetworkClickController duck-types Controller's `click(x, y)`
@@ -359,7 +382,27 @@ class NetworkGameLoopRunner:
         if self._headless:
             return
 
-        main_canvas.show(self._window_name)
+        # Resizable-window fix - see module docstring's "RESIZABLE
+        # WINDOW" section (identical mechanism to GameLoopRunner's own,
+        # see that class's own docstring for the full reasoning).
+        _actual_x, _actual_y, actual_width, actual_height = cv2.getWindowImageRect(self._window_name)
+        scale, origin_x, origin_y = compute_fit_scale_and_origin(
+            self._total_canvas_width, self._total_canvas_height, actual_width, actual_height
+        )
+        if scale > 0:
+            self.mouse_adapter._mapper = ScreenToImageMapper(
+                window_origin=(round(origin_x), round(origin_y)), window_scale=scale
+            )
+            resized = main_canvas.resize(round(self._total_canvas_width * scale), round(self._total_canvas_height * scale))
+            display_canvas = Img.blank_canvas(actual_width, actual_height, background_color=CANVAS_BACKGROUND_COLOR)
+            display_canvas.paste(resized, round(origin_x), round(origin_y))
+        else:
+            # Degenerate/minimized window - skip the mapper refresh
+            # (the last known-good one stays on self.mouse_adapter) and
+            # show main_canvas at its own native size, unscaled.
+            display_canvas = main_canvas
+
+        display_canvas.show(self._window_name)
 
         key = cv2.waitKey(1)
         if key & 0xFF == ord(QUIT_KEY):
