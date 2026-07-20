@@ -1,0 +1,20 @@
+# Runtime dependencies - separate from requirements-dev.txt (test/dev
+# tooling only: pytest). Stage B1 (server track,
+# server/connection_manager.py + server/main.py) is the first part of
+# this project that needs a real runtime dependency to actually RUN at
+# all - the core game logic under kungfu_chess/ has none, and the
+# client layer's OpenCV/`Img` dependency predates this file and was
+# never tracked in a requirements file either (out of scope to
+# retroactively add here). Kept in its own file, not merged into
+# requirements-dev.txt, so `pip install -r requirements.txt`
+# (production/server deployment) does not also pull in test tooling
+# nobody needs at runtime.
+#
+# websockets: the standard async Python WebSocket library
+# (docs/spec.md §1's "no hand-rolled protocol implementation" applies
+# here the same way it already does to pub/sub in
+# kungfu_chess/bus/event_bus.py). >=13 is required for the
+# websockets.asyncio.server/client API this code uses (ServerConnection,
+# websockets.serve as an async-context-manager-or-awaitable Server
+# factory) - verified directly against the installed 16.1.1.
+websockets>=13
