@@ -334,6 +334,75 @@ re-checked directly - Stage 7 already guards exactly this case, so
 adding a second, redundant check here would just duplicate it).
 GameLoopRunner's own job is pure orchestration - it has no validation
 logic of its own to have a failure mode about.
+
+RESIZABLE WINDOW (bugfix): `cv2.namedWindow(window_name)` used to
+default to `cv2.WINDOW_AUTOSIZE`, which explicitly disables user
+resizing outright (no resize handles at all) - now
+`cv2.WINDOW_NORMAL`, which allows it. Enabling resizing alone would not
+have been enough on its own, though: the ScreenToImageMapper built at
+construction (below) used a hardcoded `window_scale=1.0`, correct only
+for a window still at its native, never-resized size - the instant a
+user resized the window, every click would map to the wrong cell,
+silently. The fix therefore has two real parts, both per FRAME, not
+just once at construction:
+1. Query the window's real, CURRENT size via
+   `cv2.getWindowImageRect(window_name)` (skipped entirely in headless
+   mode - there is no real window to query, so the construction-time
+   mapper with window_scale=1.0 is kept and used unchanged, exactly
+   matching this class's pre-fix headless behavior byte-for-byte - see
+   `_run_one_frame`'s own docstring).
+2. Compute a real, this-frame scale/origin from that size via
+   kungfu_chess.client.input.window_fit.compute_fit_scale_and_origin
+   (a NEW, separate, pure module - see that module's own docstring for
+   the full reasoning on why it exists as its own file rather than
+   living inside screen_mapper.py, and why it uses `min()` of both
+   axes' ratios rather than independently stretching each one).
+   ScreenToImageMapper ITSELF is completely untouched by this fix - its
+   own docstring already documents a single uniform `window_scale` as
+   a deliberate design decision; this fix's whole job is to guarantee
+   that assumption actually holds true as the window's real size
+   changes, not to change what ScreenToImageMapper does once given a
+   scale/origin.
+
+A fresh ScreenToImageMapper is built every non-headless frame from that
+real scale/origin, and assigned directly onto
+`self.mouse_adapter._mapper` (MouseAdapter's own private attribute,
+reassigned from here rather than adding a public setter method to
+MouseAdapter itself - MouseAdapter's own on_mouse_event method already
+reads `self._mapper` fresh on every call, so a plain attribute
+reassignment from this composition root is picked up correctly on the
+very next click, with zero changes to MouseAdapter's own file/logic).
+The rendered main_canvas is then itself resized to that same scale and
+pasted, centered, onto a canvas sized to the window's own actual
+dimensions (solid CANVAS_BACKGROUND_COLOR fill for any letterboxed
+margin) before being shown - so the DISPLAYED image and the click-
+mapping math are built from the exact same scale/origin values every
+single frame, and can never silently disagree with each other.
+
+DEGENERATE WINDOW SIZE (e.g. minimized - a deliberate, defensive
+choice, not an afterthought): compute_fit_scale_and_origin returns a
+non-positive `scale` for a non-positive window width/height, rather
+than raising. When that happens, this class skips the mapper
+refresh entirely for that frame (the LAST known-good mapper stays in
+place on `self.mouse_adapter`) and shows `main_canvas` at its own
+native size, unscaled - there is no meaningful "fit into a
+window of size zero" to compute, and reusing the last good mapper is
+strictly safer than either crashing or building one around
+nonsensical numbers.
+
+NOT EMPIRICALLY VERIFIED IN THIS ENVIRONMENT (an honest, accepted gap,
+not a claim of certainty): this sandboxed environment has no real
+display, so the actual runtime behavior of a real
+`cv2.getWindowImageRect` call against a real, human-resized window
+could not be directly executed and observed here, unlike this
+project's own usual "verified directly from source before writing
+this" standard for cv2 APIs. The pure fit-math
+(compute_fit_scale_and_origin) is thoroughly unit-tested in isolation;
+the cv2-facing half of this fix relies on cv2's own documented
+contract for `getWindowImageRect`/`WINDOW_NORMAL` and needs a human,
+with a real display, to confirm empirically (see this module's own
+final manual-verification instructions in the task this fix was
+written for).
 """
 
 from __future__ import annotations
@@ -353,6 +422,7 @@ from kungfu_chess.client.events.piece_registry import PieceRegistry
 from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
 from kungfu_chess.client.input.mouse_adapter import MouseAdapter
 from kungfu_chess.client.input.screen_mapper import ScreenToImageMapper
+from kungfu_chess.client.input.window_fit import compute_fit_scale_and_origin
 from kungfu_chess.client.surface.asset_cache import AssetCache
 from kungfu_chess.client.surface.img import Img
 from kungfu_chess.client.surface.img_surface import ImgSurface
@@ -500,7 +570,7 @@ class GameLoopRunner:
 
         self._window_name = window_name
         if not headless:
-            cv2.namedWindow(window_name)
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
         # A freshly created OpenCV window (WINDOW_AUTOSIZE, the
         # default - never resized/dragged yet) has its client area's
@@ -646,7 +716,30 @@ class GameLoopRunner:
         if self._headless:
             return
 
-        main_canvas.show(self._window_name)
+        # Resizable-window fix - see module docstring's "RESIZABLE
+        # WINDOW" section for the full reasoning. Refresh the mapper
+        # AND resize/letterbox the displayed canvas from the SAME real,
+        # this-frame scale/origin, every frame - never a stale one from
+        # construction or an earlier frame.
+        _actual_x, _actual_y, actual_width, actual_height = cv2.getWindowImageRect(self._window_name)
+        scale, origin_x, origin_y = compute_fit_scale_and_origin(
+            self._total_canvas_width, self._total_canvas_height, actual_width, actual_height
+        )
+        if scale > 0:
+            self.mouse_adapter._mapper = ScreenToImageMapper(
+                window_origin=(round(origin_x), round(origin_y)), window_scale=scale
+            )
+            resized = main_canvas.resize(round(self._total_canvas_width * scale), round(self._total_canvas_height * scale))
+            display_canvas = Img.blank_canvas(actual_width, actual_height, background_color=CANVAS_BACKGROUND_COLOR)
+            display_canvas.paste(resized, round(origin_x), round(origin_y))
+        else:
+            # Degenerate/minimized window - see module docstring's
+            # "DEGENERATE WINDOW SIZE" section: skip the mapper refresh
+            # (the last known-good one stays on self.mouse_adapter) and
+            # show main_canvas at its own native size, unscaled.
+            display_canvas = main_canvas
+
+        display_canvas.show(self._window_name)
 
         # 1ms, not 0 (which blocks indefinitely waiting for a keypress
         # - the opposite of a real-time loop) and not a longer value
