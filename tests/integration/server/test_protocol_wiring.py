@@ -12,6 +12,17 @@ background tick loop measuring REAL elapsed time
 (time.perf_counter()), not simulated/injected time - per this stage's
 own requirement to prove the tick loop actually works, using real
 sleeps rather than pretending time passed.
+
+UPDATED for the initial-board-state-on-join fix (see
+server/game_server.py's own "BUGFIX - INITIAL BOARD STATE ON JOIN"
+docstring section): handle_connection now sends a second message - the
+current board state - immediately after assigned_color, for every
+accepted (non-rejected) connection. Every test below that previously
+drained exactly one message after connecting now drains two, to
+account for this - a real, intentional behavior addition these tests'
+own assumptions needed to catch up to, not a scenario change (see
+tests/integration/server/test_initial_board_state_on_join.py for the
+fix's own dedicated coverage).
 """
 
 from __future__ import annotations
@@ -90,6 +101,8 @@ def test_legal_move_from_correct_color_client_is_accepted_and_broadcast_to_both_
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
                 await client1.recv()  # assigned_color welcome message
                 await client2.recv()
+                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
+                await client2.recv()
 
                 # White's e-pawn double-step opening move - 2 squares.
                 await client1.send("WPe2e4")
@@ -124,6 +137,8 @@ def test_move_command_with_wrong_color_prefix_for_the_connection_is_rejected():
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
                 await client1.recv()  # client1 is White
                 await client2.recv()  # client2 is Black
+                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
+                await client2.recv()
 
                 # client1 IS White, but claims to move as Black here.
                 await client1.send("BPe7e5")
@@ -145,6 +160,8 @@ def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
                 await client1.recv()
+                await client2.recv()
+                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
                 await client2.recv()
 
                 await client1.send("not a real command")
@@ -182,6 +199,8 @@ def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
                 await client1.recv()
+                await client2.recv()
+                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
                 await client2.recv()
 
                 started_at = time.perf_counter()

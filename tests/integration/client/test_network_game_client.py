@@ -178,8 +178,15 @@ def test_poll_incoming_returns_an_empty_list_when_nothing_new_has_arrived():
     try:
         assert client.connect(test_server.uri) == Color.WHITE
 
-        # Nothing was sent by anyone - no broadcast has any reason to
-        # exist yet.
+        # The server now sends one join-time board-state message right
+        # after assigned_color (server/game_server.py's own initial-
+        # board-state-on-join fix) - drain that one expected message
+        # first (real delivery, so poll for it rather than assuming
+        # it's already queued the instant connect() returns).
+        _poll_until(client, lambda messages: len(messages) >= 1, _POLL_TIMEOUT_S)
+
+        # Nothing else was sent by anyone - no further broadcast has
+        # any reason to exist yet.
         assert client.poll_incoming() == []
         # Calling it again immediately must still be empty and must not
         # block or raise.
@@ -197,9 +204,17 @@ def test_two_independent_clients_have_no_cross_talk_in_their_incoming_streams():
         assert client1.connect(test_server.uri) == Color.WHITE
         assert client2.connect(test_server.uri) == Color.BLACK
 
-        # Neither client has sent anything - each one's own incoming
-        # stream must independently be empty; one client's queue is
-        # never affected by the other's.
+        # Each client's own join-time board-state message (see above)
+        # is expected and drained here first - the real thing being
+        # proven below is that NEITHER client's stream contains
+        # anything belonging to the OTHER (no cross-talk), not that
+        # the stream is empty outright.
+        _poll_until(client1, lambda messages: len(messages) >= 1, _POLL_TIMEOUT_S)
+        _poll_until(client2, lambda messages: len(messages) >= 1, _POLL_TIMEOUT_S)
+
+        # Neither client has sent a move - each one's own incoming
+        # stream must independently have nothing further; one client's
+        # queue is never affected by the other's.
         assert client1.poll_incoming() == []
         assert client2.poll_incoming() == []
     finally:
