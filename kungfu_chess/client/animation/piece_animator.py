@@ -44,10 +44,9 @@ on its own at all, with or without any timing drift - PieceArrived was
 the only correct authority to end it.
 
 THE FIX: PieceArrived is the real game engine's own authoritative
-signal (via RealTimeArbiter/GameEventPublisher.wait, confirmed
-directly: published for both move and jump completion, from the same
-code path) that a motion has genuinely finished - on_event now reacts
-to it by forcing an unconditional transition to AnimationState.IDLE,
+signal (via RealTimeArbiter/GameEventPublisher.wait) that an ordinary
+MOVE motion has genuinely finished - on_event now reacts to it by
+forcing an unconditional transition to AnimationState.IDLE,
 regardless of the current state's is_loop value, elapsed_ms_in_state,
 or frame count. This removes the previous implicit, unenforced
 coupling between two independent timing sources by making the exit
@@ -76,16 +75,18 @@ event of their own - re-verified directly against the real assets
 (assets/pieces/RW/states/): JUMP's own config chains
 jump -> short_rest -> long_rest -> idle entirely via
 next_state_when_finished, with no game-engine involvement in that
-chain at all once the jump's own PieceArrived has already fired. This
-is exactly the same category client_spec.md's own architecture already
-uses for capture/hit-reaction-style animations that have no matching
-event: frame-exhaustion is their ONLY legitimate way to transition, by
-design. Forcing IDLE from mid-SHORT_REST/LONG_REST on a (redundant or
-merely late-arriving) PieceArrived would truncate a deliberate visual
-flourish that has nothing further to do with the real motion, which
-has already concluded by the time SHORT_REST is even reached. This
-also means IDLE itself is left alone too (a PieceArrived while already
-IDLE is a pre-existing, harmless no-op, unchanged by this fix - see
+chain at all once the jump's own JumpLanded (or an ordinary move's own
+PieceArrived) has already fired. This is exactly the same category
+client_spec.md's own architecture already uses for capture/hit-
+reaction-style animations that have no matching event: frame-
+exhaustion is their ONLY legitimate way to transition, by design.
+Forcing IDLE from mid-SHORT_REST/LONG_REST on a (redundant or
+merely late-arriving) PieceArrived/JumpLanded would truncate a
+deliberate visual flourish that has nothing further to do with the
+real motion, which has already concluded by the time SHORT_REST is
+even reached. This also means IDLE itself is left alone too (a
+PieceArrived/JumpLanded while already IDLE is a pre-existing, harmless
+no-op, unchanged by this fix - see
 tests/unit/client/test_piece_animator.py's own
 test_irrelevant_event_types_for_own_piece_id_are_ignored, which already
 covers exactly this case and needed no edits for this fix to keep
@@ -99,6 +100,33 @@ event TYPE (OCP, per that file's own docstring) - PieceArrived already
 flows through the exact same routing path MoveAccepted/JumpAccepted
 already use, reaching the right PieceAnimator's own (now fixed)
 on_event with no registry-level change required at all.
+
+PARALLEL GAP - JUMP LANDINGS NEVER PUBLISHED PieceArrived AT ALL (found
+during investigation of a later, related stage - jump-network-wiring-
+and-cooldown-display - and fixed here too, since it is the exact same
+bug class this fix already addresses): a JUMP's own landing
+(extra/jump.py's JumpTracker, resolved inside ExtraEngine.wait) does
+NOT create a Motion and does NOT fire PieceArrived at all - re-verified
+directly against RealTimeArbiter/GameEventPublisher.wait before writing
+this, correcting this module's own earlier claim above ("confirmed
+directly: published for both move and jump completion, from the same
+code path" was true only for an ordinary MOVE that happens to be
+routed through the core engine; a JUMP's own landing was never such a
+motion). A separate, later stage (jump-cooldown-core) added a distinct
+JumpLanded event for exactly this landing moment, but until now nothing
+here reacted to it - meaning a JUMP animation could get stuck exactly
+the way a MOVE animation used to (a looping or slow-to-exhaust JUMP
+StateConfig would never transition back to IDLE on its own). THE FIX:
+on_event's PieceArrived branch above now also matches JumpLanded -
+`isinstance(event, (PieceArrived, JumpLanded))` - forcing the identical
+MOVE/JUMP -> IDLE transition for either authoritative "this motion (or
+landing) has genuinely finished" signal, with the exact same "only from
+MOVE/JUMP, leave every other state alone" guard applying to both (see
+"WHY PieceArrived ONLY forces IDLE..." below, which now applies to
+JumpLanded identically - SHORT_REST/LONG_REST remain untouched by
+either event, for the identical reason). PieceAnimatorRegistry again
+needed zero changes for this second fix, for the identical
+type-agnostic-routing reason already documented above.
 
 Fields (per spec.md §5's convention of stating fields for every
 class):
@@ -124,7 +152,7 @@ from typing import Dict
 
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.animation.state_config import StateConfig
-from kungfu_chess.client.events.game_events import JumpAccepted, MoveAccepted, PieceArrived
+from kungfu_chess.client.events.game_events import JumpAccepted, JumpLanded, MoveAccepted, PieceArrived
 
 
 class PieceAnimatorError(Exception):
@@ -269,12 +297,14 @@ class PieceAnimator:
         """Observer callback (Stage 3's Observer protocol): react to
         MoveAccepted/JumpAccepted events carrying this instance's own
         piece_id by transitioning into MOVE/JUMP, and to a matching
-        PieceArrived by forcing a transition back to IDLE - see module
-        docstring's "BUGFIX - PieceArrived FORCES MOVE/JUMP TO IDLE"
-        section for the full reasoning, and "WHY PieceArrived ONLY
-        forces IDLE when current_state is ACTUALLY MOVE or JUMP" for
-        why every other state (including IDLE itself) is left alone.
-        Ignore everything else.
+        PieceArrived OR JumpLanded by forcing a transition back to IDLE
+        - see module docstring's "BUGFIX - PieceArrived FORCES MOVE/
+        JUMP TO IDLE" and "PARALLEL GAP - JUMP LANDINGS NEVER PUBLISHED
+        PieceArrived AT ALL" sections for the full reasoning, and "WHY
+        PieceArrived ONLY forces IDLE when current_state is ACTUALLY
+        MOVE or JUMP" for why every other state (including IDLE itself)
+        is left alone - that same reasoning applies identically to
+        JumpLanded. Ignore everything else.
 
         Args:
             event: Any published client-layer event
@@ -297,7 +327,7 @@ class PieceAnimator:
             self._transition_to(AnimationState.MOVE)
         elif isinstance(event, JumpAccepted):
             self._transition_to(AnimationState.JUMP)
-        elif isinstance(event, PieceArrived):
+        elif isinstance(event, (PieceArrived, JumpLanded)):
             if self.current_state in (AnimationState.MOVE, AnimationState.JUMP):
                 self._transition_to(AnimationState.IDLE)
 
