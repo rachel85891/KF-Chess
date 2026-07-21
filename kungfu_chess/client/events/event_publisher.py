@@ -357,7 +357,18 @@ class GameEventPublisher:
         here, defender) fields are read directly off the real,
         model-layer InterceptionEvent and repackaged as a client-layer
         dataclass - no new publishing mechanism, no re-derivation of
-        data the model layer already computed. Placed FIRST in
+        data the model layer already computed. A King destroyed via
+        interception now also publishes a GameOver right after its own
+        AttackerIntercepted (interception.king_captured, set by
+        jump.py's resolve_due - see its own docstring), mirroring
+        arrival_events' own identical king_captured -> GameOver
+        convention below verbatim, just keyed off interception.attacker
+        rather than arrival.captured_piece (the attacker is the piece
+        destroyed here, not the piece captured, since an interception
+        destroys the attacker and leaves the defender untouched - see
+        jump.py's own docstring): winner_color is therefore
+        interception.attacker.color.opposite, the color that was NOT
+        destroyed. Placed FIRST in
         `pending` (ahead of landing_events/arrival_events) simply
         mirroring ExtraEngine.wait's own return-tuple order (interception_events is its first
         element) - not because any strict chronological ordering
@@ -401,6 +412,8 @@ class GameEventPublisher:
                     defender_piece_id=interception.defender.id,
                 )
             )
+            if interception.king_captured:
+                pending.append(GameOver(winner_color=interception.attacker.color.opposite))
 
         for landing in landing_events:
             pending.append(JumpLanded(piece_id=landing.piece.id, cell=landing.cell))

@@ -24,6 +24,22 @@ interception_events and promoted. GameEventPublisher.wait is the one
 place that turns these into a real, observable JumpLanded per landing
 (see its own docstring) - this class stays event-agnostic, same as it
 already is for interception_events/promoted today.
+
+GAME-OVER VIA INTERCEPTION (closing the gap where a King destroyed via
+interception never actually ended the game): wait() now also sets
+self.engine.state.game_over = True when any interception_event's own
+king_captured is True, mirroring GameEngine.wait's own identical
+one-line check over arrival_events - but that check runs entirely
+inside self.engine.wait, which never sees interception_events at all
+(a separate value this class alone assembles from JumpTracker), so it
+could never have caught this case on its own. This class is the
+correct - and only - place to add it: jump.py's own resolve_due has no
+GameEngine.state reference to mutate (see its own docstring), and this
+class already holds a real `self.engine` reference. This stays
+event-agnostic exactly like the rest of this class (no GameOver client
+event is built here - that conversion happens only in
+GameEventPublisher.wait, same as AttackerIntercepted/JumpLanded
+already do).
 """
 
 from __future__ import annotations
@@ -64,6 +80,22 @@ class ExtraEngine:
     def wait(self, ms: int) -> Tuple[list, list, List[ArrivalEvent], list]:
         target_clock_ms = self.engine.state.clock_ms + ms
         interception_events, landing_events = self.jumps.resolve_due(target_clock_ms, self.engine.arbiter, self.engine.board)
+
+        # A King destroyed via interception must end the game exactly
+        # like one lost to an ordinary arrival-based capture - mirrors
+        # GameEngine.wait's own identical one-line check over
+        # arrival_events below, applied here to interception_events
+        # instead. This is the one place that CAN make this mutation:
+        # jump.py's own resolve_due has no GameEngine.state reference to
+        # set it from (see jump.py's own docstring), and self.engine.wait
+        # below only ever inspects its own arrival_events, never
+        # interception_events - so without this line, self.engine.wait's
+        # own state.game_over = True would never fire for this case at
+        # all, leaving request_move/request_jump's existing game_over
+        # guards silently un-triggered despite a King already destroyed.
+        for interception in interception_events:
+            if interception.king_captured:
+                self.engine.state.game_over = True
 
         arrival_events = self.engine.wait(ms)
         promoted = apply_promotions(self.engine.board, arrival_events)

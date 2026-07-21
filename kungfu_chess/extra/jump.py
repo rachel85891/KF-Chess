@@ -66,6 +66,19 @@ own existing convention of a frozen, Piece-carrying dataclass built at
 the model layer and handed upward, rather than reaching into the
 client layer from here (this module has, and must keep, zero
 client/event_publisher imports).
+
+InterceptionEvent.king_captured (closing the gap where a King destroyed
+via interception never ended the game at all, unlike one lost to an
+ordinary arrival-based capture): computed at both trigger points above,
+identically to ArrivalEvent's own king_captured field
+(kungfu_chess/realtime/motion.py) - the attacker's kind at the instant
+it is destroyed. This module still has, and must keep, zero
+client/event_publisher imports, and `resolve_due`'s own signature
+(clock_ms, arbiter, board) has no GameEngine.state reference to mutate
+even if it wanted to - so this field only carries the raw fact upward;
+ExtraEngine.wait (which already holds a real GameEngine reference) is
+where that fact actually becomes state.game_over = True, mirroring
+GameEngine.wait's own identical one-line pattern for arrival_events.
 """
 
 from __future__ import annotations
@@ -74,7 +87,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from kungfu_chess.model.board import Board
-from kungfu_chess.model.piece import Piece, PieceState
+from kungfu_chess.model.piece import Piece, PieceKind, PieceState
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE, RealTimeArbiter
 
@@ -91,9 +104,24 @@ class _AirborneEntry:
 
 @dataclass(frozen=True)
 class InterceptionEvent:
+    """An attacker was destroyed instead of landing/capturing - see this
+    module's own docstring for the two distinct trigger points that can
+    produce one.
+
+    king_captured mirrors ArrivalEvent's own field of the same name
+    (kungfu_chess/realtime/motion.py) exactly - the attacker's own kind
+    at the moment it was destroyed, so a King lost to interception is
+    just as detectable as one lost to an ordinary arrival-based
+    capture, via the same field name/convention. Computed here, at the
+    model layer, rather than left for GameEventPublisher to re-derive
+    later - same reasoning as ArrivalEvent's own king_captured: the
+    model layer already knows the attacker's kind at destruction time,
+    so there is nothing for a later layer to compute freshly."""
+
     attacker: Piece
     defender: Piece
     cell: Position
+    king_captured: bool
 
 
 @dataclass(frozen=True)
@@ -142,7 +170,14 @@ class JumpTracker:
             arbiter.cancel_motion(motion)
             board.remove_piece(motion.piece.cell)
             motion.piece.state = PieceState.CAPTURED
-            events.append(InterceptionEvent(attacker=motion.piece, defender=entry.piece, cell=entry.piece.cell))
+            events.append(
+                InterceptionEvent(
+                    attacker=motion.piece,
+                    defender=entry.piece,
+                    cell=entry.piece.cell,
+                    king_captured=motion.piece.kind == PieceKind.KING,
+                )
+            )
 
         # Trigger 2: the jump's own duration elapses with an
         # already-in-flight attacker still pending (caught here even
@@ -167,7 +202,12 @@ class JumpTracker:
                 board.remove_piece(attacking_motion.piece.cell)
                 attacking_motion.piece.state = PieceState.CAPTURED
                 events.append(
-                    InterceptionEvent(attacker=attacking_motion.piece, defender=entry.piece, cell=entry.piece.cell)
+                    InterceptionEvent(
+                        attacker=attacking_motion.piece,
+                        defender=entry.piece,
+                        cell=entry.piece.cell,
+                        king_captured=attacking_motion.piece.kind == PieceKind.KING,
+                    )
                 )
 
             # land_time, not clock_ms: reflects the piece's actual scheduled

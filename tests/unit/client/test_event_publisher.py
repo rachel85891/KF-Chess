@@ -415,6 +415,41 @@ def test_wait_publishes_attacker_intercepted_when_a_jump_intercepts_an_attacker(
     ]
 
 
+def test_wait_publishes_game_over_after_attacker_intercepted_when_attacker_is_king():
+    # Mirrors test_wait_publishes_attacker_intercepted_when_a_jump_
+    # intercepts_an_attacker's own scenario exactly, but with the
+    # attacker recolored to a King - same ordering convention as
+    # test_wait_publishes_game_over_after_piece_arrived_on_king_capture
+    # (GameOver follows the event that reports the capture, here
+    # AttackerIntercepted instead of PieceArrived).
+    # Attacker is one cell away, not three: a King (unlike the ROOK in
+    # test_wait_publishes_attacker_intercepted_when_a_jump_intercepts_
+    # an_attacker, which this test otherwise mirrors) can only legally
+    # move one square at a time.
+    grid = _empty_grid(4, 4)
+    defender = _piece(Color.WHITE, PieceKind.PAWN, Position(row=0, col=0))
+    attacker = _piece(Color.BLACK, PieceKind.KING, Position(row=0, col=1))
+    grid[0][0] = defender
+    grid[0][1] = attacker
+    board = Board(grid)
+    engine = GameEngine(board)
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+
+    publisher.request_jump(Position(row=0, col=0))
+    engine.request_move(Position(row=0, col=1), Position(row=0, col=0))
+    observer.events.clear()  # drop JumpAccepted from request_jump above
+
+    publisher.wait(1000)
+
+    relevant_events = [event for event in observer.events if isinstance(event, (AttackerIntercepted, GameOver))]
+    assert relevant_events == [
+        AttackerIntercepted(piece_id=attacker.id, cell=Position(row=0, col=0), defender_piece_id=defender.id),
+        GameOver(winner_color=Color.WHITE),
+    ]
+
+
 def test_wait_publishes_no_attacker_intercepted_when_no_interception_occurs():
     grid = _empty_grid(3, 3)
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))

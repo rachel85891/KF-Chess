@@ -78,6 +78,89 @@ def test_attacker_arriving_while_target_airborne_is_destroyed_even_if_move_start
     assert attacker.state is PieceState.CAPTURED
 
 
+def test_attacker_arriving_while_target_airborne_sets_game_over_when_attacker_is_king():
+    # Trigger 1 (motion resolves while target still airborne), reusing
+    # test_attacker_arriving_while_target_airborne_is_destroyed_even_if_
+    # move_started_before_jump's own scenario verbatim, but with the
+    # attacker recolored to a King - mirrors
+    # tests/unit/test_game_engine_model.py's own arrival-based
+    # "engine.state.game_over is True" assertion style, applied to
+    # jump.py's own Trigger 1 instead of RealTimeArbiter's arrival path.
+    grid = _empty_grid(1, 2)
+    attacker = _piece(Color.WHITE, PieceKind.KING, Position(row=0, col=0))
+    defender = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=1))
+    grid[0][0] = attacker
+    grid[0][1] = defender
+    board = Board(grid)
+    engine = GameEngine(board)
+    extra_engine = ExtraEngine(engine)
+
+    result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    assert result.is_accepted is True
+
+    extra_engine.wait(100)
+    extra_engine.request_jump(Position(row=0, col=1))
+
+    extra_engine.wait(900)
+
+    assert attacker.state is PieceState.CAPTURED
+    assert engine.state.game_over is True
+
+
+def test_enemy_move_targeting_airborne_cell_sets_game_over_when_attacker_is_king():
+    # Trigger 2 (jump's own duration elapses with an already-in-flight
+    # attacker pending), reusing
+    # test_enemy_move_targeting_airborne_cell_results_in_attacker_
+    # destroyed_defender_untouched's own scenario, but with the attacker
+    # recolored to a King - moved one cell closer than that test's own
+    # ROOK attacker, since a King (unlike a Rook) can only legally move
+    # one square at a time.
+    grid = _empty_grid(4, 4)
+    defender = _piece(Color.WHITE, PieceKind.PAWN, Position(row=0, col=0))
+    attacker = _piece(Color.BLACK, PieceKind.KING, Position(row=0, col=1))
+    grid[0][0] = defender
+    grid[0][1] = attacker
+    board = Board(grid)
+    engine = GameEngine(board)
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    result = engine.request_move(Position(row=0, col=1), Position(row=0, col=0))
+    assert result.is_accepted is True
+
+    extra_engine.wait(1000)
+
+    assert attacker.state is PieceState.CAPTURED
+    assert engine.state.game_over is True
+
+
+def test_request_move_rejected_after_game_over_via_interception_even_if_otherwise_legal():
+    # Mirrors tests/unit/test_game_engine_model.py's own
+    # test_request_move_rejected_after_game_over_even_if_otherwise_legal,
+    # but with game_over triggered via interception rather than an
+    # ordinary arrival.
+    grid = _empty_grid(4, 4)
+    defender = _piece(Color.WHITE, PieceKind.PAWN, Position(row=0, col=0))
+    attacker = _piece(Color.BLACK, PieceKind.KING, Position(row=0, col=1))
+    other_black = _piece(Color.BLACK, PieceKind.ROOK, Position(row=3, col=3))
+    grid[0][0] = defender
+    grid[0][1] = attacker
+    grid[3][3] = other_black
+    board = Board(grid)
+    engine = GameEngine(board)
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    engine.request_move(Position(row=0, col=1), Position(row=0, col=0))
+    extra_engine.wait(1000)
+    assert engine.state.game_over is True
+
+    result = engine.request_move(Position(row=3, col=3), Position(row=2, col=3))
+
+    assert result.is_accepted is False
+    assert result.reason == "game_over"
+
+
 def test_jump_with_no_interception_ends_normally_after_duration():
     grid = _empty_grid(3, 3)
     rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
