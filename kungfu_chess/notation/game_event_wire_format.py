@@ -1,7 +1,23 @@
 """game_event_wire_format.py: bidirectional conversion between real
 client-layer events (kungfu_chess.client.events.game_events -
-MoveAccepted, JumpAccepted, PieceArrived) and a simple, single-line,
-human-readable wire text format - Stage B7 of the server track.
+MoveAccepted, JumpAccepted, PieceArrived, JumpLanded) and a simple,
+single-line, human-readable wire text format - Stage B7 of the server
+track, extended in a later stage (jump-network-wiring-and-cooldown-
+display) to also cover JumpLanded.
+
+JumpLanded ADDITION: a real, published event marking the exact moment
+a jump's post-landing cooldown starts (see
+kungfu_chess/client/events/game_events.py's own JumpLanded docstring -
+added in the earlier jump-cooldown-core stage, but never given a wire
+representation until now). Its shape is (piece_id, cell) only - no
+duration_ms/captured_piece_id/from_cell at all, since a jump landing is
+not a motion resolving (no Motion, no travel - extra/jump.py's own
+JumpTracker never moves the piece). New tag "LANDED", new field count
+(_LANDED_FIELD_COUNT = 4: EVT, tag, piece_id, cell) - deliberately its
+own case in format_game_event/parse_game_event rather than shoehorned
+into the existing _ARRIVED_TAG/_MOVE_LIKE_FIELD_COUNT branches, since
+its field SET genuinely differs from both (no captured_piece_id unlike
+ARRIVED, no from_cell/duration_ms unlike MOVE/JUMP).
 
 WHY A NEW MODULE, NOT REUSING move_command_format.py: that module
 formats an OUTGOING move REQUEST (client -> server, "WQe2e5" - no
@@ -59,7 +75,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from kungfu_chess.client.events.game_events import JumpAccepted, MoveAccepted, PieceArrived
+from kungfu_chess.client.events.game_events import JumpAccepted, JumpLanded, MoveAccepted, PieceArrived
 from kungfu_chess.notation.algebraic_notation import algebraic_to_position, position_to_algebraic
 
 EVENT_MESSAGE_PREFIX = "EVT:"
@@ -68,6 +84,7 @@ _MESSAGE_MARKER = "EVT"
 _MOVE_TAG = "MOVE"
 _JUMP_TAG = "JUMP"
 _ARRIVED_TAG = "ARRIVED"
+_LANDED_TAG = "LANDED"
 _NONE_TOKEN = "none"
 _FIELD_SEP = ":"
 
@@ -79,6 +96,7 @@ _FIELD_SEP = ":"
 # beforehand and then re-split, which would corrupt the tag).
 _MOVE_LIKE_FIELD_COUNT = 6  # EVT, tag, piece_id, from, to, duration_ms
 _ARRIVED_FIELD_COUNT = 5  # EVT, tag, piece_id, cell, captured_piece_id
+_LANDED_FIELD_COUNT = 4  # EVT, tag, piece_id, cell
 
 
 class GameEventWireFormatError(ValueError):
@@ -104,9 +122,9 @@ def format_game_event(event: object) -> Optional[str]:
 
     Returns:
         The wire text, or None if `event` is not a MoveAccepted,
-        JumpAccepted, or PieceArrived (e.g. MoveRejected/GameOver/
-        PromotionEvent/MoveRequested - none of these are animatable
-        motions, so callers like server/game_server.py's own
+        JumpAccepted, PieceArrived, or JumpLanded (e.g. MoveRejected/
+        GameOver/PromotionEvent/MoveRequested - none of these are
+        animatable motions, so callers like server/game_server.py's own
         broadcaster use this None to know not to send anything extra
         for them).
 
@@ -137,6 +155,9 @@ def format_game_event(event: object) -> Optional[str]:
             [_MESSAGE_MARKER, _ARRIVED_TAG, str(event.piece_id), position_to_algebraic(event.cell), captured_token]
         )
 
+    if isinstance(event, JumpLanded):
+        return _FIELD_SEP.join([_MESSAGE_MARKER, _LANDED_TAG, str(event.piece_id), position_to_algebraic(event.cell)])
+
     return None
 
 
@@ -153,9 +174,9 @@ def parse_game_event(text: str) -> object:
             ever calling this function; guarded here too regardless.
 
     Returns:
-        A real MoveAccepted, JumpAccepted, or PieceArrived instance,
-        equal in every field to whatever format_game_event was
-        originally given.
+        A real MoveAccepted, JumpAccepted, PieceArrived, or JumpLanded
+        instance, equal in every field to whatever format_game_event
+        was originally given.
 
     Raises:
         MalformedGameEventWireFormatError: If `text` doesn't start
@@ -194,6 +215,15 @@ def parse_game_event(text: str) -> object:
             captured_token = fields[4]
             captured_piece_id = None if captured_token == _NONE_TOKEN else int(captured_token)
             return PieceArrived(piece_id=piece_id, cell=cell, captured_piece_id=captured_piece_id)
+
+        if tag == _LANDED_TAG:
+            if len(fields) != _LANDED_FIELD_COUNT:
+                raise MalformedGameEventWireFormatError(
+                    f"expected {_LANDED_FIELD_COUNT} fields for {tag}, got {len(fields)}: {text!r}"
+                )
+            piece_id = int(fields[2])
+            cell = algebraic_to_position(fields[3])
+            return JumpLanded(piece_id=piece_id, cell=cell)
     except MalformedGameEventWireFormatError:
         raise
     except ValueError as exc:
