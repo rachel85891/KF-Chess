@@ -144,3 +144,48 @@ class NetworkClickController:
 
         self._network_client.send_move(self.assigned_color, selected_piece.kind, self.selected, cell)
         self.selected = None
+
+    def request_jump(self, cell: Position) -> None:
+        """Request a JUMP for whichever piece occupies `cell` - the
+        network-mode counterpart of GameLoopRunner's own _request_jump
+        (kungfu_chess/client/loop/game_loop.py), called from
+        NetworkGameLoopRunner's own on_jump_requested wiring (see that
+        class's own docstring).
+
+        Its own distinct method, not folded into click() (SRP - a jump
+        is a single-click, no-selection gesture with no shared
+        select-then-target state machine to reuse, exactly matching
+        MouseAdapter's own reasoning for why right-click is routed to
+        a completely separate callback rather than through
+        Controller/NetworkClickController.click at all). Deliberately
+        does not read or mutate self.selected - a jump never
+        participates in the move selection state machine.
+
+        Args:
+            cell: The cell the piece to jump currently occupies (a
+                single cell, not a from/to pair - matches
+                ExtraEngine.request_jump's own single-cell contract,
+                re-verified directly).
+
+        Returns:
+            None.
+
+        Mirrors click()'s own ownership check (see this module's own
+        docstring's "THE ONE REAL BEHAVIORAL DIFFERENCE FROM
+        Controller" section): only a piece belonging to this client's
+        own assigned_color may ever be requested to jump - a
+        right-click on the opponent's piece, an empty cell, or before
+        any board has been parsed yet (self.board is None) is a safe,
+        silent no-op, for the identical reason a left-click on any of
+        those is (the server would reject anything else anyway - see
+        server/game_server.py's own jump rejection scheme).
+        """
+
+        if self.board is None:
+            return
+
+        piece = self.board.piece_at(cell)
+        if piece is None or piece.color is not self.assigned_color:
+            return
+
+        self._network_client.send_jump(self.assigned_color, piece.kind, cell)

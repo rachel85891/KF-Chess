@@ -111,6 +111,7 @@ from websockets.exceptions import ConnectionClosed
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
+from kungfu_chess.notation.jump_command_format import format_jump_command
 from kungfu_chess.notation.move_command_format import format_move_command
 
 _ASSIGNED_COLOR_PREFIX = "assigned_color:"
@@ -300,6 +301,33 @@ class NetworkGameClient:
         """
 
         text = format_move_command(color=color, piece_kind=piece_kind, from_cell=from_cell, to_cell=to_cell)
+        future = asyncio.run_coroutine_threadsafe(self._send_text(text), self._loop)
+        future.add_done_callback(self._ignore_connection_closed)
+
+    def send_jump(self, color: Color, piece_kind: PieceKind, cell: Position) -> None:
+        """Format and send a jump command - fire-and-forget, exactly
+        mirroring send_move's own reasoning and mechanism verbatim (see
+        module docstring's "WHY send_move IS FIRE-AND-FORGET" and "WHY
+        send_move USES asyncio.run_coroutine_threadsafe" sections,
+        which apply identically here): the real outcome (accepted -> a
+        later JumpAccepted broadcast, or rejected -> a direct
+        "rejected:..." response, per server/game_server.py's own jump
+        rejection scheme) is only ever known via a later
+        poll_incoming() message, never this call's own return value.
+
+        Args:
+            color: The jumping piece's color.
+            piece_kind: The jumping piece's kind.
+            cell: The Position the jumping piece currently occupies (a
+                single cell, not a from/to pair - matches
+                format_jump_command's own contract).
+
+        Returns:
+            None. Does not block, does not return an accepted/rejected
+            result.
+        """
+
+        text = format_jump_command(color=color, piece_kind=piece_kind, cell=cell)
         future = asyncio.run_coroutine_threadsafe(self._send_text(text), self._loop)
         future.add_done_callback(self._ignore_connection_closed)
 

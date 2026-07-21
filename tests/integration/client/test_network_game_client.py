@@ -181,6 +181,39 @@ def test_send_move_then_poll_eventually_surfaces_the_expected_broadcast():
         test_server.stop()
 
 
+def test_send_jump_then_poll_eventually_surfaces_the_jump_landed_broadcast():
+    test_server = _BackgroundTestServer()
+    client1 = NetworkGameClient()
+    client2 = NetworkGameClient()
+    try:
+        assert client1.connect(test_server.uri) == Color.WHITE
+        assert client2.connect(test_server.uri) == Color.BLACK
+
+        client1.send_jump(Color.WHITE, PieceKind.ROOK, Position(row=7, col=0))
+
+        # Real wait for the real tick loop to advance real time far
+        # enough for the jump's own real airborne duration
+        # (MS_PER_SQUARE, extra/jump.py's own JUMP_DURATION_MS) to
+        # elapse and its landing to broadcast - mirrors
+        # test_send_move_then_poll_eventually_surfaces_the_expected_
+        # broadcast's own structure exactly, for a jump instead of a
+        # move.
+        timeout_s = MS_PER_SQUARE / 1000 + 3.0
+
+        def has_jump_landed_wire(messages: list[str]) -> bool:
+            return any(msg.startswith("EVT:LANDED:") for msg in messages)
+
+        messages1 = _poll_until(client1, has_jump_landed_wire, timeout_s)
+        messages2 = _poll_until(client2, has_jump_landed_wire, timeout_s)
+
+        assert has_jump_landed_wire(messages1)
+        assert has_jump_landed_wire(messages2)
+    finally:
+        client1.close()
+        client2.close()
+        test_server.stop()
+
+
 def test_poll_incoming_returns_an_empty_list_when_nothing_new_has_arrived():
     test_server = _BackgroundTestServer()
     client = NetworkGameClient()

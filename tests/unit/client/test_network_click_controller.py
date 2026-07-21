@@ -44,9 +44,13 @@ def _pixel(cell: Position) -> tuple[int, int]:
 class _RecordingNetworkClient:
     def __init__(self):
         self.sent_moves: list = []
+        self.sent_jumps: list = []
 
     def send_move(self, color, piece_kind, from_cell, to_cell) -> None:
         self.sent_moves.append((color, piece_kind, from_cell, to_cell))
+
+    def send_jump(self, color, piece_kind, cell) -> None:
+        self.sent_jumps.append((color, piece_kind, cell))
 
 
 def test_selecting_and_then_targeting_sends_a_real_move_with_correct_arguments():
@@ -169,6 +173,75 @@ def test_targeting_the_opponents_piece_sends_a_move_as_a_capture_attempt():
 
     assert network_client.sent_moves == [(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0), Position(row=0, col=2))]
     assert controller.selected is None
+
+
+def test_request_jump_for_own_piece_sends_a_real_jump_with_correct_arguments():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+    controller.board = board
+
+    controller.request_jump(Position(row=0, col=0))
+
+    assert network_client.sent_jumps == [(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))]
+
+
+def test_request_jump_does_not_touch_selection_state():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    knight = _piece(Color.WHITE, PieceKind.KNIGHT, Position(row=0, col=1))
+    grid[0][0] = rook
+    grid[0][1] = knight
+    board = Board(grid)
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+    controller.board = board
+    controller.click(*_pixel(Position(row=0, col=0)))
+    assert controller.selected == Position(row=0, col=0)
+
+    controller.request_jump(Position(row=0, col=1))
+
+    # A jump has no select-then-target state machine of its own - the
+    # pre-existing move selection is left completely untouched.
+    assert controller.selected == Position(row=0, col=0)
+    assert network_client.sent_jumps == [(Color.WHITE, PieceKind.KNIGHT, Position(row=0, col=1))]
+
+
+def test_request_jump_for_the_opponents_piece_is_a_safe_noop():
+    grid = _empty_grid(3, 3)
+    enemy = _piece(Color.BLACK, PieceKind.PAWN, Position(row=0, col=0))
+    grid[0][0] = enemy
+    board = Board(grid)
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+    controller.board = board
+
+    controller.request_jump(Position(row=0, col=0))
+
+    assert network_client.sent_jumps == []
+
+
+def test_request_jump_on_an_empty_cell_is_a_safe_noop():
+    board = Board(_empty_grid(3, 3))
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+    controller.board = board
+
+    controller.request_jump(Position(row=1, col=1))
+
+    assert network_client.sent_jumps == []
+
+
+def test_request_jump_before_any_board_has_been_parsed_is_a_safe_noop():
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+
+    controller.request_jump(Position(row=0, col=0))  # must not raise
+
+    assert network_client.sent_jumps == []
 
 
 def test_stale_selection_is_cleared_gracefully_if_piece_no_longer_present():
