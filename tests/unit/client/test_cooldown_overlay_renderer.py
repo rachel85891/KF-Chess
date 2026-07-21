@@ -7,7 +7,7 @@ from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
-from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
+from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE, COOLDOWN_MS
 
 
 class SpyImg:
@@ -62,7 +62,8 @@ def test_piece_at_half_ratio_draws_a_half_width_bar():
     tracker.on_event(PieceArrived(piece_id=rook.id, cell=Position(row=1, col=1), captured_piece_id=None))
 
     canvas = SpyImg()
-    CooldownOverlayRenderer(canvas).render(board, tracker, current_clock_ms=500)  # COOLDOWN_MS is 1000 -> ratio 0.5
+    # Halfway through COOLDOWN_MS -> ratio 0.5, regardless of COOLDOWN_MS's real value.
+    CooldownOverlayRenderer(canvas).render(board, tracker, current_clock_ms=COOLDOWN_MS // 2)
 
     assert len(canvas.rectangle_calls) == 1
     x, y, width, height, _color, _thickness = canvas.rectangle_calls[0]

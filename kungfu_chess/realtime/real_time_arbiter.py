@@ -116,7 +116,7 @@ from kungfu_chess.rules.shapes import path_cells
 CELL_SIZE = 100
 PIECE_SPEED = 100
 MS_PER_SQUARE = int(CELL_SIZE / PIECE_SPEED * 1000)
-COOLDOWN_MS = 1000
+COOLDOWN_MS = 4000
 
 
 def _chebyshev_distance(source: Position, destination: Position) -> int:
