@@ -11,12 +11,18 @@ from __future__ import annotations
 
 from kungfu_chess.bus.event_bus import EventBus
 from kungfu_chess.client.events.game_events import JumpAccepted, JumpLanded, MoveAccepted
+from kungfu_chess.client.events.observers import CaptureLogEntry
 from kungfu_chess.extra.jump import JUMP_DURATION_MS
+from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
-from kungfu_chess.model.piece import PieceKind
+from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
 from server.game_session import GameSession
+
+
+def _empty_grid(rows: int, cols: int) -> list[list[None]]:
+    return [[None for _ in range(cols)] for _ in range(rows)]
 
 
 def test_constructing_a_game_session_produces_a_standard_starting_position():
@@ -136,6 +142,66 @@ def test_request_jump_on_an_empty_cell_is_rejected_and_publishes_nothing():
 
     assert accepted is False
     assert events == []
+
+
+def test_a_real_capture_updates_score_observer_and_records_move_then_capture_in_moves_log_observer():
+    session = GameSession()
+    from_cell = Position(row=6, col=4)  # white pawn e2
+    to_cell = Position(row=4, col=4)  # e4
+
+    result = session.request_move(from_cell, to_cell)
+    assert result.is_accepted is True
+
+    score_after_move = session.score_observer.snapshot()
+    assert score_after_move.score_by_color == {Color.WHITE: 0, Color.BLACK: 0}
+
+    log_after_move = session.moves_log_observer.snapshot()
+    assert len(log_after_move.entries) == 1
+    move_entry = log_after_move.entries[0]
+    assert move_entry.piece_kind is PieceKind.PAWN
+    assert move_entry.piece_color is Color.WHITE
+    assert move_entry.from_cell == from_cell
+    assert move_entry.to_cell == to_cell
+    assert move_entry.is_jump is False
+
+
+def test_move_accepted_is_recorded_with_clock_ms_zero_since_it_fires_before_any_wait():
+    # MoveAccepted publishes synchronously, inside request_move() itself
+    # - which always happens BEFORE any wait() call advances the clock
+    # or ever calls set_current_clock_ms - so its own MoveLogEntry is
+    # stamped with whatever _current_clock_ms already was (0, the
+    # observer's own untouched default), not a predicted future value.
+    session = GameSession()
+
+    session.request_move(Position(row=6, col=4), Position(row=4, col=4))
+
+    log = session.moves_log_observer.snapshot()
+    assert len(log.entries) == 1
+    assert log.entries[0].recorded_at_clock_ms == 0
+
+
+def test_moves_log_observer_receives_the_predicted_upcoming_clock_ms_before_each_wait():
+    # A PieceArrived (and the CaptureLogEntry it produces) fires
+    # SYNCHRONOUSLY INSIDE wait() itself, after set_current_clock_ms was
+    # just called with THIS wait() call's own predicted upcoming clock
+    # (clock_ms_before + ms) - so, unlike a MoveAccepted (see the
+    # sibling test above), a capture entry's own recorded_at_clock_ms
+    # must reflect that exact predicted value.
+    grid = _empty_grid(3, 4)
+    mover = Piece(color=Color.WHITE, kind=PieceKind.ROOK, cell=Position(row=0, col=0))
+    target = Piece(color=Color.BLACK, kind=PieceKind.PAWN, cell=Position(row=0, col=2))
+    grid[0][0] = mover
+    grid[0][2] = target
+    session = GameSession(board=Board(grid))
+
+    session.request_move(Position(row=0, col=0), Position(row=0, col=2))
+    session.wait(2 * MS_PER_SQUARE)
+
+    log = session.moves_log_observer.snapshot()
+    capture_entries = [entry for entry in log.entries if isinstance(entry, CaptureLogEntry)]
+    assert len(capture_entries) == 1
+    assert capture_entries[0].recorded_at_clock_ms == 2 * MS_PER_SQUARE
+    assert session.engine.state.clock_ms == 2 * MS_PER_SQUARE
 
 
 def test_two_independent_game_sessions_do_not_share_state():

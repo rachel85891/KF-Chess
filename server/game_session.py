@@ -25,10 +25,79 @@ PieceAnimatorRegistry, ScoreObserver, MovesLogObserver,
 CooldownTracker, SoundManager, AssetCache, Controller, MouseAdapter,
 and the whole cv2/Img rendering/canvas-layout machinery - none of that
 belongs on a server (no display, no mouse, no speakers), so none of it
-is constructed here. GameSession is therefore a strict SUBSET of
-GameLoopRunner's own composition, not a reimplementation of it - the
-same real GameEngine/ExtraEngine/GameEventPublisher/EventBus classes,
-composed the same way, just without the client-only half.
+is constructed here EXCEPT PieceRegistry/ScoreObserver/
+MovesLogObserver (see "SCORE / MOVE-LOG / TIMER" section below, a
+later stage's addition): unlike PieceAnimatorRegistry/CooldownTracker/
+SoundManager/the rendering machinery, these three are pure DATA
+observers with no display/mouse/speaker dependency at all - reusing
+them here is exactly as legitimate as GameLoopRunner's own reuse of
+them, just for a different consumer (a future network broadcast
+instead of a local HudRenderer/SidePanelRenderer). GameSession is
+therefore a strict SUBSET of GameLoopRunner's own composition, not a
+reimplementation of it - the same real GameEngine/ExtraEngine/
+GameEventPublisher/EventBus/PieceRegistry/ScoreObserver/
+MovesLogObserver classes, composed and subscribed the same way
+GameLoopRunner already does, just without the client-only half.
+
+SCORE / MOVE-LOG / TIMER (later stage - server-score-moveslog-timer-
+broadcast): WHY CONSTRUCTED HERE, IN GameSession, NOT IN GameServer
+(re-read both files' current constructors directly before deciding):
+GameServer accepts an already-built GameSession (or builds a default
+one with `GameSession()`, no board of its own) - it never sees the
+initial `board` directly, only whatever GameSession already wrapped it
+into. PieceRegistry.from_board(board) needs that ORIGINAL board at the
+exact moment it's still a plain Board, before anything has moved -
+GameSession.__init__ is the one and only place that already holds it at
+that moment (the same reason GameLoopRunner itself builds
+PieceRegistry.from_board(board) inside its own __init__, immediately
+after receiving `board`, rather than deferring it to some later
+composition step). Building it in GameServer instead would mean either
+threading the original board through GameServer's own constructor
+(duplicating GameSession's own "build or accept a board" responsibility
+in a second place) or reaching into GameSession's own internals to
+re-derive a board snapshot after the fact (fragile, and arguably WRONG
+once even one move has already happened by the time GameServer got
+around to it). GameSession is therefore the correct, and only genuinely
+available, composition point for this - exactly the same reasoning
+that already puts the engine/extra_engine/event_bus/publisher stack
+here rather than in GameServer.
+
+Subscribed via `self.publisher.subscribe(...)` - the SAME Observer-
+protocol mechanism (kungfu_chess/client/events/event_publisher.py's
+`_observers` list, Stage 3) GameLoopRunner already uses for these exact
+two classes, NOT the EventBus's own per-type `subscribe(event_type,
+callback)` mechanism GameServer's broadcaster uses for ITS OWN,
+different purpose (bridging a sync callback into an async send - see
+game_server.py's own docstring). Both classes already implement
+Observer's single `on_event(event)` method; reusing that existing,
+already-tested subscription path is the more DRY, zero-new-mechanism
+choice, rather than reinventing a second, EventBus-shaped way to
+deliver the same events to the same two classes.
+
+wait()'s own new one-line addition - `self.moves_log_observer.
+set_current_clock_ms(self.engine.state.clock_ms + ms)`, called BEFORE
+`self.publisher.wait(ms)` - mirrors GameLoopRunner._run_one_frame's own
+exact "told BEFORE wait() runs" ordering and clock-prediction formula
+(`upcoming_clock_ms = self.engine.state.clock_ms + delta_ms`, re-read
+directly) for the identical reason documented in
+MovesLogObserver.set_current_clock_ms's own docstring: by the time
+on_event fires (inside publisher.wait(), after the clock has already
+advanced), the real clock has already moved - so the value must be
+predicted and supplied beforehand. DELIBERATELY LIVES INSIDE
+GameSession.wait() ITSELF, not duplicated in GameServer.run_tick_loop
+(the literal call site GameLoopRunner's own equivalent lives in): this
+class's own `wait()` is the SINGLE choke point every caller advancing
+this session's clock already goes through (GameServer's tick loop, and
+this module's own tests calling `session.wait(...)` directly) - baking
+the invariant "moves_log_observer always reflects the correct clock
+before an advance" directly into this one method guarantees it holds
+for every caller automatically, rather than requiring every present
+and future caller of `wait()` to separately remember to call
+`set_current_clock_ms` first (which GameServer would otherwise need to
+know MovesLogObserver even exists to do). This is a one-line,
+purely-additive change - it does not alter wait()'s own return value or
+any existing move/board-mutation behavior, so no pre-existing test
+needed to change.
 
 `self.event_bus` is public for the exact same reason
 GameLoopRunner.event_bus is (see that class's own "EVENTBUS WIRING"
@@ -108,6 +177,8 @@ from typing import List, Optional
 
 from kungfu_chess.bus.event_bus import EventBus
 from kungfu_chess.client.events.event_publisher import GameEventPublisher
+from kungfu_chess.client.events.observers import MovesLogObserver, ScoreObserver
+from kungfu_chess.client.events.piece_registry import PieceRegistry
 from kungfu_chess.engine.game_engine import GameEngine, MoveResult
 from kungfu_chess.extra.extra_engine import ExtraEngine
 from kungfu_chess.io.board_parser import BoardParser
@@ -177,6 +248,19 @@ class GameSession:
         self.event_bus = EventBus()
         self.publisher = GameEventPublisher(self.extra_engine, event_bus=self.event_bus)
 
+        # See module docstring's "SCORE / MOVE-LOG / TIMER" section for
+        # why these three are built and subscribed here, not in
+        # GameServer. piece_registry is snapshotted from THIS board,
+        # before anything has moved - the same "one-time snapshot at
+        # game start" contract PieceRegistry.from_board's own docstring
+        # documents, and the same moment GameLoopRunner itself builds
+        # its own equivalent registry.
+        self.piece_registry = PieceRegistry.from_board(board)
+        self.score_observer = ScoreObserver(self.piece_registry)
+        self.moves_log_observer = MovesLogObserver(self.piece_registry)
+        self.publisher.subscribe(self.score_observer)
+        self.publisher.subscribe(self.moves_log_observer)
+
     def request_move(self, from_cell: Position, to_cell: Position) -> MoveResult:
         """Thin pass-through to GameEventPublisher.request_move - see
         module docstring's "NO CLICK/PIXEL-COORDINATE HANDLING" section
@@ -226,7 +310,11 @@ class GameSession:
         return self.publisher.request_jump(cell)
 
     def wait(self, ms: int) -> List[ArrivalEvent]:
-        """Thin pass-through to GameEventPublisher.wait.
+        """Advance this session's clock by ms - see module docstring's
+        "SCORE / MOVE-LOG / TIMER" section for why this now also stamps
+        moves_log_observer's own current clock BEFORE delegating to
+        GameEventPublisher.wait, mirroring GameLoopRunner's own
+        identical "told before wait()" ordering.
 
         Args:
             ms: Milliseconds of logical time to advance.
@@ -236,4 +324,5 @@ class GameSession:
             GameEventPublisher.wait, unchanged.
         """
 
+        self.moves_log_observer.set_current_clock_ms(self.engine.state.clock_ms + ms)
         return self.publisher.wait(ms)
