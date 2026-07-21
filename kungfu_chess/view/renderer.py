@@ -231,16 +231,37 @@ def build_snapshot(engine: GameEngine, controller: Controller) -> GameSnapshot:
     )
 
 
+@dataclass(frozen=True)
+class InFlightMotion:
+    """One piece's in-flight motion data for build_snapshot_from_board
+    (Stage B7.5) - a caller-supplied, ALREADY-clamped progress value,
+    not a raw elapsed_ms/duration_ms pair. See module docstring's
+    "EXTRACTED, Stage B7.5" section for the full reasoning: this
+    function has no engine/arbiter/clock of its own (unlike
+    build_snapshot), so it deliberately never computes progress
+    itself - keeping it fully agnostic of WHICH clock produced that
+    fraction (a local engine's clock_ms, as build_snapshot itself
+    uses; a client's own wall-clock elapsed time, as
+    NetworkGameLoopRunner uses; or any future clock source)."""
+
+    from_cell: Position
+    to_cell: Position
+    progress: float
+
+
 def build_snapshot_from_board(
     board: Board,
     selected: Optional[Position] = None,
     game_over: bool = False,
+    active_motions: Optional[dict[int, InFlightMotion]] = None,
 ) -> GameSnapshot:
     """Build a GameSnapshot directly from a plain Board - no
     GameEngine/Controller/RealTimeArbiter involved. See module
     docstring's "build_snapshot_from_board (Stage B6...)" section for
-    the full reasoning (why this exists, and its explicit no-
-    interpolation scope decision).
+    the full reasoning (why this exists) - its original no-
+    interpolation scope decision (Stage B6) is now OPTIONALLY liftable
+    per-piece via `active_motions` (Stage B7.5, see module docstring's
+    "EXTRACTED, Stage B7.5" section).
 
     Args:
         board: The Board to snapshot - e.g. one just parsed via
@@ -251,11 +272,25 @@ def build_snapshot_from_board(
         game_over: Whether to mark the snapshot as game-over. Defaults
             to False - see module docstring for why this can never be
             inferred from `board` itself.
+        active_motions: Optional {piece_id: InFlightMotion} (Stage
+            B7.5). A piece whose id has an entry here is rendered via
+            interpolate_cell_pixel between that entry's own
+            from_cell/to_cell at its own progress, instead of
+            statically at piece.cell. Defaults to None, identical
+            (byte-for-byte) to this function's pre-Stage-B7.5
+            behavior - every existing caller that doesn't pass this
+            argument is completely unaffected (see
+            tests/unit/test_renderer_from_board.py's own pre-existing,
+            unedited test suite).
 
     Returns:
-        A GameSnapshot with every piece rendered statically at its own
-        cell's pixel position (no in-flight interpolation).
+        A GameSnapshot with each piece rendered either at its
+        interpolated in-flight position (if `active_motions` has an
+        entry for it) or statically at its own cell's pixel position
+        (every other piece - unchanged default behavior).
     """
+
+    active_motions = active_motions or {}
 
     pieces = []
     for row in range(board.height):
@@ -264,7 +299,12 @@ def build_snapshot_from_board(
             if piece is None:
                 continue
 
-            x, y = _cell_pixel(piece.cell)
+            motion = active_motions.get(piece.id)
+            if motion is not None:
+                x, y = interpolate_cell_pixel(motion.from_cell, motion.to_cell, motion.progress)
+            else:
+                x, y = _cell_pixel(piece.cell)
+
             pieces.append(PieceSnapshot(id=piece.id, kind=piece.kind, color=piece.color, x=x, y=y, state=piece.state))
 
     return GameSnapshot(
