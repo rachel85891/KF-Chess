@@ -187,6 +187,72 @@ def test_move_command_with_wrong_color_prefix_for_the_connection_is_rejected():
     asyncio.run(scenario())
 
 
+def test_move_command_for_a_square_not_matching_the_claimed_piece_is_rejected():
+    # Safety-net characterization test, added before refactor/server-
+    # application-presentation-split: this scenario (piece_mismatch for
+    # a MOVE command specifically, not just a JUMP command) had no
+    # existing coverage anywhere in this suite - only
+    # test_jump_command_for_a_cell_not_matching_the_claimed_piece_is_
+    # rejected (below) exercised this rejection reason, for JUMP only.
+    # Mirrors that test's own scenario shape, applied to a MOVE command.
+    async def scenario():
+        async with _running_game_server() as (uri, _game_server):
+            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.recv()  # client1 is White
+                await client2.recv()  # client2 is Black
+                await client1.recv()  # join-time board state
+                await client2.recv()
+
+                # e2 really holds a Pawn, not a Queen - piece_mismatch.
+                await client1.send("WQe2e4")
+                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+
+                assert "piece_mismatch" in rejection
+
+                # client2 must not have received anything - the bad
+                # command never reached the engine, so no game
+                # event/broadcast was ever produced.
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client2.recv(), timeout=0.3)
+
+    asyncio.run(scenario())
+
+
+def test_move_rejected_by_the_real_engine_broadcasts_board_text_to_both_clients_with_no_wire_event():
+    # Safety-net characterization test, added before refactor/server-
+    # application-presentation-split: proves the real-engine-rejection
+    # path the module docstring's own "MOVE COMMAND REJECTION SCHEME"
+    # section describes (a move that parses fine and matches the real
+    # board, but is still illegal per the real engine) - this path had
+    # NO existing test coverage anywhere in this suite. A 3-square pawn
+    # move from its own starting square is parseable and piece-matches
+    # (e2 really is a white pawn) but illegal chess-piece-movement shape
+    # - GameEventPublisher publishes a real MoveRejected event for this,
+    # which only ever produces the ordinary board-text broadcast (no
+    # wire-format event, no direct point-to-point rejection response -
+    # unlike malformed/wrong_color/piece_mismatch, which never reach the
+    # engine at all).
+    async def scenario():
+        async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
+            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.recv()  # assigned_color
+                await client2.recv()
+                await client1.recv()  # join-time board state
+                await client2.recv()
+
+                await client1.send("WPe2e5")  # 3 squares - illegal pawn shape
+
+                board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+
+        assert board_after_1 == board_after_2
+        lines = board_after_1.splitlines()
+        assert lines[6].split()[4] == "wP"  # e2 - the pawn never moved
+        assert lines[3].split()[4] == "."  # e5 - still empty
+
+    asyncio.run(scenario())
+
+
 def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid_commands():
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
