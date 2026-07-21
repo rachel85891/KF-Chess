@@ -152,6 +152,18 @@ mapper is refreshed by direct reassignment of
 `self.mouse_adapter._mapper`, the same mechanism GameLoopRunner uses,
 for the same reason (MouseAdapter re-reads `self._mapper` fresh on
 every click, so no setter method needs to be added to it).
+
+BUGFIX (fix/resizable-window-click-mapping-bug): the above was never
+actually run against a real window/real clicks when first written -
+doing so (against GameLoopRunner first, then re-verified against this
+class identically) revealed the per-frame mapper rebuild was silently
+dropping `self._board_origin_x`/`self._board_origin_y` (the board's
+own offset within the canvas, past the left panel/label margin) - see
+game_loop.py's own "RESIZABLE WINDOW - CLICK MAPPING BUGFIX" docstring
+section for the full real, logged evidence. Fixed identically here:
+the board's own offset, scaled by this frame's real scale factor, is
+now composed on top of the canvas's own letterbox origin before
+building the mapper.
 """
 
 from __future__ import annotations
@@ -423,8 +435,19 @@ class NetworkGameLoopRunner:
                 f"scale={scale:.6f} origin=({origin_x:.3f},{origin_y:.3f})"
             )
         if scale > 0:
+            # BUGFIX - see game_loop.py's own "RESIZABLE WINDOW - CLICK
+            # MAPPING BUGFIX" docstring section for the full reasoning
+            # (identical bug, found via the same real, logged evidence
+            # against this class too): origin_x/origin_y is only the
+            # CANVAS's own letterbox offset within the window - the
+            # board's own offset WITHIN that canvas
+            # (self._board_origin_x/_y) must be composed on top,
+            # scaled by this frame's real scale factor, or every click
+            # resolves board_origin_x/_y pixels too far right/down.
+            board_window_origin_x = origin_x + self._board_origin_x * scale
+            board_window_origin_y = origin_y + self._board_origin_y * scale
             self.mouse_adapter._mapper = ScreenToImageMapper(
-                window_origin=(round(origin_x), round(origin_y)), window_scale=scale
+                window_origin=(round(board_window_origin_x), round(board_window_origin_y)), window_scale=scale
             )
             resized = main_canvas.resize(round(self._total_canvas_width * scale), round(self._total_canvas_height * scale))
             display_canvas = Img.blank_canvas(actual_width, actual_height, background_color=CANVAS_BACKGROUND_COLOR)

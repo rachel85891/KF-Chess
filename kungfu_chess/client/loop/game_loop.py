@@ -390,19 +390,54 @@ window of size zero" to compute, and reusing the last good mapper is
 strictly safer than either crashing or building one around
 nonsensical numbers.
 
-NOT EMPIRICALLY VERIFIED IN THIS ENVIRONMENT (an honest, accepted gap,
-not a claim of certainty): this sandboxed environment has no real
-display, so the actual runtime behavior of a real
-`cv2.getWindowImageRect` call against a real, human-resized window
-could not be directly executed and observed here, unlike this
-project's own usual "verified directly from source before writing
-this" standard for cv2 APIs. The pure fit-math
-(compute_fit_scale_and_origin) is thoroughly unit-tested in isolation;
-the cv2-facing half of this fix relies on cv2's own documented
-contract for `getWindowImageRect`/`WINDOW_NORMAL` and needs a human,
-with a real display, to confirm empirically (see this module's own
-final manual-verification instructions in the task this fix was
-written for).
+EMPIRICAL VERIFICATION HISTORY: the resizable-window fix above was
+originally written and merged from a sandboxed environment with no
+real display, so its cv2-facing half was never actually run against a
+real window - only reasoned about. When later run against a REAL
+display and REAL simulated OS-level clicks (SetCursorPos + mouse_event
+at real screen coordinates, computed from this class's own real
+in-process state - see fix/resizable-window-click-mapping-bug's own
+investigation), it turned out to be broken - NOT from any DPI-scaling
+mismatch, NOT from `getWindowImageRect` itself being unreliable on this
+platform (both were directly ruled out first, with logged evidence: the
+real per-monitor DPI here is 100%/96, and `getWindowImageRect` was
+shown to agree exactly with Win32's own `GetClientRect`, both before
+and after a real `SetWindowPos` resize), but from a much simpler, pure
+logic bug, 100% reproducible on literally the FIRST rendered frame
+(not something that only appears after a resize - resizing just made
+it more visually obvious to a human): see "RESIZABLE WINDOW - CLICK
+MAPPING BUGFIX" below.
+
+RESIZABLE WINDOW - CLICK MAPPING BUGFIX (found via real, logged
+evidence, not guessed): the per-frame mapper rebuild computed
+`window_origin` using ONLY `compute_fit_scale_and_origin`'s own
+canvas-to-window letterbox offset - but that offset positions the
+WHOLE main_canvas (side panels + label margins + board together)
+within the window; it says nothing about where the BOARD itself sits
+WITHIN that canvas. `self._board_origin_x`/`self._board_origin_y`
+(PANEL_WIDTH + LABEL_MARGIN, and LABEL_MARGIN respectively) is a
+SEPARATE offset the original, pre-resizable-window code already
+folded into the mapper's origin at construction time (see this
+docstring's own now-historical "CLICK OFFSET" section above) - the
+resizable-window fix's per-frame rebuild silently dropped it, so every
+click resolved to a board-relative image position that was
+`self._board_origin_x`/`self._board_origin_y` pixels too far
+right/down (scaled), landing on the wrong cell (or off the board
+entirely) on literally every frame. Confirmed with real logged numbers
+(fix/resizable-window-click-mapping-bug's own investigation): a click
+squarely on a cell whose board-relative center should resolve to image
+position (50, 48.68) instead resolved to (300, 78.95) - exactly
+`board_origin_x=250` too far on x, precisely matching the composition
+error, reproduced identically at three different real window
+sizes/shapes (native, a proportional resize, and a non-proportional
+one). THE FIX: compose the board's own offset back in, scaled by this
+frame's real scale factor (the board lives inside the same uniformly-
+scaled canvas, so its own offset scales proportionally too) - see
+`_run_one_frame`'s own inline comment at the point of the fix for the
+exact composition. The visual resize/letterbox/paste logic itself was
+never wrong - only the SEPARATE mapper-origin computation used for
+click resolution; re-verified this is the only place window_origin is
+computed.
 """
 
 from __future__ import annotations
@@ -769,8 +804,24 @@ class GameLoopRunner:
                 f"scale={scale:.6f} origin=({origin_x:.3f},{origin_y:.3f})"
             )
         if scale > 0:
+            # BUGFIX (see module docstring's "RESIZABLE WINDOW - CLICK
+            # MAPPING BUGFIX" section): origin_x/origin_y from
+            # compute_fit_scale_and_origin is the CANVAS's own
+            # letterbox offset within the window - it does NOT yet
+            # account for the BOARD's own offset WITHIN that canvas
+            # (self._board_origin_x/_y, the space reserved for the
+            # left side panel and label margin before the board even
+            # starts). ScreenToImageMapper.window_origin must point to
+            # where the BOARD's own image (0, 0) lands in window space
+            # (BoardMapper, downstream, expects board-relative pixels)
+            # - so the board's own offset, SCALED by this frame's real
+            # scale factor (it lives inside the same uniformly-scaled
+            # canvas), must be composed on top of the canvas's own
+            # letterbox origin, not used in its place.
+            board_window_origin_x = origin_x + self._board_origin_x * scale
+            board_window_origin_y = origin_y + self._board_origin_y * scale
             self.mouse_adapter._mapper = ScreenToImageMapper(
-                window_origin=(round(origin_x), round(origin_y)), window_scale=scale
+                window_origin=(round(board_window_origin_x), round(board_window_origin_y)), window_scale=scale
             )
             resized = main_canvas.resize(round(self._total_canvas_width * scale), round(self._total_canvas_height * scale))
             display_canvas = Img.blank_canvas(actual_width, actual_height, background_color=CANVAS_BACKGROUND_COLOR)
