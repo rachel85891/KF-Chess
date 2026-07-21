@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from kungfu_chess.engine.game_engine import GameEngine
 from kungfu_chess.extra.extra_engine import ExtraEngine
-from kungfu_chess.extra.jump import JUMP_COOLDOWN_MS
+from kungfu_chess.extra.jump import JUMP_COOLDOWN_MS, JumpLandingEvent
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind, PieceState
@@ -156,6 +156,50 @@ def test_request_move_rejected_during_jump_cooldown_and_accepted_after():
     result = engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
 
     assert result.is_accepted is True
+
+
+def test_wait_returns_a_landing_event_when_a_jump_lands_with_no_interception():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    _interception_events, landing_events, _arrival_events, _promoted = extra_engine.wait(1000)
+
+    assert landing_events == [JumpLandingEvent(piece=rook, cell=Position(row=0, col=0))]
+
+
+def test_wait_returns_a_landing_event_for_the_defender_when_a_jump_lands_via_interception():
+    grid = _empty_grid(4, 4)
+    defender = _piece(Color.WHITE, PieceKind.PAWN, Position(row=0, col=0))
+    attacker = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = defender
+    grid[0][3] = attacker
+    board = Board(grid)
+    engine = GameEngine(board)
+    extra_engine = ExtraEngine(engine)
+
+    extra_engine.request_jump(Position(row=0, col=0))
+    engine.request_move(Position(row=0, col=3), Position(row=0, col=0))
+
+    _interception_events, landing_events, _arrival_events, _promoted = extra_engine.wait(1000)
+
+    assert landing_events == [JumpLandingEvent(piece=defender, cell=Position(row=0, col=0))]
+
+
+def test_wait_returns_no_landing_events_when_no_jump_is_airborne():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    extra_engine = ExtraEngine(engine)
+
+    engine.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    _interception_events, landing_events, _arrival_events, _promoted = extra_engine.wait(1000)
+
+    assert landing_events == []
 
 
 def test_request_jump_rejected_during_post_landing_cooldown_and_accepted_after():

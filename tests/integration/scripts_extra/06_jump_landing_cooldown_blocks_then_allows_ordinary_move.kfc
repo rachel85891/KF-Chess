@@ -6,7 +6,7 @@ jump 0 0
 wait 1000
 click 0 0
 click 100 0
-wait 1000
+wait 2000
 print board
 click 0 0
 click 100 0

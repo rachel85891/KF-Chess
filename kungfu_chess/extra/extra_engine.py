@@ -14,6 +14,16 @@ gated from an ordinary move by request_move's existing cooldown_active
 guard, so it is gated here too, from jumping again immediately,
 matching request_jump's existing bool-return rejection style rather
 than inventing a new one.
+
+wait()'s return value grew a fourth element (landing_events, closing
+client_spec.md §10's documented gap): JumpTracker.resolve_due now
+returns its own landing events alongside interception_events (see
+jump.py's own docstring) - this method simply forwards that second
+value through unchanged, exactly like it already forwards
+interception_events and promoted. GameEventPublisher.wait is the one
+place that turns these into a real, observable JumpLanded per landing
+(see its own docstring) - this class stays event-agnostic, same as it
+already is for interception_events/promoted today.
 """
 
 from __future__ import annotations
@@ -51,11 +61,11 @@ class ExtraEngine:
         self.jumps.start_jump(piece, self.engine.state.clock_ms)
         return True
 
-    def wait(self, ms: int) -> Tuple[list, List[ArrivalEvent], list]:
+    def wait(self, ms: int) -> Tuple[list, list, List[ArrivalEvent], list]:
         target_clock_ms = self.engine.state.clock_ms + ms
-        interception_events = self.jumps.resolve_due(target_clock_ms, self.engine.arbiter, self.engine.board)
+        interception_events, landing_events = self.jumps.resolve_due(target_clock_ms, self.engine.arbiter, self.engine.board)
 
         arrival_events = self.engine.wait(ms)
         promoted = apply_promotions(self.engine.board, arrival_events)
 
-        return interception_events, arrival_events, promoted
+        return interception_events, landing_events, arrival_events, promoted

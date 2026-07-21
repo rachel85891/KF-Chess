@@ -113,6 +113,7 @@ from kungfu_chess.bus.event_bus import EventBus
 from kungfu_chess.client.events.game_events import (
     GameOver,
     JumpAccepted,
+    JumpLanded,
     MoveAccepted,
     MoveRejected,
     PieceArrived,
@@ -318,15 +319,16 @@ class GameEventPublisher:
     def wait(self, ms: int) -> List[ArrivalEvent]:
         """Advance the wrapped engine's clock by ms, and publish a
         PieceArrived (and a GameOver, if a king was captured) for each
-        resulting ArrivalEvent, in the order this publisher's
-        EventOrderingPolicy produces.
+        resulting ArrivalEvent, plus a JumpLanded for each jump landing
+        that resolved, in the order this publisher's EventOrderingPolicy
+        produces.
 
         Args:
             ms: Milliseconds of logical time to advance, forwarded
                 as-is to ExtraEngine.wait.
 
         Returns:
-            The arrival_events element of ExtraEngine.wait's 3-tuple,
+            The arrival_events element of ExtraEngine.wait's 4-tuple,
             unchanged - callers that only use the return value (not
             events) keep working exactly as if GameEventPublisher
             weren't in the call path at all. Identical to what
@@ -345,11 +347,11 @@ class GameEventPublisher:
         in one call. This is also what actually makes JUMP landing/
         interception happen at all (see module docstring) - without
         this, an accepted jump would start but never resolve.
-        interception_events (ExtraEngine.wait's other return value) is
+        interception_events (ExtraEngine.wait's first return value) is
         deliberately not turned into a published event here - out of
         this stage's JUMP-only scope; a future stage can add an
         InterceptionEvent-style event the same way this one adds
-        JumpAccepted. `promoted` (ExtraEngine.wait's third return
+        JumpAccepted. `promoted` (ExtraEngine.wait's fourth return
         value) IS now turned into a published PromotionEvent (Stage
         14) - previously discarded entirely (`_promoted`), since
         nothing consumed it before Stage 14's SoundManager needed a
@@ -361,12 +363,26 @@ class GameEventPublisher:
         ever appends a piece it found by iterating this exact
         arrival_events batch, so every id in `promoted` is guaranteed
         to belong to exactly one arrival already in this loop.
+
+        `landing_events` (ExtraEngine.wait's second return value, new -
+        closes client_spec.md §10's documented gap) is turned into one
+        published JumpLanded per landing, the same way arrival_events
+        become PieceArrived: JumpTracker.resolve_due (via
+        ExtraEngine.wait) is the real, authoritative point a jump's
+        cooldown starts, and until now nothing published that moment at
+        all - CooldownTracker (kungfu_chess/client/events/
+        cooldown_tracker.py) could only ever react to ordinary
+        PieceArrived. See game_events.py's own JumpLanded docstring for
+        why this is a NEW event type rather than a reused PieceArrived.
         """
 
-        _interception_events, arrival_events, promoted = self._extra_engine.wait(ms)
+        _interception_events, landing_events, arrival_events, promoted = self._extra_engine.wait(ms)
         promoted_piece_ids = {piece.id for piece in promoted}
 
         pending: List[object] = []
+        for landing in landing_events:
+            pending.append(JumpLanded(piece_id=landing.piece.id, cell=landing.cell))
+
         for arrival in arrival_events:
             captured_piece_id: Optional[int] = (
                 arrival.captured_piece.id if arrival.captured_piece is not None else None

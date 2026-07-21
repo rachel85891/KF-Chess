@@ -55,6 +55,17 @@ resolve_due call's clock_ms, unlike core's clock_ms-based convention in
 RealTimeArbiter.advance_time: land_time is the piece's actual scheduled
 landing instant, so the cooldown window doesn't get inflated just
 because resolve_due happened to be reached late via a large wait().
+
+JumpLandingEvent (closing client_spec.md §10's documented gap): every
+landing above - unconditional, same as available_at_ms - now also
+appends a JumpLandingEvent(piece=entry.piece, cell=entry.piece.cell) to
+resolve_due's own second return value, so ExtraEngine.wait (and, from
+there, GameEventPublisher.wait) has a real, observable signal for the
+exact moment a jump's cooldown starts - mirroring InterceptionEvent's
+own existing convention of a frozen, Piece-carrying dataclass built at
+the model layer and handed upward, rather than reaching into the
+client layer from here (this module has, and must keep, zero
+client/event_publisher imports).
 """
 
 from __future__ import annotations
@@ -68,7 +79,7 @@ from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE, RealTimeArbiter
 
 JUMP_DURATION_MS = MS_PER_SQUARE
-JUMP_COOLDOWN_MS = 500
+JUMP_COOLDOWN_MS = 2000
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,16 @@ class _AirborneEntry:
 class InterceptionEvent:
     attacker: Piece
     defender: Piece
+    cell: Position
+
+
+@dataclass(frozen=True)
+class JumpLandingEvent:
+    """A jump landed - piece stayed at its own cell, cooldown starts.
+    See this module's own docstring's "JumpLandingEvent" section for
+    why this exists (client_spec.md §10's documented gap)."""
+
+    piece: Piece
     cell: Position
 
 
@@ -100,8 +121,11 @@ class JumpTracker:
     def _airborne_entry_at(self, cell: Position) -> Optional[_AirborneEntry]:
         return next((entry for entry in self._airborne.values() if entry.piece.cell == cell), None)
 
-    def resolve_due(self, clock_ms: int, arbiter: RealTimeArbiter, board: Board) -> list[InterceptionEvent]:
+    def resolve_due(
+        self, clock_ms: int, arbiter: RealTimeArbiter, board: Board
+    ) -> tuple[list[InterceptionEvent], list[JumpLandingEvent]]:
         events: list[InterceptionEvent] = []
+        landings: list[JumpLandingEvent] = []
 
         # Trigger 1: an attacker due to arrive while its target is
         # still airborne is destroyed instead of capturing/landing.
@@ -150,6 +174,7 @@ class JumpTracker:
             # landing instant, avoiding cooldown inflation when resolve_due
             # is reached late via a large wait().
             entry.piece.available_at_ms = entry.land_time + JUMP_COOLDOWN_MS
+            landings.append(JumpLandingEvent(piece=entry.piece, cell=entry.piece.cell))
             del self._airborne[piece_id]
 
-        return events
+        return events, landings

@@ -8,6 +8,7 @@ from kungfu_chess.client.events.event_publisher import GameEventPublisher, Motio
 from kungfu_chess.client.events.game_events import (
     GameOver,
     JumpAccepted,
+    JumpLanded,
     MoveAccepted,
     MoveRejected,
     PieceArrived,
@@ -367,3 +368,37 @@ def test_wait_drives_extra_engines_jump_landing_and_cooldown():
     publisher.wait(JUMP_DURATION_MS)
 
     assert rook.available_at_ms == JUMP_DURATION_MS + JUMP_COOLDOWN_MS
+
+
+def test_wait_publishes_jump_landed_when_a_jump_lands():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+
+    publisher.request_jump(Position(row=0, col=0))
+    observer.events.clear()  # drop the JumpAccepted from request_jump above
+
+    publisher.wait(JUMP_DURATION_MS)
+
+    assert observer.events == [JumpLanded(piece_id=rook.id, cell=Position(row=0, col=0))]
+
+
+def test_wait_publishes_no_jump_landed_when_no_jump_is_airborne():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+
+    publisher.request_move(Position(row=0, col=0), Position(row=0, col=1))
+    observer.events.clear()  # drop the MoveAccepted from request_move above
+
+    publisher.wait(MS_PER_SQUARE)
+
+    assert all(not isinstance(event, JumpLanded) for event in observer.events)
