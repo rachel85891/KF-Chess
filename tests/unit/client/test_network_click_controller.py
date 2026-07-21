@@ -265,3 +265,45 @@ def test_stale_selection_is_cleared_gracefully_if_piece_no_longer_present():
 
     assert controller.selected is None
     assert network_client.sent_moves == []
+
+
+def test_game_over_defaults_to_false():
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+
+    assert controller.game_over is False
+
+
+def test_click_is_a_safe_noop_once_game_over_is_set():
+    # fix/network-gameover-and-king-interception: once the game has
+    # ended, further clicks must not select a piece or send a move -
+    # mirrors the existing "safe no-op" style already used above for
+    # request_jump's own ownership/empty-cell/no-board guards.
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+    controller.board = board
+    controller.game_over = True
+
+    controller.click(*_pixel(Position(row=0, col=0)))
+
+    assert controller.selected is None
+    assert network_client.sent_moves == []
+
+
+def test_request_jump_is_a_safe_noop_once_game_over_is_set():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    board = Board(grid)
+    network_client = _RecordingNetworkClient()
+    controller = NetworkClickController(assigned_color=Color.WHITE, network_client=network_client)
+    controller.board = board
+    controller.game_over = True
+
+    controller.request_jump(Position(row=0, col=0))
+
+    assert network_client.sent_jumps == []

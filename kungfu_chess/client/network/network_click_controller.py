@@ -57,6 +57,21 @@ before Stage B7. This class's own `click()` method is unaffected
 either way: it only ever reads `self.board.piece_at(...)` fresh at
 call time, which reflects the current state correctly whether the
 object was replaced or mutated in place.
+
+GAME-OVER INPUT FREEZE (fix/network-gameover-and-king-interception):
+`game_over` is a plain, publicly settable bool attribute (defaults to
+False), checked at the very start of both click() and request_jump() -
+the single guard point for BOTH input paths, since both eventually
+reach this class (see MouseAdapter's own left/right-click routing).
+NetworkGameLoopRunner sets it to True once it parses a real GameOver
+wire message (kungfu_chess/notation/game_event_wire_format.py) - see
+that class's own docstring for the chosen freeze-and-display end-of-
+game UX. Placed here, on this class, rather than as a check inside
+NetworkGameLoopRunner's own click-dispatch wiring: this class is
+already the single place BOTH gestures funnel through and already owns
+every other "is this input allowed right now" decision (ownership,
+bounds, board-not-yet-parsed) - adding a second, parallel gate
+elsewhere would split one concern across two classes for no benefit.
 """
 
 from __future__ import annotations
@@ -95,6 +110,7 @@ class NetworkClickController:
         self._network_client = network_client
         self.board: Optional[Board] = None
         self.selected: Optional[Position] = None
+        self.game_over = False
         self._board_mapper = BoardMapper()
 
     def click(self, x: int, y: int) -> None:
@@ -114,9 +130,14 @@ class NetworkClickController:
         (self.board is None) - a plain no-op, matching this stage's own
         documented "no initial-state broadcast" gap (there is nothing
         yet to click against).
+
+        Also a safe no-op once self.game_over is True (fix/network-
+        gameover-and-king-interception) - see this module's own
+        docstring's "GAME-OVER INPUT FREEZE" section for why this flag
+        lives here rather than in NetworkGameLoopRunner itself.
         """
 
-        if self.board is None:
+        if self.board is None or self.game_over:
             return
 
         cell = self._board_mapper.pixel_to_cell(x, y)
@@ -178,10 +199,14 @@ class NetworkClickController:
         any board has been parsed yet (self.board is None) is a safe,
         silent no-op, for the identical reason a left-click on any of
         those is (the server would reject anything else anyway - see
-        server/game_server.py's own jump rejection scheme).
+        server/game_server.py's own jump rejection scheme). Also mirrors
+        click()'s own self.game_over guard (see this module's own
+        docstring's "GAME-OVER INPUT FREEZE" section) for the identical
+        reason: once the game has ended, no further request of any kind
+        should leave this client.
         """
 
-        if self.board is None:
+        if self.board is None or self.game_over:
             return
 
         piece = self.board.piece_at(cell)

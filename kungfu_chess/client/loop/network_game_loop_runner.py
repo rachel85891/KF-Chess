@@ -109,12 +109,18 @@ relitigate; each is documented again at its own point of use below):
    arrives (the same "correct, honest default before real data exists"
    pattern `self.board = None` already establishes for SCOPE DECISION 4
    below).
-3. NO GAME-OVER DETECTION: raw board-state broadcast text carries no
-   explicit game-over signal (see build_snapshot_from_board's own
-   docstring) - GameSnapshot.game_over is always False in network
-   mode. Exit conditions are therefore narrower than GameLoopRunner's
-   own three (no GameOver-driven exit is possible here at all) - see
-   _should_exit's own docstring.
+3. NO GAME-OVER DETECTION (SUPERSEDED - see "GAME OVER OVER THE
+   NETWORK" below, fix/network-gameover-and-king-interception): raw
+   board-state broadcast text still carries no explicit game-over
+   signal and GameSnapshot.game_over is still always False in network
+   mode - but this class no longer relies on that channel at all for
+   game-over detection. A real, dedicated GameOver wire event
+   (kungfu_chess/notation/game_event_wire_format.py) now carries this
+   signal instead, exactly like every other real game event
+   (MoveAccepted/PieceArrived/etc.) already does - see that section
+   below for the full reasoning. _should_exit's own three-vs-fewer
+   exit-condition count is UNCHANGED by this (a deliberate UX choice,
+   not a remaining limitation - see that section for why).
 4. NO INITIAL-STATE BROADCAST (a real, pre-existing protocol gap, not
    introduced by this stage): the server's own protocol (Stage B3)
    never sends a board-state broadcast on join - only in reaction to a
@@ -564,6 +570,64 @@ the displayed timer shows a harmless "00:00" ticking up from
 CONNECTION time, not a crash or a None-guard - the same "correct,
 honest default" treatment this class already gives `self.board = None`
 before the first board-text broadcast.
+
+GAME OVER OVER THE NETWORK (fix/network-gameover-and-king-interception):
+before this fix, network play never actually ended for a connected
+client at all - a real checkmate-equivalent (a captured King) only ever
+produced a silent board-text refresh, and both windows kept running
+forever (see server/game_server.py's own "GameOver ADDITION" docstring
+section for the server-side half of this same fix: GameOver was already
+subscribed to _BROADCAST_EVENT_TYPES, but format_game_event returned
+None for it, so nothing beyond the board text was ever sent). THE FIX,
+CLIENT SIDE: `_apply_wire_event` now also recognizes a parsed GameOver
+and dispatches it to `_handle_game_over`, which (a) sets `self._game_over
+= True` and `self._game_over_winner_color = event.winner_color` (this
+class's own new, honest state - defaults to False/None at construction,
+mirroring `self.board = None`'s own "correct default before real data
+arrives" convention) and (b) sets `self.click_controller.game_over =
+True` - the actual mechanism that stops further clicks/jumps from
+leaving this client (see NetworkClickController's own "GAME-OVER INPUT
+FREEZE" docstring section for why that guard lives on that class, not
+here).
+
+FREEZE-AND-DISPLAY, NOT AUTO-CLOSE OR EXIT (the chosen end-of-game UX,
+decided and justified here): `_should_exit` is deliberately NOT changed
+to react to `self._game_over` at all - the window stays open, still
+rendering every frame (via the new `if self._game_over:
+GameOverOverlayRenderer(...).render(...)` block in `_run_one_frame`),
+until the human closes it or presses 'q' (both pre-existing exit paths,
+completely unchanged). This project has no "back to menu"/rematch flow
+today (re-verified - no such mechanism exists anywhere in this
+codebase), so auto-closing the window the instant GameOver arrives
+would just end the session abruptly with no next step to offer the
+player, and would also make it impossible for a human tester to actually
+SEE the end-of-game message before the window vanished. Freezing and
+displaying the result, then waiting for a manual close, is the simplest
+option that gives the player a real, readable outcome without inventing
+UI flow this stage was never asked to build.
+
+GameOverOverlayRenderer (kungfu_chess/client/ui/game_over_overlay_
+renderer.py, new this stage) draws "Game Over - White wins" (or "Black
+wins") - deliberately NOT "Checkmate - <color> wins", even though a
+captured King is this game's own checkmate-equivalent: docs/spec.md §2
+explicitly states checkmate itself is not implemented, so naming it
+would claim a win condition this project doesn't have. Drawn onto
+`main_canvas` (the full window canvas, including both side panels), not
+just `board_canvas`, mirroring GameTimerRenderer's own choice to draw
+onto the full canvas rather than the board sub-canvas alone, and drawn
+every frame for as long as `self._game_over` stays True (it never
+becomes False again - a game, once over, stays over for the rest of
+this client's own session; there is no rematch/reset path to clear it).
+
+NO piece_id TRANSLATION NEEDED for GameOver, unlike every other handler
+above (_handle_piece_arrived/_handle_jump_landed/
+_handle_attacker_intercepted all call _translate_piece first): GameOver
+carries no piece_id at all (see kungfu_chess/client/events/
+game_events.py's own GameOver docstring - winner_color is its only
+field), so `_handle_game_over` has no PROBLEM-1-style translation gap to
+account for and no self.board/self.piece_animator_registry guard to
+check either - there is nothing board-position-related in this event
+that could still be unresolved by the time it arrives.
 """
 
 from __future__ import annotations
@@ -579,6 +643,7 @@ from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorR
 from kungfu_chess.client.events.cooldown_tracker import CooldownTracker
 from kungfu_chess.client.events.game_events import (
     AttackerIntercepted,
+    GameOver,
     JumpAccepted,
     JumpLanded,
     MoveAccepted,
@@ -596,6 +661,7 @@ from kungfu_chess.client.surface.img_surface import ImgSurface
 from kungfu_chess.client.ui.captured_pieces_renderer import CapturedPiecesRenderer
 from kungfu_chess.client.ui.coordinate_label_renderer import LABEL_MARGIN, CoordinateLabelRenderer
 from kungfu_chess.client.ui.cooldown_overlay_renderer import CooldownOverlayRenderer
+from kungfu_chess.client.ui.game_over_overlay_renderer import GameOverOverlayRenderer
 from kungfu_chess.client.ui.game_timer_renderer import TIMER_STRIP_HEIGHT, GameTimerRenderer
 from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH, SidePanelRenderer
 from kungfu_chess.io.board_parser import BoardParser
@@ -768,6 +834,13 @@ class NetworkGameLoopRunner:
         self._latest_log = _EMPTY_LOG
         self._latest_clock_ms = 0
         self._latest_clock_ms_received_at = self._clock()
+
+        # See module docstring's "GAME OVER OVER THE NETWORK" section -
+        # the correct, honest INITIAL values before this client's first
+        # real GameOver wire event ever arrives (mirrors self.board's
+        # own None-until-first-broadcast convention).
+        self._game_over = False
+        self._game_over_winner_color: Optional[Color] = None
 
         self.asset_cache = AssetCache()
 
@@ -1042,6 +1115,8 @@ class NetworkGameLoopRunner:
             self._handle_jump_landed(event)
         elif isinstance(event, AttackerIntercepted):
             self._handle_attacker_intercepted(event)
+        elif isinstance(event, GameOver):
+            self._handle_game_over(event)
 
     def _clock_ms(self) -> int:
         """Convert self._clock()'s own float (seconds - Stage B7.5's
@@ -1277,6 +1352,35 @@ class NetworkGameLoopRunner:
         if self.piece_animator_registry is not None:
             self.piece_animator_registry.on_event(translated)
 
+    def _handle_game_over(self, event: GameOver) -> None:
+        """Freeze this client's own input and record the real winner -
+        see module docstring's "GAME OVER OVER THE NETWORK" section for
+        the full reasoning behind the chosen freeze-and-display UX.
+
+        Args:
+            event: The real, wire-parsed GameOver.
+
+        Returns:
+            None.
+
+        No piece_id to translate here (GameOver carries none - see its
+        own docstring: winner_color is its only field) and no
+        self.board/self.piece_animator_registry guard needed either,
+        unlike every other handler above: this event carries no board
+        position at all, so there is nothing that could still be
+        unparsed/untranslatable by the time it arrives. Setting
+        self.click_controller.game_over = True here (rather than
+        leaving NetworkClickController to somehow discover this on its
+        own) is what actually stops further clicks/jumps from leaving
+        this client - see that class's own "GAME-OVER INPUT FREEZE"
+        docstring section for why the guard lives there instead of
+        being checked in this class's own click-dispatch wiring.
+        """
+
+        self._game_over = True
+        self._game_over_winner_color = event.winner_color
+        self.click_controller.game_over = True
+
     def poll_and_process(self) -> None:
         """Drain every new broadcast since the last call and apply each
         one, in arrival order - the per-frame network-polling step (see
@@ -1459,6 +1563,14 @@ class NetworkGameLoopRunner:
         timer_x = self._board_origin_x + self._board_pixel_width // 2 - 40
         GameTimerRenderer(main_canvas).render(self._displayed_clock_ms(), x=timer_x)
 
+        # See module docstring's "GAME OVER OVER THE NETWORK" section -
+        # drawn onto main_canvas (not board_canvas), so the message is
+        # never obscured by anything pasted on top of it afterward, and
+        # spans the same full-window canvas ImgSurface.
+        # draw_game_over_message centers itself on for local play.
+        if self._game_over:
+            GameOverOverlayRenderer(main_canvas).render(winner_color=self._game_over_winner_color)
+
         if self._headless:
             return
 
@@ -1507,10 +1619,13 @@ class NetworkGameLoopRunner:
 
     def _should_exit(self) -> bool:
         """True if either of this class's two real exit conditions
-        currently holds - narrower than GameLoopRunner's own three
-        (see module docstring's SCOPE DECISION 3: no GameOver-driven
-        exit is possible in network mode, since this class can never
-        detect one)."""
+        currently holds - narrower than GameLoopRunner's own three, and
+        DELIBERATELY still not a third GameOver-driven one even though
+        this class can now genuinely detect GameOver (see module
+        docstring's "GAME OVER OVER THE NETWORK" section: freeze-and-
+        display was chosen over auto-exit, so a game-over window stays
+        open and keeps rendering - the human closes it manually via
+        either of the two conditions actually checked below)."""
 
         if self._quit_requested:
             return True

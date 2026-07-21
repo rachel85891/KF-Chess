@@ -83,6 +83,24 @@ def test_attacker_intercepted_round_trips():
     assert reconstructed == event
 
 
+def test_game_over_round_trips_for_white_winner():
+    event = GameOver(winner_color=Color.WHITE)
+
+    text = format_game_event(event)
+    reconstructed = parse_game_event(text)
+
+    assert reconstructed == event
+
+
+def test_game_over_round_trips_for_black_winner():
+    event = GameOver(winner_color=Color.BLACK)
+
+    text = format_game_event(event)
+    reconstructed = parse_game_event(text)
+
+    assert reconstructed == event
+
+
 def test_wire_text_is_a_single_line_starting_with_the_distinct_prefix():
     text = format_game_event(MoveAccepted(piece_id=1, from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=1), duration_ms=1000))
 
@@ -90,9 +108,13 @@ def test_wire_text_is_a_single_line_starting_with_the_distinct_prefix():
     assert text.startswith(EVENT_MESSAGE_PREFIX)
 
 
-def test_format_game_event_returns_none_for_non_motion_events():
+def test_format_game_event_returns_none_for_non_motion_non_gameover_events():
+    # GameOver moved OUT of this list (fix/network-gameover-and-king-
+    # interception): it now gets a real wire message of its own (see
+    # test_game_over_round_trips_for_white_winner/_black_winner above) -
+    # MoveRejected/MoveRequested/PromotionEvent remain the genuinely
+    # un-wire-formatted events this module still returns None for.
     assert format_game_event(MoveRejected(reason="illegal_piece_move")) is None
-    assert format_game_event(GameOver(winner_color=Color.WHITE)) is None
     assert format_game_event(object()) is None
 
 
@@ -116,6 +138,9 @@ def test_format_game_event_returns_none_for_non_motion_events():
         "EVT:INTERCEPTED:not_an_int:e2:2",  # non-integer piece_id
         "EVT:INTERCEPTED:1:zz:2",  # invalid algebraic square
         "EVT:INTERCEPTED:1:e2:not_an_int",  # non-integer defender_piece_id
+        "EVT:GAMEOVER",  # missing winner_color field
+        "EVT:GAMEOVER:W:extra",  # too many fields
+        "EVT:GAMEOVER:X",  # unrecognized color letter
     ],
 )
 def test_parse_game_event_raises_for_malformed_or_unrecognized_text(bad_text):

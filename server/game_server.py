@@ -176,11 +176,28 @@ adds richer, structured per-motion data for a client that wants to
 animate smoothly (kungfu_chess/client/loop/network_game_loop_runner.py),
 without removing the guarantee a simpler/older client can still just
 parse the board text alone and ignore the new message entirely. WHY
-MoveRejected/GameOver GET NO WIRE-FORMAT MESSAGE:
-format_game_event returns None for both (neither is an animatable
-motion - see that module's own docstring) - `_broadcast_event` treats
-that None as "nothing extra to send", so these two event types'
-broadcasts stay byte-for-byte identical to before this stage.
+MoveRejected GETS NO WIRE-FORMAT MESSAGE: format_game_event returns
+None for it (not an animatable motion - see that module's own
+docstring) - `_broadcast_event` treats that None as "nothing extra to
+send", so its broadcast stays byte-for-byte identical to before this
+stage.
+
+GameOver ADDITION (fix/network-gameover-and-king-interception): GameOver
+was ALREADY in `_BROADCAST_EVENT_TYPES` below (added when GameOver
+itself was first introduced) and `_on_game_event`/`_broadcast_event`
+were therefore already firing for it - but format_game_event used to
+return None for GameOver too (same reasoning as MoveRejected above),
+so nothing beyond the existing board-text broadcast was ever actually
+sent, and no connected client had any way to detect the game had
+ended. Once format_game_event started returning a real "EVT:GAMEOVER:"
+message for it (kungfu_chess/notation/game_event_wire_format.py's own
+docstring), this class needed ZERO code changes to start sending it -
+the exact same `wire_text = format_game_event(event); if wire_text is
+not None: await self._broadcast(wire_text)` line below now simply stops
+producing None for this one event type. This is the intended, minimal
+shape of that module's own None-return contract: a caller here never
+needs to special-case which event types currently have wire support -
+it only ever needs to ask format_game_event, once.
 
 SCORE / MOVE-LOG / TIMER BROADCAST (later stage - server-score-
 moveslog-timer-broadcast): `_broadcast_event` now sends ONE MORE
@@ -542,11 +559,16 @@ class GameServer:
 
         Reuses `_broadcast` for EVERY send (no duplicated connection-
         iteration logic, per this stage's own DRY requirement) - a
-        MoveRejected/GameOver produces no wire-format message
-        (format_game_event returns None for both - neither is an
-        animatable motion), so only the pre-existing board-text
-        broadcast happens for those, byte-for-byte unchanged from
-        before this stage. Every send happens from within this SAME
+        MoveRejected produces no wire-format message (format_game_event
+        returns None for it - not an animatable motion), so only the
+        pre-existing board-text broadcast happens for that one event
+        type, byte-for-byte unchanged from before this stage. GameOver
+        DOES now produce a real wire-format message too (fix/network-
+        gameover-and-king-interception - see module docstring's
+        "GameOver ADDITION" section), so it follows the same wire-text-
+        then-board-text order as MoveAccepted/JumpAccepted/PieceArrived/
+        AttackerIntercepted/JumpLanded below, not MoveRejected's board-
+        text-only path. Every send happens from within this SAME
         coroutine, in this fixed order, so a client's own message
         stream always sees this event's own wire message, then its own
         resulting board state, then (for MoveAccepted/JumpAccepted/

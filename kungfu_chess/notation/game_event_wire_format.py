@@ -1,11 +1,30 @@
 """game_event_wire_format.py: bidirectional conversion between real
 client-layer events (kungfu_chess.client.events.game_events -
 MoveAccepted, JumpAccepted, PieceArrived, JumpLanded,
-AttackerIntercepted) and a simple, single-line, human-readable wire
-text format - Stage B7 of the server track, extended in later stages
-(jump-network-wiring-and-cooldown-display for JumpLanded; fix/
-interception-event-and-network-removal for AttackerIntercepted) to
-cover the two events added after Stage B7.
+AttackerIntercepted, GameOver) and a simple, single-line, human-readable
+wire text format - Stage B7 of the server track, extended in later
+stages (jump-network-wiring-and-cooldown-display for JumpLanded; fix/
+interception-event-and-network-removal for AttackerIntercepted; fix/
+network-gameover-and-king-interception for GameOver) to cover the
+events added after Stage B7.
+
+GameOver ADDITION: a real, published event marking the moment the game
+actually ends (an ordinary arrival-based king capture, or one via
+jump.py interception - see kungfu_chess/extra/extra_engine.py's own
+docstring for the latter). Previously listed among the events this
+module deliberately returns None for (no wire representation at all) -
+that was the root cause of network play never actually ending for a
+connected client (see server/game_server.py's own docstring: GameOver
+was already in _BROADCAST_EVENT_TYPES, but format_game_event returning
+None meant _broadcast_event's `if wire_text is not None` guard silently
+dropped it every time). New tag "GAMEOVER", new field count
+(_GAMEOVER_FIELD_COUNT = 3: EVT, tag, winner_color) - GameOver's only
+field is winner_color, a Color, encoded as a single letter
+(event.winner_color.name[0], 'W'/'B') exactly like
+move_command_format.py's own color-letter convention
+(color_letter = color.name[0]), and decoded via Color(fields[2].lower())
+the same way that module's own inverse does - reused convention, not a
+new one invented for this event.
 
 AttackerIntercepted ADDITION: a real, published event marking the
 exact moment a jump successfully intercepts (destroys) an attacker -
@@ -89,11 +108,13 @@ from typing import Optional
 
 from kungfu_chess.client.events.game_events import (
     AttackerIntercepted,
+    GameOver,
     JumpAccepted,
     JumpLanded,
     MoveAccepted,
     PieceArrived,
 )
+from kungfu_chess.model.color import Color
 from kungfu_chess.notation.algebraic_notation import algebraic_to_position, position_to_algebraic
 
 EVENT_MESSAGE_PREFIX = "EVT:"
@@ -104,6 +125,7 @@ _JUMP_TAG = "JUMP"
 _ARRIVED_TAG = "ARRIVED"
 _LANDED_TAG = "LANDED"
 _INTERCEPTED_TAG = "INTERCEPTED"
+_GAMEOVER_TAG = "GAMEOVER"
 _NONE_TOKEN = "none"
 _FIELD_SEP = ":"
 
@@ -117,6 +139,7 @@ _MOVE_LIKE_FIELD_COUNT = 6  # EVT, tag, piece_id, from, to, duration_ms
 _ARRIVED_FIELD_COUNT = 5  # EVT, tag, piece_id, cell, captured_piece_id
 _LANDED_FIELD_COUNT = 4  # EVT, tag, piece_id, cell
 _INTERCEPTED_FIELD_COUNT = 5  # EVT, tag, piece_id, cell, defender_piece_id
+_GAMEOVER_FIELD_COUNT = 3  # EVT, tag, winner_color
 
 
 class GameEventWireFormatError(ValueError):
@@ -142,11 +165,11 @@ def format_game_event(event: object) -> Optional[str]:
 
     Returns:
         The wire text, or None if `event` is not a MoveAccepted,
-        JumpAccepted, PieceArrived, JumpLanded, or AttackerIntercepted
-        (e.g. MoveRejected/GameOver/PromotionEvent/MoveRequested - none
-        of these are animatable motions, so callers like
-        server/game_server.py's own broadcaster use this None to know
-        not to send anything extra for them).
+        JumpAccepted, PieceArrived, JumpLanded, AttackerIntercepted, or
+        GameOver (e.g. MoveRejected/PromotionEvent/MoveRequested - none
+        of these are animatable motions or a real end-of-game signal,
+        so callers like server/game_server.py's own broadcaster use
+        this None to know not to send anything extra for them).
 
     Raises:
         InvalidPositionError: Propagated from position_to_algebraic if
@@ -189,6 +212,9 @@ def format_game_event(event: object) -> Optional[str]:
             ]
         )
 
+    if isinstance(event, GameOver):
+        return _FIELD_SEP.join([_MESSAGE_MARKER, _GAMEOVER_TAG, event.winner_color.name[0]])
+
     return None
 
 
@@ -205,16 +231,17 @@ def parse_game_event(text: str) -> object:
             ever calling this function; guarded here too regardless.
 
     Returns:
-        A real MoveAccepted, JumpAccepted, PieceArrived, JumpLanded, or
-        AttackerIntercepted instance, equal in every field to whatever
-        format_game_event was originally given.
+        A real MoveAccepted, JumpAccepted, PieceArrived, JumpLanded,
+        AttackerIntercepted, or GameOver instance, equal in every field
+        to whatever format_game_event was originally given.
 
     Raises:
         MalformedGameEventWireFormatError: If `text` doesn't start
             with EVENT_MESSAGE_PREFIX, has the wrong number of fields
-            for its own tag, names an unrecognized tag, or has a
-            non-integer piece_id/duration_ms/captured_piece_id or an
-            invalid algebraic square.
+            for its own tag, names an unrecognized tag, has a
+            non-integer piece_id/duration_ms/captured_piece_id, an
+            invalid algebraic square, or an unrecognized winner_color
+            letter.
     """
 
     fields = text.split(_FIELD_SEP)
@@ -265,6 +292,14 @@ def parse_game_event(text: str) -> object:
             cell = algebraic_to_position(fields[3])
             defender_piece_id = int(fields[4])
             return AttackerIntercepted(piece_id=piece_id, cell=cell, defender_piece_id=defender_piece_id)
+
+        if tag == _GAMEOVER_TAG:
+            if len(fields) != _GAMEOVER_FIELD_COUNT:
+                raise MalformedGameEventWireFormatError(
+                    f"expected {_GAMEOVER_FIELD_COUNT} fields for {tag}, got {len(fields)}: {text!r}"
+                )
+            winner_color = Color(fields[2].lower())
+            return GameOver(winner_color=winner_color)
     except MalformedGameEventWireFormatError:
         raise
     except ValueError as exc:
