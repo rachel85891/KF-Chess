@@ -347,6 +347,66 @@ drive the whole render pipeline (cv2/Img/ImgSurface) at all - the same
 "separate the logic from the loop/window shell around it" principle
 this codebase already applies everywhere else (e.g. GameLoopRunner's
 own _run_one_frame extracted from run() for the identical reason).
+
+JUMP OVER THE NETWORK (later stage - jump-network-wiring-and-cooldown-
+display): right-click was already routed through MouseAdapter's own
+on_jump_requested callback slot (Stage 11a, local play) - this class
+simply never PASSED that callback at all until now (re-verified
+directly via grep before writing this: `MouseAdapter(mapper,
+self.click_controller)`, no third argument). The fix mirrors
+GameLoopRunner's own local wiring exactly: __init__ now passes
+`on_jump_requested=self._request_jump`, and `_request_jump` is a tiny
+named method (not a lambda, for the identical debuggability reason
+GameLoopRunner's own _request_jump already gives) that forwards to
+`self.click_controller.request_jump(cell)` - NetworkClickController's
+own new method (kungfu_chess/client/network/network_click_controller.py),
+which applies the same ownership check click() already does for moves
+(only this client's own assigned_color may ever be requested to jump)
+and sends a real jump command via NetworkGameClient.send_jump - the
+network-mode counterpart of a local ExtraEngine.request_jump call, per
+this whole class's own "the server is the sole source of truth"
+design.
+
+COOLDOWN DISPLAY OVER THE NETWORK (same later stage): this class had no
+CooldownTracker/CooldownOverlayRenderer at all before this stage - B7/
+B7.5 only wired sprite-state animation and pixel sliding, not cooldown.
+The fix constructs a real CooldownTracker in __init__ (self.
+cooldown_tracker) and a fresh CooldownOverlayRenderer per frame in
+_run_one_frame, mirroring GameLoopRunner's own exact composition and
+render order (board+pieces drawn first, THEN cooldown bars, onto the
+SAME board sub-canvas, before it is pasted onto main_canvas) - not a
+new rendering concept, purely reused as-is per this stage's own DRY
+requirement.
+
+The one genuine design question this raised: CooldownTracker's own
+contract (kungfu_chess/client/events/cooldown_tracker.py) requires a
+`current_clock_ms` value at both event-recording time
+(set_current_clock_ms) and query time (remaining_ratio's own
+parameter) - GameLoopRunner supplies this from its one shared
+GameEngine.state.clock_ms, but this class has no local engine and no
+shared clock with the server at all (the same premise Stage B7.5
+already established for pixel sliding - see that section above). THE
+ANSWER: reuse the exact same `self._clock` Stage B7.5 already
+introduced (real time.perf_counter() by default, fake-clock-injectable
+for tests) rather than inventing a second clock abstraction -
+`_clock_ms()` (a tiny new private helper) just converts that same
+float-seconds value to the integer milliseconds CooldownTracker's own
+constants (COOLDOWN_MS/JUMP_COOLDOWN_MS) are expressed in. No server
+clock synchronization is attempted or needed here either, for the
+identical reason Stage B7.5 gives: a cooldown bar only needs to know
+"how much of MY OWN duration has elapsed since I started", measured
+entirely on this client's own clock from the moment it received the
+real PieceArrived/JumpLanded that started it - visually correct
+regardless of network latency, just like a pixel slide's own progress
+fraction already is.
+
+set_current_clock_ms is called immediately before on_event in BOTH
+_handle_piece_arrived (now also feeding cooldown_tracker, alongside its
+pre-existing piece_animator_registry forwarding) and the new
+_handle_jump_landed - mirroring GameLoopRunner's own "told BEFORE
+wait()/on_event runs" ordering exactly, just triggered by a real
+received wire event instead of a local wait() call about to advance a
+shared clock.
 """
 
 from __future__ import annotations
@@ -359,7 +419,8 @@ from typing import Callable, Dict, Optional, Union
 import cv2
 
 from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
-from kungfu_chess.client.events.game_events import JumpAccepted, MoveAccepted, PieceArrived
+from kungfu_chess.client.events.cooldown_tracker import CooldownTracker
+from kungfu_chess.client.events.game_events import JumpAccepted, JumpLanded, MoveAccepted, PieceArrived
 from kungfu_chess.client.events.observers import MovesLogSnapshot, ScoreSnapshot
 from kungfu_chess.client.input.mouse_adapter import MouseAdapter
 from kungfu_chess.client.input.screen_mapper import ScreenToImageMapper
@@ -370,6 +431,7 @@ from kungfu_chess.client.surface.asset_cache import AssetCache
 from kungfu_chess.client.surface.img import Img
 from kungfu_chess.client.surface.img_surface import ImgSurface
 from kungfu_chess.client.ui.coordinate_label_renderer import LABEL_MARGIN, CoordinateLabelRenderer
+from kungfu_chess.client.ui.cooldown_overlay_renderer import CooldownOverlayRenderer
 from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH, SidePanelRenderer
 from kungfu_chess.io.board_parser import BoardParser
 from kungfu_chess.model.board import Board
@@ -517,6 +579,14 @@ class NetworkGameLoopRunner:
         # piece_animator_registry/_server_piece_cache already use.
         self._active_motions: Dict[int, _ClientMotion] = {}
 
+        # See module docstring's "COOLDOWN DISPLAY OVER THE NETWORK"
+        # section - a real CooldownTracker, fed real, translated
+        # PieceArrived/JumpLanded events exactly like local play's
+        # GameLoopRunner does, just using this class's own client-local
+        # clock (self._clock_ms(), below) instead of a shared engine
+        # clock, since no such shared clock exists in network mode.
+        self.cooldown_tracker = CooldownTracker()
+
         self.asset_cache = AssetCache()
 
         # See module docstring's SCOPE DECISION 6 - computed once, from
@@ -534,11 +604,26 @@ class NetworkGameLoopRunner:
         mapper = ScreenToImageMapper(window_origin=(self._board_origin_x, self._board_origin_y), window_scale=1.0)
         # NetworkClickController duck-types Controller's `click(x, y)`
         # method - see module docstring's "REUSING MouseAdapter" note.
-        self.mouse_adapter = MouseAdapter(mapper, self.click_controller)
+        # on_jump_requested=self._request_jump wires right-click the
+        # same way GameLoopRunner's own identically-named method does
+        # locally (see module docstring's "JUMP OVER THE NETWORK"
+        # section) - previously never passed at all in network mode.
+        self.mouse_adapter = MouseAdapter(mapper, self.click_controller, on_jump_requested=self._request_jump)
         if not headless:
             self.mouse_adapter.attach(window_name)
             if _DEBUG_CLICKS:
                 self._attach_debug_mouse_callback(window_name)
+
+    def _request_jump(self, cell: Position) -> None:
+        """MouseAdapter's on_jump_requested callback - mirrors
+        GameLoopRunner's own identically-named method exactly (see
+        that class's own docstring), just calling through to
+        NetworkClickController.request_jump (this class's own network-
+        mode counterpart of a local GameEventPublisher.request_jump
+        call) instead of a local engine call - see module docstring's
+        "JUMP OVER THE NETWORK" section."""
+
+        self.click_controller.request_jump(cell)
 
     def _attach_debug_mouse_callback(self, window_name: str) -> None:
         """TEMPORARY debug instrumentation (KF_CHESS_DEBUG_CLICKS) -
@@ -713,6 +798,29 @@ class NetworkGameLoopRunner:
             self._handle_move_or_jump_accepted(event)
         elif isinstance(event, PieceArrived):
             self._handle_piece_arrived(event)
+        elif isinstance(event, JumpLanded):
+            self._handle_jump_landed(event)
+
+    def _clock_ms(self) -> int:
+        """Convert self._clock()'s own float (seconds - Stage B7.5's
+        convention, see _ClientMotion.started_at) into the millisecond
+        integer CooldownTracker's own set_current_clock_ms/
+        remaining_ratio contract expects (kungfu_chess/client/events/
+        cooldown_tracker.py's own COOLDOWN_MS/JUMP_COOLDOWN_MS
+        constants are both expressed in ms).
+
+        Returns:
+            A purely LOCAL, client-side clock value in milliseconds -
+            no server clock synchronization is attempted, exactly the
+            same reasoning Stage B7.5 already applies to pixel-sliding
+            motions (see module docstring's "STAGE B7.5" section),
+            applied here to cooldown durations instead: a cooldown bar
+            only needs to know "how much of my own duration has elapsed
+            since I started", which this client can measure entirely on
+            its own.
+        """
+
+        return int(self._clock() * 1000)
 
     def _handle_move_or_jump_accepted(self, event: Union[MoveAccepted, JumpAccepted]) -> None:
         """Translate a real MoveAccepted/JumpAccepted's server piece_id,
@@ -811,6 +919,65 @@ class NetworkGameLoopRunner:
         )
         if self.piece_animator_registry is not None:
             self.piece_animator_registry.on_event(translated)
+
+        # See module docstring's "COOLDOWN DISPLAY OVER THE NETWORK"
+        # section - set_current_clock_ms must be called before on_event
+        # for the identical reason GameLoopRunner's own local wiring
+        # calls it before publisher.wait(): CooldownTracker records
+        # whatever clock value was most recently supplied, so it must
+        # already reflect "now" by the time on_event actually fires.
+        self.cooldown_tracker.set_current_clock_ms(self._clock_ms())
+        self.cooldown_tracker.on_event(translated)
+
+    def _handle_jump_landed(self, event: JumpLanded) -> None:
+        """Translate a real JumpLanded's server piece_id, forward a
+        reconstructed, client-local copy to piece_animator_registry.
+        on_event (closes this stage's own Part E PieceAnimator gap -
+        see that class's own module docstring for the parallel-to-
+        PieceArrived reasoning) and to cooldown_tracker.on_event
+        (starts a real cooldown bar for this landing, using
+        JUMP_COOLDOWN_MS - the exact same mechanism local play's
+        CooldownTracker already uses for PieceArrived, see module
+        docstring's "COOLDOWN DISPLAY OVER THE NETWORK" section).
+
+        Args:
+            event: The real, wire-parsed JumpLanded.
+
+        Returns:
+            None.
+
+        Unlike _handle_piece_arrived, this method never mutates
+        self.board: a JUMP landing never moves the piece at all
+        (extra/jump.py's own JumpTracker - a piece is airborne AT ITS
+        OWN CELL the whole time, re-verified directly) - event.cell is
+        always that same, unchanged cell, so there is nothing to
+        move/remove-then-move on the board.
+
+        A translation failure (see _translate_piece - the same narrow,
+        accepted "joined mid-motion" gap PROBLEM 1 documents) is a
+        safe, silent no-op, mirroring _handle_piece_arrived's identical
+        policy - neither piece_animator_registry nor cooldown_tracker
+        is touched for an untranslatable landing.
+        """
+
+        piece = self._translate_piece(event.piece_id, from_cell=None)
+        if piece is None:
+            return
+
+        # A landed jump is no longer "in flight" for rendering purposes
+        # either - mirrors _handle_piece_arrived's own identical
+        # cleanup (a jump's own JumpAccepted DOES populate
+        # _active_motions, from_cell == to_cell == its own cell, same
+        # as _handle_move_or_jump_accepted already does uniformly for
+        # both MoveAccepted and JumpAccepted).
+        self._active_motions.pop(piece.id, None)
+
+        translated = JumpLanded(piece_id=piece.id, cell=event.cell)
+        if self.piece_animator_registry is not None:
+            self.piece_animator_registry.on_event(translated)
+
+        self.cooldown_tracker.set_current_clock_ms(self._clock_ms())
+        self.cooldown_tracker.on_event(translated)
 
     def poll_and_process(self) -> None:
         """Drain every new broadcast since the last call and apply each
@@ -939,6 +1106,11 @@ class NetworkGameLoopRunner:
                 active_motions=self._compute_motions_for_rendering(),
             )
             Renderer(surface).render(snapshot)
+            # See module docstring's "COOLDOWN DISPLAY OVER THE
+            # NETWORK" section - mirrors GameLoopRunner's own exact
+            # render order (board+pieces, THEN cooldown bars, onto the
+            # same board sub-canvas, before it is pasted).
+            CooldownOverlayRenderer(board_canvas).render(self.board, self.cooldown_tracker, self._clock_ms())
         else:
             # No board known yet at all (SCOPE DECISION 4) - draw an
             # empty grid using the same assumed board size the canvas
