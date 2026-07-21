@@ -128,6 +128,51 @@ either event, for the identical reason). PieceAnimatorRegistry again
 needed zero changes for this second fix, for the identical
 type-agnostic-routing reason already documented above.
 
+PART B DECISION - AttackerIntercepted GETS NO REACTION HERE, DELIBERATELY
+(fix/interception-event-and-network-removal): investigated how this
+class/PieceAnimatorRegistry already treat a piece CAPTURED via an
+ordinary move (the piece PieceArrived.captured_piece_id names) before
+deciding, rather than inventing a third convention for "a piece is
+gone" - re-verified directly: PieceAnimatorRegistry.on_event routes
+purely by `event.piece_id` (that file's own docstring, "OCP" section);
+a PieceArrived's own `.piece_id` names the ARRIVING piece, never the
+captured one (the captured piece's id only ever appears in the
+secondary `captured_piece_id` field) - so a captured piece's own
+PieceAnimator receives NO event at all when it's captured, not even an
+ignored one. Its removal from the SCREEN is achieved entirely by Board-
+level removal (RealTimeArbiter.advance_time's `board.remove_piece(...)`
+call, before PieceArrived is even published): the renderer only ever
+enumerates pieces still present on the Board (kungfu_chess/view/
+renderer.py's build_snapshot/build_snapshot_from_board), so an orphaned
+PieceAnimator - left in whatever state it last had, forever, per
+PieceAnimatorRegistry's own "captured pieces' PieceAnimators are kept,
+never removed" docstring section - is simply never queried for a
+sprite again, regardless of its own internal state.
+
+AttackerIntercepted's OWN shape is structurally different from
+PieceArrived in exactly the relevant way: its `.piece_id` field IS the
+destroyed attacker's own id (deliberately, per that event's own
+docstring - there is no "arriving piece" for an interception at all).
+This means PieceAnimatorRegistry's existing, unmodified, type-agnostic
+routing WILL still forward this event straight to the attacker's own
+PieceAnimator.on_event (unlike an ordinary capture, where routing never
+even reaches the captured piece's animator) - a real, unavoidable
+consequence of AttackerIntercepted needing the attacker's own id as its
+primary field, not a choice made here. Given that, the closest faithful
+mirror of "a captured piece's animator gets no special treatment" is: on_event
+adds NO isinstance branch for AttackerIntercepted at all - the event
+reaches this method (unlike an ordinary capture) but produces no
+transition, exactly like GameOver/MoveRejected/MoveRequested already
+silently fall through today. The net visible effect is identical
+either way: the piece disappears purely because NetworkGameLoopRunner/
+the local engine remove it from the Board (see
+kungfu_chess/client/loop/network_game_loop_runner.py's own
+_handle_attacker_intercepted), never because any AnimationState
+transition was forced - forcing IDLE here would be actively wrong (the
+task's own reasoning): the piece isn't idle, it's gone, and an
+orphaned-but-still-queried animator showing IDLE would misleadingly
+imply the piece is still present and merely standing still.
+
 Fields (per spec.md §5's convention of stating fields for every
 class):
 - piece_id: int - identifies which Piece this animator tracks;
@@ -311,7 +356,10 @@ class PieceAnimator:
                 (kungfu_chess/client/events/game_events.py). Events
                 for a different piece_id, and event types this
                 animator has no reaction to (GameOver, MoveRejected,
-                MoveRequested, or any future type), are silently
+                MoveRequested, AttackerIntercepted - see module
+                docstring's own "PART B DECISION" section for why the
+                last one is a deliberate, investigated no-op rather
+                than an oversight - or any future type), are silently
                 no-ops - not an error, just normal operation for an
                 Observer that only cares about a subset of events
                 (ISP, client_spec.md §6).
