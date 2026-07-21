@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from kungfu_chess.client.events.game_events import (
+    AttackerIntercepted,
     GameOver,
     JumpAccepted,
     JumpLanded,
@@ -73,6 +74,15 @@ def test_jump_landed_round_trips():
     assert reconstructed == event
 
 
+def test_attacker_intercepted_round_trips():
+    event = AttackerIntercepted(piece_id=8, cell=Position(row=0, col=0), defender_piece_id=2)
+
+    text = format_game_event(event)
+    reconstructed = parse_game_event(text)
+
+    assert reconstructed == event
+
+
 def test_wire_text_is_a_single_line_starting_with_the_distinct_prefix():
     text = format_game_event(MoveAccepted(piece_id=1, from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=1), duration_ms=1000))
 
@@ -101,6 +111,11 @@ def test_format_game_event_returns_none_for_non_motion_events():
         "EVT:LANDED:1:e2:extra",  # too many fields
         "EVT:LANDED:not_an_int:e2",  # non-integer piece_id
         "EVT:LANDED:1:zz",  # invalid algebraic square
+        "EVT:INTERCEPTED:1:e2",  # missing defender_piece_id field
+        "EVT:INTERCEPTED:1:e2:2:extra",  # too many fields
+        "EVT:INTERCEPTED:not_an_int:e2:2",  # non-integer piece_id
+        "EVT:INTERCEPTED:1:zz:2",  # invalid algebraic square
+        "EVT:INTERCEPTED:1:e2:not_an_int",  # non-integer defender_piece_id
     ],
 )
 def test_parse_game_event_raises_for_malformed_or_unrecognized_text(bad_text):
