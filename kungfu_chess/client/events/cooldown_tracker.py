@@ -1,22 +1,29 @@
-"""CooldownTracker: per-piece move-arrival cooldown timer, per
-client_spec.md §2's "Cooldown after a move" extension. Design patterns:
-Observer (implements Stage 3's single-method Observer protocol itself)
-+ Registry (a piece_id -> cooldown-start lookup, the same
+"""CooldownTracker: per-piece cooldown timer, per client_spec.md §2's
+"Cooldown after a move" extension. Design patterns: Observer
+(implements Stage 3's single-method Observer protocol itself) +
+Registry (a piece_id -> cooldown-start/duration lookup, the same
 pattern-vocabulary convention as PieceAnimatorRegistry, Stage 10a).
 
-SCOPE - ordinary move cooldown ONLY, not JUMP's: kungfu_chess/realtime/
-real_time_arbiter.py's COOLDOWN_MS (the fixed cooldown GameEngine
-already applies to every genuine arrival, re-imported here rather than
-re-hardcoded) is set the moment a PieceArrived fires - a real, already-
-published, client-visible event this tracker can react to. JUMP's own
-post-landing cooldown (JUMP_COOLDOWN_MS,
-kungfu_chess/extra/jump.py) has NO corresponding published event
-marking when it starts - JumpTracker resolves landings entirely
-internally to ExtraEngine.wait, with no client-visible signal (see
-client_spec.md §10's own bullet documenting this exact gap). This
-class therefore only ever tracks what PieceArrived tells it about -
-extending it to JUMP cooldowns is explicitly out of this stage's scope
-until a future stage adds a real event for jump landings to react to.
+SCOPE - BOTH ordinary move cooldown AND JUMP's post-landing cooldown:
+kungfu_chess/realtime/real_time_arbiter.py's COOLDOWN_MS (the fixed
+cooldown GameEngine already applies to every genuine arrival,
+re-imported here rather than re-hardcoded) is recorded the moment a
+PieceArrived fires; kungfu_chess/extra/jump.py's JUMP_COOLDOWN_MS
+(also re-imported, never re-hardcoded) is recorded the moment a
+JumpLanded fires - a real, published event for the exact moment a
+jump's cooldown starts (closing client_spec.md §10's previously
+documented gap: JumpTracker used to resolve landings entirely
+internally to ExtraEngine.wait, with no client-visible signal at all;
+see kungfu_chess/extra/jump.py's own docstring and
+kungfu_chess/client/events/game_events.py's JumpLanded docstring for
+the full reasoning behind that event's shape and why it is a distinct
+type rather than a reused PieceArrived). Because the two kinds of
+cooldown have different durations, this class now records not just
+WHEN a piece's cooldown started but WHICH duration applies to it
+(`_cooldown_duration_ms`, alongside the existing `_cooldown_start_ms`)
+- remaining_ratio reads the duration back per piece_id rather than
+assuming COOLDOWN_MS for every cooldown, which is what would happen if
+this were left a single fixed module-level divisor.
 
 WHY this class needs to be TOLD the current clock_ms, both at
 recording time and at query time, rather than reading a GameEngine
@@ -63,18 +70,21 @@ from __future__ import annotations
 
 from typing import Dict
 
-from kungfu_chess.client.events.game_events import PieceArrived
+from kungfu_chess.client.events.game_events import JumpLanded, PieceArrived
+from kungfu_chess.extra.jump import JUMP_COOLDOWN_MS
 from kungfu_chess.realtime.real_time_arbiter import COOLDOWN_MS
 
 
 class CooldownTracker:
     def __init__(self) -> None:
-        """Holds no engine/board reference (DIP) - only a
-        piece_id -> cooldown-start-clock_ms map it builds up entirely
-        from PieceArrived events and set_current_clock_ms() calls."""
+        """Holds no engine/board reference (DIP) - only piece_id ->
+        cooldown-start-clock_ms and piece_id -> cooldown-duration maps
+        it builds up entirely from PieceArrived/JumpLanded events and
+        set_current_clock_ms() calls."""
 
         self._current_clock_ms: int = 0
         self._cooldown_start_ms: Dict[int, int] = {}
+        self._cooldown_duration_ms: Dict[int, int] = {}
 
     def set_current_clock_ms(self, current_clock_ms: int) -> None:
         """Tell this tracker what the current logical clock is - see
@@ -94,12 +104,14 @@ class CooldownTracker:
         self._current_clock_ms = current_clock_ms
 
     def on_event(self, event: object) -> None:
-        """On a real PieceArrived, record that piece's cooldown as
-        starting at whatever clock_ms was most recently supplied via
-        set_current_clock_ms() - matching the "match on the one
-        relevant type, ignore the rest" OCP pattern every other
-        Observer in this codebase already follows: a future 6th event
-        type needs no change here.
+        """On a real PieceArrived or JumpLanded, record that piece's
+        cooldown as starting at whatever clock_ms was most recently
+        supplied via set_current_clock_ms(), using the duration that
+        matches the event's own kind (COOLDOWN_MS for an ordinary
+        arrival, JUMP_COOLDOWN_MS for a jump landing) - matching the
+        "match on the relevant types, ignore the rest" OCP pattern
+        every other Observer in this codebase already follows: a
+        future 7th event type needs no change here.
 
         Args:
             event: Any published client-layer event.
@@ -109,11 +121,22 @@ class CooldownTracker:
         """
 
         if isinstance(event, PieceArrived):
-            self._cooldown_start_ms[event.piece_id] = self._current_clock_ms
+            self._start_cooldown(event.piece_id, COOLDOWN_MS)
+        elif isinstance(event, JumpLanded):
+            self._start_cooldown(event.piece_id, JUMP_COOLDOWN_MS)
+
+    def _start_cooldown(self, piece_id: int, duration_ms: int) -> None:
+        """Shared recording step for either cooldown kind - keeps
+        on_event a plain type dispatch, not a place where the actual
+        bookkeeping (two dicts, kept in sync) is duplicated per event
+        type."""
+
+        self._cooldown_start_ms[piece_id] = self._current_clock_ms
+        self._cooldown_duration_ms[piece_id] = duration_ms
 
     def remaining_ratio(self, piece_id: int, current_clock_ms: int) -> float:
-        """How much of piece_id's ordinary-move cooldown is still
-        remaining, as a fraction.
+        """How much of piece_id's currently recorded cooldown - move or
+        jump, whichever started it - is still remaining, as a fraction.
 
         Args:
             piece_id: The piece to query.
@@ -122,23 +145,25 @@ class CooldownTracker:
                 - this class never reads a clock on its own).
 
         Returns:
-            1.0 immediately after the piece's cooldown-starting arrival,
-            linearly decreasing to 0.0 once COOLDOWN_MS has fully
-            elapsed. Also 0.0 - not an error, the normal, common case
-            for most pieces most of the time - if this tracker has no
-            recorded arrival for piece_id at all, or if
-            current_clock_ms indicates the cooldown has already fully
-            elapsed.
+            1.0 immediately after the piece's cooldown-starting event,
+            linearly decreasing to 0.0 once that cooldown's own
+            duration (COOLDOWN_MS or JUMP_COOLDOWN_MS, whichever
+            started it) has fully elapsed. Also 0.0 - not an error, the
+            normal, common case for most pieces most of the time - if
+            this tracker has no recorded cooldown for piece_id at all,
+            or if current_clock_ms indicates the cooldown has already
+            fully elapsed.
         """
 
         start_ms = self._cooldown_start_ms.get(piece_id)
         if start_ms is None:
             return 0.0
 
+        duration_ms = self._cooldown_duration_ms[piece_id]
         elapsed_ms = current_clock_ms - start_ms
         if elapsed_ms <= 0:
             return 1.0
-        if elapsed_ms >= COOLDOWN_MS:
+        if elapsed_ms >= duration_ms:
             return 0.0
 
-        return 1.0 - (elapsed_ms / COOLDOWN_MS)
+        return 1.0 - (elapsed_ms / duration_ms)
