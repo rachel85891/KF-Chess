@@ -44,13 +44,19 @@ playable without it (a player very quickly learns which pieces are
 theirs) - deferred to a future polish stage, not fixed here.
 
 `board` is a plain, publicly settable attribute (not constructor-
-injected once) rather than a live engine reference, because it
-genuinely changes identity every time a new broadcast is parsed
-(NetworkGameLoopRunner replaces it wholesale, the same way it replaces
-`self.board` itself) - there is no single long-lived Board object to
-hold a stable reference to in network mode, unlike Controller's
-`self.game_engine.board`, which never changes identity for the
-lifetime of one local game.
+injected once) rather than a live engine reference, because this
+class has no engine of its own to read a `.board` property from -
+NetworkGameLoopRunner assigns it directly instead. As of Stage B7
+(kungfu_chess/client/loop/network_game_loop_runner.py's own "STAGE B7"
+docstring section), NetworkGameLoopRunner assigns this attribute only
+ONCE per connection - the first board this client ever receives -
+and mutates that SAME Board object in place from then on (to preserve
+piece identity for its own PieceAnimatorRegistry), rather than
+replacing it wholesale on every later broadcast the way it used to
+before Stage B7. This class's own `click()` method is unaffected
+either way: it only ever reads `self.board.piece_at(...)` fresh at
+call time, which reflects the current state correctly whether the
+object was replaced or mutated in place.
 """
 
 from __future__ import annotations

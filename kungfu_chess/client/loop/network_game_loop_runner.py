@@ -75,20 +75,37 @@ inheritance), not a hack.
 
 SCOPE DECISIONS (Stage B6, explicit and accepted - do not
 relitigate; each is documented again at its own point of use below):
-1. NO SMOOTH ANIMATION: the server's existing broadcast (Stage B3)
-   sends a full board-as-text snapshot at two points per move
-   (MoveAccepted = pre-move, PieceArrived = post-move), not the rich,
-   continuous animation-frame event stream PieceAnimatorRegistry
-   expects locally. Each new broadcast is parsed into a real Board
-   (BoardParser) and pieces are redrawn STATICALLY at their new
-   positions - no interpolation, no animation frames (ImgSurface is
-   constructed with NO PieceAnimatorRegistry at all, using its
-   already-existing, already-tested "no-registry static-idle
-   fallback" path - see ImgSurface's own module docstring), no
-   cooldown overlay (no CooldownTracker exists in network mode either -
-   CooldownOverlayRenderer is simply never called). Smooth
-   cross-network animation is explicitly OUT OF SCOPE for this stage
-   and left to a separate future stage.
+1. SPRITE ANIMATION, BUT NOT PIXEL-POSITION INTERPOLATION (Stage B6's
+   original "NO SMOOTH ANIMATION" gap, PARTIALLY closed by Stage B7 -
+   see "STAGE B7 - REAL EVENT-DRIVEN ANIMATION" below for the full
+   reasoning on exactly what changed and, just as importantly, what
+   deliberately did NOT): a real PieceAnimatorRegistry now runs in
+   network mode, reacting to real, translated MoveAccepted/JumpAccepted/
+   PieceArrived events - a piece's SPRITE now genuinely transitions
+   idle -> move/jump -> idle, the same live per-frame walk-cycle
+   GameLoopRunner's own local play already shows. What this stage does
+   NOT add: PIXEL-position interpolation (a piece visibly sliding,
+   pixel-by-pixel, between two cells while its motion is in flight) -
+   that is build_snapshot's own SEPARATE mechanism (kungfu_chess/view/
+   renderer.py), driven by a local GameEngine's RealTimeArbiter.
+   active_motions()/engine.state.clock_ms, neither of which this class
+   has or is permitted to add this stage (see "Do NOT modify
+   PieceAnimatorRegistry, PieceAnimator, GameLoopRunner, or Controller"
+   in this stage's own task, which - by naming only NetworkGameLoopRunner
+   and the server's broadcaster as gaining new capability - implicitly
+   also excludes renderer.py/build_snapshot_from_board from this
+   stage's scope). Net effect: a piece's on-screen POSITION still
+   updates in one discrete jump, exactly when the next board-text
+   resync (or, more precisely now, the next successfully-translated
+   PieceArrived - see "STAGE B7" below) updates its logical cell -
+   but for the FULL DURATION of that motion, its SPRITE already shows
+   real move/jump animation frames, not a frozen idle pose. This is a
+   real, honest, deliberately-scoped gap, not an oversight - closing it
+   fully would require either giving NetworkGameLoopRunner its own
+   client-side Motion-interpolation mechanism (duplicating
+   RealTimeArbiter's own job) or extending build_snapshot_from_board
+   itself (out of this stage's own explicit scope) - left to a future
+   stage.
 2. NO SCORE/MOVES-LOG TRACKING: SidePanelRenderer is still reused (per
    this stage's own "reuse existing rendering pieces" requirement), but
    fed a permanently-empty ScoreSnapshot (0-0) and MovesLogSnapshot (no
@@ -164,15 +181,116 @@ section for the full real, logged evidence. Fixed identically here:
 the board's own offset, scaled by this frame's real scale factor, is
 now composed on top of the canvas's own letterbox origin before
 building the mapper.
+
+STAGE B7 - REAL EVENT-DRIVEN ANIMATION: server/game_server.py now
+broadcasts a structured wire-format message (kungfu_chess/notation/
+game_event_wire_format.py) for MoveAccepted/JumpAccepted/PieceArrived,
+alongside (not instead of) its existing board-text snapshot broadcast.
+This class now parses those wire messages back into real event
+objects and feeds them into a real PieceAnimatorRegistry via on_event -
+the exact same method GameLoopRunner's own local publisher subscription
+calls it with - so PieceAnimator's own state-machine logic is entirely
+unaware its caller changed. Two real design problems had to be solved
+to make this work correctly, neither anticipated by "just forward the
+event" alone:
+
+PROBLEM 1 - SERVER piece_id IS NOT PORTABLE TO THIS PROCESS:
+kungfu_chess.model.piece.Piece.id is assigned from a process-global
+counter (re-verified directly in piece.py) - the SERVER's own
+piece_id (baked into every wire event) was assigned in the SERVER's
+own process and has no relationship to any id this CLIENT process has
+ever assigned to its own, separately-constructed Piece objects (this
+class's own `self.board` is built via a completely independent
+BoardParser.parse() call, in this process, with its own independent
+id counter). Feeding a raw server piece_id straight into
+piece_animator_registry.on_event would almost always silently
+resolve to the WRONG PieceAnimator (or none at all) - not a crash, but
+silent, wrong, or entirely absent animation. THE FIX: a per-connection
+translation cache, `self._server_piece_cache: Dict[int, Piece]`,
+mapping a server piece_id to the actual CLIENT-LOCAL Piece OBJECT it
+refers to (not just its id - see _translate_piece's own docstring for
+why the object itself, not merely its id, is cached). Populated
+lazily, the first time a MoveAccepted/JumpAccepted for that
+server_piece_id is ever seen by THIS client: only MoveAccepted/
+JumpAccepted carry a `from_cell`, letting this class resolve
+`self.board.piece_at(from_cell)` - reliable specifically because a
+MoveAccepted's own accompanying board-text broadcast (still sent,
+per the scope decision below) always reflects the board's PRE-this-
+move state (nothing has moved yet at the instant MoveAccepted fires -
+docs/spec.md's own "board changes only after arrival" rule), so
+`from_cell` is guaranteed still occupied by the right piece at
+translation time. A later PieceArrived for the SAME server_piece_id
+(which carries no from_cell at all) is then translated via a pure
+cache lookup, no board lookup needed. A client that only ever
+observes a PieceArrived for a piece it never saw move (e.g. it joined
+mid-motion, after that piece's own MoveAccepted had already been
+broadcast to earlier-joined clients) is a real, but narrow and
+honestly documented, gap: translation fails, and that specific
+event's own animation transition is skipped - see _translate_piece and
+_handle_piece_arrived's own docstrings for the exact fallback
+behavior, and the RECONCILIATION POLICY below for why `self.board`
+itself does not silently drift wrong forever because of it.
+
+PROBLEM 2 - BoardParser ASSIGNS A FRESH id TO EVERY PIECE ON EVERY
+PARSE, WHICH BREAKS PIECE IDENTITY ACROSS SUCCESSIVE BOARD-TEXT
+BROADCASTS: before Stage B7, `_apply_broadcast` replaced
+`self.board` WHOLESALE on every single broadcast (re-parsing the
+entire board from scratch each time) - harmless before this stage,
+since nothing needed piece IDENTITY to survive across broadcasts (only
+occupancy, read fresh each frame). Now that a real
+PieceAnimatorRegistry exists, keyed by piece_id and built ONCE (see
+below), a wholesale re-parse on every later broadcast would silently
+assign brand-new ids to every piece, permanently orphaning
+piece_animator_registry's own id -> PieceAnimator mapping (every piece
+drawn after the second broadcast would raise UnknownPieceIdError) and
+invalidating `self._server_piece_cache` itself. THE FIX -
+RECONCILIATION POLICY (the exact policy this stage's own task asked
+for, decided and justified here): `self.board` is now set from a
+freshly-parsed Board exactly ONCE - the first board-text broadcast
+this client ever receives (SCOPE DECISION 4 below) - and
+`self.piece_animator_registry` is built from that SAME, ONE Board via
+PieceAnimatorRegistry.from_board at that same moment. Every
+subsequent board-text broadcast is treated purely as a read-only
+SANITY CHECK, never a replacement: `_log_resync_mismatch` compares its
+occupancy (kind+color per cell) against `self.board`'s own current
+occupancy and only ever PRINTS a diagnostic message on a genuine
+disagreement - it never mutates `self.board`, never replaces any
+Piece object, and never calls piece_animator_registry.on_event. All
+REAL position changes to `self.board` after the first broadcast
+happen exclusively through `_handle_piece_arrived`'s own direct,
+in-place `Board.move_piece`/`remove_piece` calls, driven by real,
+successfully-translated PieceArrived events - this preserves every
+Piece object's identity/id for the rest of the session (Piece is
+already documented, in kungfu_chess/model/piece.py, as a mutable
+entity for exactly this reason: "state and cell change in place...
+without every holder of a reference needing to swap to a freshly-
+replaced instance"). WHY THIS SATISFIES "NEVER FORCE-RESET AN
+ANIMATOR MID-MOTION": an animator's own visual/sprite state is driven
+ONLY by real events reaching piece_animator_registry.on_event - a
+resync's own mismatch-logging path never calls on_event at all (it
+has no event to synthesize one from - a raw occupancy diff is not an
+event), so it structurally CANNOT disrupt an in-flight animation,
+regardless of what it finds. The one honestly-accepted consequence
+(see PROBLEM 1's own "narrow gap" paragraph above): a piece whose
+arrival could never be translated (the rare mid-motion-join case) has
+its OWN specific position error only ever surfaced via
+_log_resync_mismatch's diagnostic print, never silently and never
+auto-corrected - the same category of "documented, accepted gap for a
+genuinely rare edge case" this codebase already applies elsewhere
+(e.g. SCOPE DECISION 4's own pre-existing "no initial state on join"
+gap, before that was separately fixed at the protocol level).
 """
 
 from __future__ import annotations
 
 import os
-from typing import Optional
+import time
+from typing import Dict, Optional, Union
 
 import cv2
 
+from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
+from kungfu_chess.client.events.game_events import JumpAccepted, MoveAccepted, PieceArrived
 from kungfu_chess.client.events.observers import MovesLogSnapshot, ScoreSnapshot
 from kungfu_chess.client.input.mouse_adapter import MouseAdapter
 from kungfu_chess.client.input.screen_mapper import ScreenToImageMapper
@@ -187,6 +305,13 @@ from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH, SidePanelRen
 from kungfu_chess.io.board_parser import BoardParser
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
+from kungfu_chess.model.piece import Piece
+from kungfu_chess.model.position import Position
+from kungfu_chess.notation.game_event_wire_format import (
+    EVENT_MESSAGE_PREFIX,
+    MalformedGameEventWireFormatError,
+    parse_game_event,
+)
 from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
 from kungfu_chess.view.renderer import Renderer, build_snapshot_from_board
 
@@ -265,6 +390,21 @@ class NetworkGameLoopRunner:
             assigned_color=self.assigned_color, network_client=self.network_client
         )
 
+        # Stage B7 - see module docstring's "STAGE B7 - REAL EVENT-
+        # DRIVEN ANIMATION" section for the full reasoning behind both:
+        # piece_animator_registry is built once, from the FIRST real
+        # board this client ever receives (_apply_broadcast); until
+        # then it stays None, and ImgSurface (see _run_one_frame) falls
+        # back to its own existing no-registry static-idle rendering.
+        # _server_piece_cache maps a SERVER piece_id to the actual
+        # CLIENT-LOCAL Piece object it refers to (see _translate_piece)
+        # - process-local ids are not portable between the server and
+        # this client process, so every wire event's own piece_id must
+        # be translated through this cache before being fed to
+        # piece_animator_registry.on_event.
+        self.piece_animator_registry: Optional[PieceAnimatorRegistry] = None
+        self._server_piece_cache: Dict[int, Piece] = {}
+
         self.asset_cache = AssetCache()
 
         # See module docstring's SCOPE DECISION 6 - computed once, from
@@ -308,10 +448,15 @@ class NetworkGameLoopRunner:
         cv2.setMouseCallback(window_name, debug_mouse_event)
 
     def _apply_broadcast(self, text: str) -> None:
-        """Parse one raw board-state broadcast and update both this
-        runner's own `board` and the click controller's - the reuse
-        point for the existing BoardParser (per this stage's own
-        requirement to reuse it, not write a new parser).
+        """Parse one raw board-text broadcast - the reuse point for the
+        existing BoardParser (per this stage's own requirement to reuse
+        it, not write a new parser). See module docstring's "PROBLEM 2"
+        /"RECONCILIATION POLICY" section for the full reasoning behind
+        the branch below: the FIRST board this client ever receives
+        establishes `self.board`/`self.click_controller.board`/
+        `self.piece_animator_registry` for the rest of the session;
+        every later one is a read-only sanity check only, never a
+        replacement.
 
         Args:
             text: The raw broadcast text (BoardPrinter's own format,
@@ -334,8 +479,209 @@ class NetworkGameLoopRunner:
         if error is not None:
             return
 
-        self.board = board
-        self.click_controller.board = board
+        if self.board is None:
+            self.board = board
+            self.click_controller.board = board
+            self.piece_animator_registry = PieceAnimatorRegistry.from_board(board)
+            return
+
+        self._log_resync_mismatch(board)
+
+    def _log_resync_mismatch(self, resync_board: Board) -> None:
+        """Compare `resync_board` (freshly parsed from a LATER
+        board-text broadcast) against this runner's own, long-lived
+        `self.board`, cell by cell, and print a diagnostic for any
+        genuine disagreement - see module docstring's "RECONCILIATION
+        POLICY" section for why this NEVER mutates `self.board`,
+        replaces a Piece, or touches piece_animator_registry.
+
+        Args:
+            resync_board: The freshly-parsed Board from a board-text
+                broadcast that arrived after `self.board` was already
+                established.
+
+        Returns:
+            None.
+
+        Compares (kind, color) per cell, never raw Piece identity/id -
+        `resync_board`'s own pieces were assigned entirely new ids by
+        this same process's BoardParser call, so comparing ids would
+        always disagree even when the two boards genuinely agree about
+        what is actually on the board.
+        """
+
+        assert self.board is not None
+
+        for row in range(self.board.height):
+            for col in range(self.board.width):
+                cell = Position(row=row, col=col)
+                own_piece = self.board.piece_at(cell)
+                resync_piece = resync_board.piece_at(cell) if resync_board.in_bounds(cell) else None
+
+                own_key = None if own_piece is None else (own_piece.kind, own_piece.color)
+                resync_key = None if resync_piece is None else (resync_piece.kind, resync_piece.color)
+
+                if own_key != resync_key:
+                    print(
+                        f"[NetworkGameLoopRunner] resync mismatch at {cell}: "
+                        f"locally tracked={own_key}, server broadcast={resync_key}"
+                    )
+
+    def _translate_piece(self, server_piece_id: int, from_cell: Optional[Position]) -> Optional[Piece]:
+        """Resolve a wire event's SERVER piece_id to the actual
+        CLIENT-LOCAL Piece object it refers to - see module docstring's
+        "PROBLEM 1" section for the full reasoning behind why this
+        translation is necessary at all, and why the Piece OBJECT
+        itself (not merely its id) is what gets cached: this method's
+        own callers need both the object's `.id` (to build a translated
+        event for piece_animator_registry) AND its live `.cell` (kept
+        correctly up to date by Board itself on every move/removal -
+        see kungfu_chess/model/board.py) - caching the object once
+        gives both for free, with no separate position-tracking of its
+        own to keep in sync.
+
+        Args:
+            server_piece_id: The piece_id carried by the wire event.
+            from_cell: The event's own from_cell, if it has one
+                (MoveAccepted/JumpAccepted only) - used to resolve a
+                server_piece_id this cache has never seen before, via
+                `self.board.piece_at(from_cell)`. None for PieceArrived
+                (which carries no from_cell at all - see module
+                docstring) - only a cache hit can resolve those.
+
+        Returns:
+            The client-local Piece, or None if it cannot be resolved
+            (an unpopulated cache entry with no from_cell to fall back
+            on, or self.board is still None) - see module docstring's
+            "PROBLEM 1" section for why this is a real, but narrow and
+            honestly accepted, gap rather than an error.
+        """
+
+        piece = self._server_piece_cache.get(server_piece_id)
+        if piece is not None:
+            return piece
+
+        if from_cell is None or self.board is None:
+            return None
+
+        piece = self.board.piece_at(from_cell)
+        if piece is None:
+            return None
+
+        self._server_piece_cache[server_piece_id] = piece
+        return piece
+
+    def _apply_wire_event(self, text: str) -> None:
+        """Parse one wire-format event message (kungfu_chess/notation/
+        game_event_wire_format.py) and dispatch it to the matching
+        handler.
+
+        Args:
+            text: The raw message text - already confirmed by the
+                caller (poll_and_process) to start with
+                EVENT_MESSAGE_PREFIX.
+
+        Returns:
+            None.
+
+        A malformed/unrecognized message is silently ignored -
+        MalformedGameEventWireFormatError is caught here, matching this
+        project's "malformed input never crashes the process"
+        convention (see _apply_broadcast's own identical policy for
+        board-text messages, and server/game_server.py's own
+        malformed-command handling).
+        """
+
+        try:
+            event = parse_game_event(text)
+        except MalformedGameEventWireFormatError:
+            return
+
+        if isinstance(event, (MoveAccepted, JumpAccepted)):
+            self._handle_move_or_jump_accepted(event)
+        elif isinstance(event, PieceArrived):
+            self._handle_piece_arrived(event)
+
+    def _handle_move_or_jump_accepted(self, event: Union[MoveAccepted, JumpAccepted]) -> None:
+        """Translate a real MoveAccepted/JumpAccepted's server piece_id
+        and forward a reconstructed, client-local copy of it to
+        piece_animator_registry.on_event - the exact same method
+        GameLoopRunner's own local publisher subscription calls it
+        with (see module docstring's "STAGE B7" section).
+
+        Args:
+            event: The real, wire-parsed MoveAccepted or JumpAccepted.
+
+        Returns:
+            None.
+
+        Does NOT mutate self.board - per docs/spec.md's own "board
+        changes only after a piece has actually reached its
+        destination" rule, a piece logically stays at its from_cell
+        until its own later PieceArrived (see _handle_piece_arrived).
+        A translation failure (see _translate_piece) or no
+        piece_animator_registry yet (self.board itself still None) is
+        a safe, silent no-op - this event's own animation transition is
+        simply skipped (module docstring's own documented, narrow gap).
+        """
+
+        piece = self._translate_piece(event.piece_id, event.from_cell)
+        if piece is None or self.piece_animator_registry is None:
+            return
+
+        translated = type(event)(
+            piece_id=piece.id, from_cell=event.from_cell, to_cell=event.to_cell, duration_ms=event.duration_ms
+        )
+        self.piece_animator_registry.on_event(translated)
+
+    def _handle_piece_arrived(self, event: PieceArrived) -> None:
+        """Translate a real PieceArrived's server piece_id, apply its
+        real position change directly onto self.board (in place,
+        preserving every Piece's identity/id - see module docstring's
+        "PROBLEM 2"/"RECONCILIATION POLICY" section), and forward a
+        reconstructed, client-local copy of the event to
+        piece_animator_registry.on_event.
+
+        Args:
+            event: The real, wire-parsed PieceArrived.
+
+        Returns:
+            None.
+
+        A translation failure (see _translate_piece - the documented,
+        narrow "joined mid-motion" gap) or self.board still being None
+        is a safe, silent no-op: neither self.board nor
+        piece_animator_registry is touched for this event at all -
+        that specific piece's position will only ever be caught by a
+        later _log_resync_mismatch diagnostic, never silently
+        auto-corrected (see module docstring for why this is an
+        accepted trade-off, not an oversight).
+
+        captured_piece_id translation is best-effort only: if the
+        captured piece's own server_piece_id was never itself observed
+        via a translated MoveAccepted/JumpAccepted, it is passed
+        through as None rather than blocking this arrival's own
+        translation - PieceAnimator never reads captured_piece_id at
+        all (re-verified directly against piece_animator.py), so this
+        never affects animation correctness.
+        """
+
+        piece = self._translate_piece(event.piece_id, from_cell=None)
+        if piece is None or self.board is None:
+            return
+
+        if self.board.piece_at(event.cell) is not None:
+            self.board.remove_piece(event.cell)
+        self.board.move_piece(piece.cell, event.cell)
+
+        captured_piece = None if event.captured_piece_id is None else self._server_piece_cache.get(event.captured_piece_id)
+        translated = PieceArrived(
+            piece_id=piece.id,
+            cell=event.cell,
+            captured_piece_id=(captured_piece.id if captured_piece is not None else None),
+        )
+        if self.piece_animator_registry is not None:
+            self.piece_animator_registry.on_event(translated)
 
     def poll_and_process(self) -> None:
         """Drain every new broadcast since the last call and apply each
@@ -346,10 +692,20 @@ class NetworkGameLoopRunner:
 
         Returns:
             None.
+
+        Dispatches each raw message by its own distinct prefix (Stage
+        B7 - see kungfu_chess/notation/game_event_wire_format.py's own
+        docstring for why a wire-format event message can never be
+        confused with a board-text broadcast, or vice versa): a wire
+        event goes to _apply_wire_event, everything else to the
+        pre-existing _apply_broadcast.
         """
 
         for text in self.network_client.poll_incoming():
-            self._apply_broadcast(text)
+            if text.startswith(EVENT_MESSAGE_PREFIX):
+                self._apply_wire_event(text)
+            else:
+                self._apply_broadcast(text)
 
     def run(self) -> None:
         """Run the real-time loop until one of this class's exit
@@ -359,21 +715,43 @@ class NetworkGameLoopRunner:
 
         Returns:
             None.
+
+        Measures real wall-clock delta_ms exactly like GameLoopRunner's
+        own run() (time.perf_counter() before/after each iteration) -
+        Stage B7 needs this real value to drive
+        piece_animator_registry.advance_all in _run_one_frame; before
+        Stage B7 no per-frame timing was needed at all in network mode.
         """
 
+        last_time = time.perf_counter()
         while not self._should_exit():
-            self._run_one_frame()
+            now = time.perf_counter()
+            delta_ms = int((now - last_time) * 1000)
+            last_time = now
+            self._run_one_frame(delta_ms)
 
         self.close()
 
-    def _run_one_frame(self) -> None:
-        """Run exactly one iteration: poll+apply new broadcasts, build
-        a snapshot from whatever board is currently known (or an empty
-        one if none has arrived yet - see module docstring's SCOPE
-        DECISION 4), and render - mirrors GameLoopRunner's own
-        `_run_one_frame` structure (poll -> snapshot -> render ->
-        display), with every step that class performs via a local
-        engine/publisher/registries removed, since none exist here.
+    def _run_one_frame(self, delta_ms: int = 0) -> None:
+        """Run exactly one iteration: poll+apply new broadcasts, advance
+        every live PieceAnimator by delta_ms, build a snapshot from
+        whatever board is currently known (or an empty one if none has
+        arrived yet - see module docstring's SCOPE DECISION 4), and
+        render - mirrors GameLoopRunner's own `_run_one_frame`
+        structure (poll -> wait/advance -> snapshot -> render ->
+        display), with the steps that class performs via a local
+        engine/publisher removed, since neither exists here.
+
+        Args:
+            delta_ms: Milliseconds of logical/wall-clock time since the
+                previous frame, forwarded to
+                piece_animator_registry.advance_all - see run()'s own
+                docstring for how real callers measure this. Defaults
+                to 0 (a harmless no-op advance) so existing direct
+                callers (this class's own pre-Stage-B7 tests, which
+                call `runner._run_one_frame()` with no delta at all)
+                keep working unchanged - advance_all(0) still runs, it
+                simply advances no animation time for that one call.
 
         Returns:
             None.
@@ -381,11 +759,16 @@ class NetworkGameLoopRunner:
 
         self.poll_and_process()
 
+        if self.piece_animator_registry is not None:
+            self.piece_animator_registry.advance_all(delta_ms)
+
         board_canvas = Img.blank_canvas(self._board_pixel_width, self._board_pixel_height)
-        # No PieceAnimatorRegistry passed - ImgSurface's own existing
-        # no-registry static-idle fallback path draws every piece at
-        # its <KIND><COLOR>'s idle frame, exactly per SCOPE DECISION 1.
-        surface = ImgSurface(board_canvas, self.asset_cache)
+        # Stage B7 - piece_animator_registry is passed through exactly
+        # like GameLoopRunner already does (None until the first real
+        # board arrives, per SCOPE DECISION 1 - ImgSurface's own
+        # existing no-registry static-idle fallback path covers that
+        # brief window, unchanged).
+        surface = ImgSurface(board_canvas, self.asset_cache, self.piece_animator_registry)
 
         if self.board is not None:
             snapshot = build_snapshot_from_board(self.board, selected=self.click_controller.selected)

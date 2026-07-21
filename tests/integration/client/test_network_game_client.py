@@ -159,7 +159,16 @@ def test_send_move_then_poll_eventually_surfaces_the_expected_broadcast():
         timeout_s = (2 * MS_PER_SQUARE) / 1000 + 3.0
 
         def has_arrival_broadcast(messages: list[str]) -> bool:
-            return any(msg.splitlines()[4].split()[4] == "wP" for msg in messages)
+            # Stage B7 (server track) added a new, single-line wire-
+            # format event message alongside every existing multi-line
+            # board-text broadcast (kungfu_chess/notation/
+            # game_event_wire_format.py) - poll_incoming() now returns a
+            # mix of both message shapes, so a short message (too few
+            # lines to be board text) is skipped here rather than
+            # indexed blindly; this predicate is only ever looking for
+            # the multi-line board-text broadcast anyway.
+            lines_per_message = [msg.splitlines() for msg in messages]
+            return any(len(lines) > 4 and lines[4].split()[4] == "wP" for lines in lines_per_message)
 
         messages1 = _poll_until(client1, has_arrival_broadcast, timeout_s)
         messages2 = _poll_until(client2, has_arrival_broadcast, timeout_s)
