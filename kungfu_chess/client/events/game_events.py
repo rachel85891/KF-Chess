@@ -71,6 +71,41 @@ class PieceArrived:
 
 
 @dataclass(frozen=True)
+class JumpLanded:
+    """A JUMP's airborne period ended and its post-landing cooldown
+    starts now: piece_id landed back at cell - always the piece's own
+    cell, since JUMP never moves it (extra/jump.py's JumpTracker never
+    creates a Motion for an airborne piece at all).
+
+    A NEW, distinct event type, not a reused PieceArrived, even though
+    both nominally carry "a piece, a cell": PieceArrived's third field,
+    captured_piece_id, means "the piece that just arrived captured
+    whoever already occupied its destination" - a relationship that
+    does not exist for a jump landing. A jump's own interception
+    mechanic (extra/jump.py's InterceptionEvent, not yet published as a
+    client event - out of this event's scope) destroys the ATTACKER
+    trying to land on the airborne piece, never a piece the defender
+    itself displaces; the defender's own landing never captures
+    anything. Reusing PieceArrived (always with captured_piece_id=None)
+    would also silently feed every existing PieceArrived consumer a
+    payload shaped like a genuine arrival it structurally is not:
+    SoundManager would treat it as a plain "move" echo, PieceAnimator's
+    documented PieceArrived-forces-IDLE bugfix would force an unrelated
+    animation transition, and the network wire format/reconciliation
+    layer (kungfu_chess/notation/game_event_wire_format.py,
+    kungfu_chess/client/loop/network_game_loop_runner.py) would need to
+    treat a same-cell "arrival" as a special case it was never designed
+    for. A new, narrow type lets CooldownTracker react to jump landings
+    (client_spec.md §10's documented gap) without any of those
+    consumers needing to change or accidentally misfire - OCP's
+    "match on the one relevant type, ignore the rest" pattern this
+    codebase already follows for every Observer."""
+
+    piece_id: int
+    cell: Position
+
+
+@dataclass(frozen=True)
 class GameOver:
     """The game ended; winner_color is the side whose king was NOT
     captured."""
