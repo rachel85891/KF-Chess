@@ -15,6 +15,15 @@ the very first move anywhere in the game. These tests prove a
 just-joined client now also receives the CURRENT board state
 immediately after its assigned_color message, before any move has ever
 happened.
+
+UPDATED for Stage B7's real wire-format events (see
+server/game_server.py's own "STAGE B7 - REAL WIRE-FORMAT EVENTS"
+docstring section): _on_game_event now broadcasts an extra,
+structured wire-format message immediately before the existing
+board-text broadcast for MoveAccepted/PieceArrived - this test file's
+own event-driven-broadcast test drains one more message per such event
+than before Stage B7; final assertions on board-text content are
+unchanged.
 """
 
 from __future__ import annotations
@@ -115,15 +124,21 @@ def test_existing_event_driven_broadcasts_still_work_after_the_join_time_board_s
 
                 await client1.send("WPe2e4")
 
-                # Same two-broadcast pattern already established by
-                # tests/integration/server/test_protocol_wiring.py's own
-                # test_legal_move_from_correct_color_client_is_accepted_
-                # and_broadcast_to_both_clients: MoveAccepted fires
-                # immediately (pre-move board), then PieceArrived once
-                # the tick loop's real elapsed time completes the
-                # motion (post-move board) - the first is drained here,
-                # the second is asserted on.
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                # Same four-broadcast-per-client pattern already
+                # established by tests/integration/server/
+                # test_protocol_wiring.py's own test_legal_move_from_
+                # correct_color_client_is_accepted_and_broadcast_to_both_
+                # clients (Stage B7): MoveAccepted fires immediately
+                # (wire event + pre-move board text), then PieceArrived
+                # fires once the tick loop's real elapsed time completes
+                # the motion (wire event + post-move board text) - the
+                # first three are drained here, the fourth is asserted
+                # on.
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)

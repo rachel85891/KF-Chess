@@ -23,6 +23,17 @@ account for this - a real, intentional behavior addition these tests'
 own assumptions needed to catch up to, not a scenario change (see
 tests/integration/server/test_initial_board_state_on_join.py for the
 fix's own dedicated coverage).
+
+UPDATED AGAIN for Stage B7's real wire-format events (see
+server/game_server.py's own "STAGE B7 - REAL WIRE-FORMAT EVENTS"
+docstring section): _on_game_event now broadcasts an EXTRA,
+structured wire-format message immediately before the existing
+board-text broadcast for MoveAccepted/PieceArrived (MoveRejected gets
+no such extra message - see that same docstring section for why). Any
+test below that drains a move's resulting broadcasts now drains one
+more message per accepted-move-related event than before Stage B7 -
+again a real, intentional behavior addition, not a scenario change;
+final assertions on the actual board-text content are unchanged.
 """
 
 from __future__ import annotations
@@ -107,18 +118,24 @@ def test_legal_move_from_correct_color_client_is_accepted_and_broadcast_to_both_
                 # White's e-pawn double-step opening move - 2 squares.
                 await client1.send("WPe2e4")
 
-                # Two broadcasts arrive per accepted move, not one:
-                # MoveAccepted fires (and is broadcast) the instant the
-                # motion STARTS - showing the board still in its
-                # pre-move state, since the board only mutates on real
-                # arrival (docs/spec.md's own "board changes only after
-                # a moving piece has actually reached its destination"
-                # rule) - then PieceArrived fires (and is broadcast)
-                # once the tick loop has advanced enough real time for
-                # the motion to complete. The first recv() per client is
-                # therefore drained and discarded here; the SECOND is
-                # the one that reflects the actual, final board state.
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                # Two GAME EVENTS fire per accepted move (MoveAccepted,
+                # instantly - board still pre-move, since the board only
+                # mutates on real arrival, docs/spec.md's own "board
+                # changes only after a moving piece has actually reached
+                # its destination" rule; then PieceArrived, once the
+                # tick loop's real elapsed time completes the motion),
+                # and Stage B7 makes EACH of those two events broadcast
+                # TWO messages of its own (the new wire-format event,
+                # then the existing board-text snapshot) - four
+                # messages total per client. The first three are drained
+                # and discarded here (wire+board for MoveAccepted, wire
+                # for PieceArrived); the fourth is the one that reflects
+                # the actual, final post-move board state.
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
@@ -172,10 +189,16 @@ def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid
                 # afterward - proven by a real, subsequent legal move
                 # still working normally.
                 await client1.send("WPe2e4")
-                # Drain the immediate MoveAccepted broadcast (pre-move
-                # board) before the later PieceArrived one (see the
-                # sibling test above for the full reasoning).
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                # Drain the immediate MoveAccepted broadcasts (wire
+                # event + pre-move board text) and PieceArrived's own
+                # wire event, before the later, final PieceArrived board
+                # text (see the sibling test above for the full Stage B7
+                # reasoning).
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
@@ -205,13 +228,19 @@ def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_
 
                 started_at = time.perf_counter()
                 await client1.send("WPe2e4")  # 2 squares = 2 * MS_PER_SQUARE of real motion time
-                # First broadcast = MoveAccepted, near-instant (pre-move
-                # board) - drained, not timed. Second = PieceArrived,
-                # only produced once the tick loop's real elapsed time
+                # MoveAccepted's own wire event + board text arrive
+                # near-instantly (pre-move board) - both drained, not
+                # timed. PieceArrived's own wire event arrives next,
+                # also drained - only PieceArrived's FINAL board text is
+                # produced once the tick loop's real elapsed time
                 # actually covers the motion's full duration; THAT one
-                # is what this test times.
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                # is what this test times (Stage B7 added one more
+                # drained message per event; the thing actually being
+                # timed is unchanged).
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived board text
                 elapsed_s = time.perf_counter() - started_at
 
         expected_s = (2 * MS_PER_SQUARE) / 1000

@@ -117,6 +117,25 @@ message arriving (client_spec.md's/this stage's own requirement) -
 cadence for as long as the process lives, entirely decoupled from
 `_handle_message`.
 
+STAGE B7 - REAL WIRE-FORMAT EVENTS, ALONGSIDE (NOT INSTEAD OF) BOARD
+TEXT: `_on_game_event`'s broadcaster now also sends a structured,
+single-line wire-format message (kungfu_chess/notation/
+game_event_wire_format.py) for MoveAccepted/JumpAccepted/PieceArrived,
+immediately before the existing board-text snapshot for the same
+event - see `_broadcast_event`'s own docstring for the exact ordering
+guarantee. WHY ALONGSIDE, NOT REPLACING: the board-text broadcast is
+this project's own established fallback/sanity-check safety net (every
+existing client and test already depends on receiving it) - this stage
+adds richer, structured per-motion data for a client that wants to
+animate smoothly (kungfu_chess/client/loop/network_game_loop_runner.py),
+without removing the guarantee a simpler/older client can still just
+parse the board text alone and ignore the new message entirely. WHY
+MoveRejected/GameOver GET NO WIRE-FORMAT MESSAGE:
+format_game_event returns None for both (neither is an animatable
+motion - see that module's own docstring) - `_broadcast_event` treats
+that None as "nothing extra to send", so these two event types'
+broadcasts stay byte-for-byte identical to before this stage.
+
 SHAPE FOR A FUTURE ROOMS STAGE (F) - noted explicitly, NOT built now
 (YAGNI): today, `self._game_session`/`self._colors`/the four event-bus
 subscriptions are each a SINGLE instance/mapping, because there is
@@ -174,16 +193,17 @@ from typing import Dict, Optional
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
-from kungfu_chess.client.events.game_events import GameOver, MoveAccepted, MoveRejected, PieceArrived
+from kungfu_chess.client.events.game_events import GameOver, JumpAccepted, MoveAccepted, MoveRejected, PieceArrived
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.color import Color
+from kungfu_chess.notation.game_event_wire_format import format_game_event
 from server.connection_manager import ConnectionManager
 from server.game_session import GameSession
 from server.move_command import MalformedCommandError, ParsedMoveCommand, parse_move_command
 
 TICK_INTERVAL_S = 1 / 30
 
-_BROADCAST_EVENT_TYPES = (MoveAccepted, MoveRejected, PieceArrived, GameOver)
+_BROADCAST_EVENT_TYPES = (MoveAccepted, JumpAccepted, MoveRejected, PieceArrived, GameOver)
 
 
 class GameServer:
@@ -334,16 +354,56 @@ class GameServer:
 
         Args:
             event: Whatever GameEventPublisher published - only
-                MoveAccepted/MoveRejected/PieceArrived/GameOver are
-                subscribed to in __init__, so `event` is always one of
-                those four here; no isinstance filtering is needed
-                inside this method itself.
+                MoveAccepted/JumpAccepted/MoveRejected/PieceArrived/
+                GameOver are subscribed to in __init__, so `event` is
+                always one of those five here; no isinstance filtering
+                is needed inside this method itself (format_game_event,
+                called from _broadcast_event below, does its own
+                isinstance check to decide whether an extra wire-format
+                message is even applicable).
 
         Returns:
             None.
         """
 
-        asyncio.create_task(self._broadcast(self._current_board_text()))
+        asyncio.create_task(self._broadcast_event(event))
+
+    async def _broadcast_event(self, event: object) -> None:
+        """Broadcast the real, structured wire-format event message for
+        `event` (Stage B7 - see kungfu_chess/notation/
+        game_event_wire_format.py's own docstring for the full wire-
+        format reasoning), THEN the existing board-text snapshot -
+        added alongside the pre-existing board-text broadcast, not in
+        place of it (an explicit, accepted Stage B7 scope decision: the
+        board-text broadcast remains the fallback/sanity-check safety
+        net every existing test and client already depends on).
+
+        Args:
+            event: The real event _on_game_event received.
+
+        Returns:
+            None.
+
+        Reuses `_broadcast` for BOTH sends (no duplicated connection-
+        iteration logic, per this stage's own DRY requirement) - a
+        MoveRejected/GameOver produces no wire-format message
+        (format_game_event returns None for both - neither is an
+        animatable motion), so only the pre-existing board-text
+        broadcast happens for those, byte-for-byte unchanged from
+        before this stage. Both sends happen from within this SAME
+        coroutine, in this fixed order, so a client's own message
+        stream always sees this event's own wire message immediately
+        before this event's own resulting board state - never
+        interleaved with a DIFFERENT event's pair (this coroutine does
+        not yield control between the two `await self._broadcast(...)`
+        calls to any other code that could send a third message to the
+        same connections in between).
+        """
+
+        wire_text = format_game_event(event)
+        if wire_text is not None:
+            await self._broadcast(wire_text)
+        await self._broadcast(self._current_board_text())
 
     def _current_board_text(self) -> str:
         """The exact board-serialization call used for both the
