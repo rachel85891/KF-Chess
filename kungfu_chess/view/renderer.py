@@ -21,6 +21,52 @@ row*CELL_SIZE - the same anchor convention BoardMapper already uses).
 A piece not currently in an active motion renders at its own cell's
 pixel position directly.
 
+EXTRACTED, Stage B7.5 (network pixel-sliding): the two pieces of math
+above - the clamp(0, 1) progress fraction, and the per-axis pixel
+lerp - are now their own pure, standalone functions, `motion_progress`
+and `interpolate_cell_pixel` (below), rather than inline code inside
+build_snapshot's own per-motion loop. Reason: kungfu_chess/client/loop/
+network_game_loop_runner.py's own client-side motion tracking (Stage
+B7.5) needs to compute the IDENTICAL progress-and-interpolate shape
+from ITS OWN clock source (a client's real wall-clock elapsed time
+since it received a MoveAccepted/JumpAccepted wire event, plus the
+wire-transmitted duration_ms) rather than a local engine's
+clock_ms/RealTimeArbiter.active_motions() - reusing these two
+functions directly means the formula exists in exactly one place,
+used by both local play (build_snapshot, refactored below to call
+them instead of computing this inline) and network play, instead of a
+second, silently-divergable reimplementation. This refactor is
+PURELY mechanical - build_snapshot's own observable behavior is
+byte-for-byte unchanged (see tests/unit/test_renderer_interpolation.py
+for the two functions' own unit tests, and this refactor commit's own
+before/after regression test for proof build_snapshot itself is
+unaffected).
+
+WHY motion_progress ITSELF stays a SEPARATE function from
+interpolate_cell_pixel, not merged into one: they consume genuinely
+different inputs from genuinely different sources (motion_progress
+needs only two millisecond counts, regardless of where they came
+from; interpolate_cell_pixel needs two Positions and an
+already-resolved progress fraction) - build_snapshot computes its own
+progress from `engine.state.clock_ms - motion.start_time` and
+`motion.arrival_time - motion.start_time`; NetworkGameLoopRunner
+computes an analogous elapsed/total pair from its own wall-clock
+timer and the wire-transmitted duration_ms. Keeping them separate
+lets each caller supply whatever elapsed/total pair its own clock
+produces, without motion_progress needing to know or care where those
+numbers came from - a single-responsibility split matching this
+project's own established convention for small, focused, reusable
+pure functions (client_spec.md §1's own "single responsibility" rule).
+
+WHY interpolate_cell_pixel does NOT re-clamp progress itself: clamping
+is motion_progress's own, single, well-defined job (see its own
+docstring) - every caller of interpolate_cell_pixel in this codebase
+already computes progress via motion_progress first, so a second,
+redundant clamp inside interpolate_cell_pixel would only duplicate
+that guarantee, not add a new one. A pure lerp function has no
+independent opinion about what counts as a "valid" progress value;
+enforcing that is the caller's job.
+
 build_snapshot_from_board (Stage B6, server track): a SECOND, additive
 snapshot builder, alongside build_snapshot above - not a replacement
 for it, and build_snapshot/Renderer/GameSnapshot/PieceSnapshot are all
@@ -98,6 +144,57 @@ def _cell_pixel(cell: Position) -> tuple[int, int]:
     return cell.col * CELL_SIZE, cell.row * CELL_SIZE
 
 
+def motion_progress(elapsed_ms: int, total_ms: int) -> float:
+    """The fraction of a motion's own total_ms duration that elapsed_ms
+    represents, clamped to [0, 1] - see module docstring's "EXTRACTED,
+    Stage B7.5" section for the full reasoning behind this extraction.
+
+    Args:
+        elapsed_ms: Milliseconds elapsed so far within this motion (may
+            be negative or exceed total_ms - both are clamped, never
+            raised on).
+        total_ms: The motion's own total duration, in milliseconds.
+
+    Returns:
+        0.0 if total_ms <= 0 (a degenerate, zero-or-negative-duration
+        motion - matches build_snapshot's own pre-extraction guard
+        exactly, never divides by zero), otherwise
+        elapsed_ms / total_ms clamped to [0.0, 1.0].
+    """
+
+    if total_ms <= 0:
+        return 0.0
+    return max(0.0, min(1.0, elapsed_ms / total_ms))
+
+
+def interpolate_cell_pixel(from_cell: Position, to_cell: Position, progress: float) -> tuple[int, int]:
+    """Pure per-axis linear interpolation between two cells' own pixel
+    positions (top-left corner - col*CELL_SIZE/row*CELL_SIZE, the same
+    anchor BoardMapper already uses) - see module docstring's
+    "EXTRACTED, Stage B7.5" section for the full reasoning behind this
+    extraction.
+
+    Args:
+        from_cell: The motion's source cell (progress=0.0 -> here).
+        to_cell: The motion's destination cell (progress=1.0 -> here).
+        progress: Interpolation fraction - NOT re-clamped here (see
+            module docstring's "WHY interpolate_cell_pixel does NOT
+            re-clamp" section) - callers are expected to have already
+            produced a clamped value via motion_progress.
+
+    Returns:
+        The interpolated (x, y) pixel position, rounded to the nearest
+        integer pixel (matching build_snapshot's own pre-extraction
+        `round(...)` calls exactly).
+    """
+
+    source_x, source_y = _cell_pixel(from_cell)
+    destination_x, destination_y = _cell_pixel(to_cell)
+    x = round(source_x + (destination_x - source_x) * progress)
+    y = round(source_y + (destination_y - source_y) * progress)
+    return x, y
+
+
 def build_snapshot(engine: GameEngine, controller: Controller) -> GameSnapshot:
     board = engine.board
     clock_ms = engine.state.clock_ms
@@ -106,13 +203,8 @@ def build_snapshot(engine: GameEngine, controller: Controller) -> GameSnapshot:
     for motion in engine.arbiter.active_motions():
         total_ms = motion.arrival_time - motion.start_time
         elapsed_ms = clock_ms - motion.start_time
-        progress = 0.0 if total_ms <= 0 else max(0.0, min(1.0, elapsed_ms / total_ms))
-
-        source_x, source_y = _cell_pixel(motion.source)
-        destination_x, destination_y = _cell_pixel(motion.destination)
-        x = round(source_x + (destination_x - source_x) * progress)
-        y = round(source_y + (destination_y - source_y) * progress)
-        in_flight_positions[motion.piece.id] = (x, y)
+        progress = motion_progress(elapsed_ms, total_ms)
+        in_flight_positions[motion.piece.id] = interpolate_cell_pixel(motion.source, motion.destination, progress)
 
     pieces = []
     for row in range(board.height):
