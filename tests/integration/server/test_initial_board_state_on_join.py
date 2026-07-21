@@ -24,6 +24,15 @@ board-text broadcast for MoveAccepted/PieceArrived - this test file's
 own event-driven-broadcast test drains one more message per such event
 than before Stage B7; final assertions on board-text content are
 unchanged.
+
+UPDATED AGAIN for the server-score-moveslog-timer-broadcast stage (see
+server/game_server.py's own "SCORE / MOVE-LOG / TIMER BROADCAST"
+docstring section): _broadcast_event now sends one more message (the
+score/move-log/elapsed-clock snapshot) immediately after the existing
+wire-event + board-text pair for MoveAccepted/JumpAccepted/PieceArrived
+- this test file's own event-driven-broadcast test drains one more
+message per such event again; final assertions on board-text content
+are unchanged.
 """
 
 from __future__ import annotations
@@ -124,19 +133,21 @@ def test_existing_event_driven_broadcasts_still_work_after_the_join_time_board_s
 
                 await client1.send("WPe2e4")
 
-                # Same four-broadcast-per-client pattern already
+                # Same six-broadcast-per-client pattern already
                 # established by tests/integration/server/
                 # test_protocol_wiring.py's own test_legal_move_from_
                 # correct_color_client_is_accepted_and_broadcast_to_both_
-                # clients (Stage B7): MoveAccepted fires immediately
-                # (wire event + pre-move board text), then PieceArrived
-                # fires once the tick loop's real elapsed time completes
-                # the motion (wire event + post-move board text) - the
-                # first three are drained here, the fourth is asserted
-                # on.
+                # clients: MoveAccepted fires immediately (wire event +
+                # pre-move board text + state snapshot), then
+                # PieceArrived fires once the tick loop's real elapsed
+                # time completes the motion (wire event + post-move
+                # board text + state snapshot) - the first four are
+                # drained here, the fifth is asserted on.
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)

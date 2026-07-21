@@ -173,6 +173,30 @@ motion - see that module's own docstring) - `_broadcast_event` treats
 that None as "nothing extra to send", so these two event types'
 broadcasts stay byte-for-byte identical to before this stage.
 
+SCORE / MOVE-LOG / TIMER BROADCAST (later stage - server-score-
+moveslog-timer-broadcast): `_broadcast_event` now sends ONE MORE
+message - the real, structured score/move-log/elapsed-clock snapshot
+(kungfu_chess/notation/game_state_snapshot_wire_format.py) - right
+after the existing wire-event + board-text pair, but ONLY for
+MoveAccepted/JumpAccepted/PieceArrived (re-checked directly: these are
+the only three event types that can ever change
+self._session.score_observer/moves_log_observer's own running state -
+JumpLanded/MoveRejected/GameOver never do, and are therefore correctly
+left byte-for-byte unchanged by this addition, matching this stage's
+own explicit "do not touch MoveRejected/GameOver handling" scope).
+score_observer/moves_log_observer themselves are NOT constructed or
+subscribed here - they live on `self._session` (see
+server/game_session.py's own "SCORE / MOVE-LOG / TIMER" docstring
+section for why GameSession, not this class, is the correct
+composition point) - this class only ever READS their already-current
+snapshots (`self._session.score_observer.snapshot()`,
+`self._session.moves_log_observer.snapshot()`) plus the current
+`self._session.engine.state.clock_ms`, exactly mirroring how
+`_current_board_text` already reads `self._session.engine.board`
+directly rather than owning any board state itself. Reuses the exact
+same `_broadcast` connection-iteration method every other message in
+this class already uses - no second broadcast path.
+
 SHAPE FOR A FUTURE ROOMS STAGE (F) - noted explicitly, NOT built now
 (YAGNI): today, `self._game_session`/`self._colors`/the four event-bus
 subscriptions are each a SINGLE instance/mapping, because there is
@@ -243,6 +267,7 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.notation.game_event_wire_format import format_game_event
+from kungfu_chess.notation.game_state_snapshot_wire_format import format_game_state_snapshot
 from kungfu_chess.notation.jump_command import JUMP_COMMAND_PREFIX, MalformedJumpCommandError, parse_jump_command
 from server.connection_manager import ConnectionManager
 from server.game_session import GameSession
@@ -497,26 +522,48 @@ class GameServer:
         Returns:
             None.
 
-        Reuses `_broadcast` for BOTH sends (no duplicated connection-
+        Reuses `_broadcast` for EVERY send (no duplicated connection-
         iteration logic, per this stage's own DRY requirement) - a
         MoveRejected/GameOver produces no wire-format message
         (format_game_event returns None for both - neither is an
         animatable motion), so only the pre-existing board-text
         broadcast happens for those, byte-for-byte unchanged from
-        before this stage. Both sends happen from within this SAME
+        before this stage. Every send happens from within this SAME
         coroutine, in this fixed order, so a client's own message
-        stream always sees this event's own wire message immediately
-        before this event's own resulting board state - never
-        interleaved with a DIFFERENT event's pair (this coroutine does
-        not yield control between the two `await self._broadcast(...)`
-        calls to any other code that could send a third message to the
-        same connections in between).
+        stream always sees this event's own wire message, then its own
+        resulting board state, then (for MoveAccepted/JumpAccepted/
+        PieceArrived only - see module docstring's "SCORE / MOVE-LOG /
+        TIMER BROADCAST" section) its own resulting score/move-log/
+        clock snapshot - never interleaved with a DIFFERENT event's own
+        messages (this coroutine does not yield control between any of
+        these `await self._broadcast(...)` calls to any other code that
+        could send a message to the same connections in between).
         """
 
         wire_text = format_game_event(event)
         if wire_text is not None:
             await self._broadcast(wire_text)
         await self._broadcast(self._current_board_text())
+        if isinstance(event, (MoveAccepted, JumpAccepted, PieceArrived)):
+            await self._broadcast(self._current_state_snapshot_text())
+
+    def _current_state_snapshot_text(self) -> str:
+        """The score/move-log/elapsed-clock snapshot broadcast added by
+        this later stage - see module docstring's "SCORE / MOVE-LOG /
+        TIMER BROADCAST" section for the full reasoning behind why
+        this reads self._session's own observers/engine state directly
+        rather than owning any of it here.
+
+        Returns:
+            The current (ScoreSnapshot, MovesLogSnapshot,
+            engine.state.clock_ms) triple, serialized via
+            format_game_state_snapshot.
+        """
+
+        score = self._session.score_observer.snapshot()
+        log = self._session.moves_log_observer.snapshot()
+        clock_ms = self._session.engine.state.clock_ms
+        return format_game_state_snapshot(score, log, clock_ms)
 
     def _current_board_text(self) -> str:
         """The exact board-serialization call used for both the
