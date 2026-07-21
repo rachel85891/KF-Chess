@@ -12,6 +12,67 @@ move_command.py (this stage) are pure, network-agnostic parsers. This
 class is where those four things actually meet, and it is the only
 place they do.
 
+THE APPLICATION/PRESENTATION BOUNDARY (refactor/server-application-
+presentation-split): this file used to ALSO own every detail of how
+the wire protocol is actually spoken - parsing raw text, formatting
+every outgoing message, the literal connection.send calls - alongside
+its own coordination decisions, in one 664-line file. That PRESENTATION
+half is now server/protocol_handler.py's ProtocolHandler (see its own
+module docstring for the full reasoning) - a stateless, ConnectionManager/
+GameSession/EventBus-agnostic class this one holds via composition
+(`self._protocol`, injected DIP, defaulting to a real ProtocolHandler).
+This class (APPLICATION) keeps every decision about what a client
+message MEANS for the game and who is allowed to send it: color/join-
+order assignment, third-plus-connection policy, validating a parsed
+command's color/ownership against the real board, deciding WHICH
+GameSession method a valid command maps to, deciding WHICH broadcast
+messages a given game event triggers and in what order, and the tick
+loop. Neither class reaches into the other's internals - GameServer
+never imports a wire-format module or BoardPrinter directly anymore
+(re-verified: this file has no such import left), and ProtocolHandler
+never imports GameSession/ConnectionManager/EventBus.
+
+BORDERLINE JUDGMENT CALLS, decided and justified here (per this
+refactor's own explicit invitation to document them):
+  - Parsing raw text into a structured command (including the leading-
+    character jump-vs-move dispatch that used to live directly inside
+    `_handle_message`) is PRESENTATION, not APPLICATION - it is pure
+    wire-grammar knowledge with no coordination decision in it (WHICH
+    parser applies to a given message is a fact about the GRAMMAR, not
+    about the game) - moved to ProtocolHandler.parse_incoming_command.
+    But VALIDATING an already-parsed command (does its color match this
+    connection's assigned color? does its claimed piece actually match
+    what's on the board?) stays APPLICATION, in `_handle_move_command`/
+    `_handle_jump_command`/`_piece_matches` - these decisions need
+    GameSession/`self._colors` knowledge ProtocolHandler deliberately
+    does not have.
+  - Constructing the literal "rejected:<reason>"/"assigned_color:
+    <color>" wire STRINGS is PRESENTATION (ProtocolHandler.
+    format_rejection/format_assigned_color) - it's protocol syntax, the
+    same category as format_game_event. But DECIDING which reason
+    string applies (wrong_color vs. piece_mismatch vs. a parse failure
+    vs. jump_rejected) stays APPLICATION - that decision requires
+    knowing the connection's assigned color and the real board, neither
+    of which ProtocolHandler has.
+  - `_broadcast_event`'s own SEQUENCING logic (send the wire event if
+    any, then board text, then conditionally the state snapshot, based
+    on the event's own type) stays APPLICATION, in GameServer, even
+    though it calls PRESENTATION methods to actually format/send each
+    piece: which event types warrant a state-snapshot broadcast is a
+    decision about GAME-EVENT SEMANTICS (only moves/jumps/arrivals ever
+    change score/log state - see this module's own "SCORE / MOVE-LOG /
+    TIMER BROADCAST" section), not wire-protocol mechanics - moving it
+    into ProtocolHandler would give that class an opinion about what a
+    MoveAccepted MEANS, which is exactly the knowledge this split is
+    meant to keep out of it.
+  - ConnectionManager itself stays owned by GameServer (APPLICATION),
+    not ProtocolHandler: `self._connection_manager` is coordination
+    state (who is currently connected), not wire-protocol mechanics.
+    ProtocolHandler.broadcast takes a plain connections ITERABLE
+    instead (GameServer passes `self._connection_manager.connections()`
+    in) - this class's own decision, not something ProtocolHandler asks
+    for by holding a ConnectionManager reference of its own.
+
 WHY THIS IS THE "JOIN" STAGE: Stage B1 proved networking in isolation
 (echo only). Stage B2 proved engine hosting in isolation (direct method
 calls only). This class is what Stage B1's own echo_message docstring
@@ -117,9 +178,10 @@ synchronously, inline, with no `await` anywhere in that path. But
 actually delivering a broadcast requires a real, awaited
 `connection.send(...)`. The bridge: `_on_game_event` (the subscribed
 handler) is itself a plain sync function - it satisfies EventBus's
-contract - but its body does no real I/O itself; it only computes the
-board text and schedules `asyncio.create_task(self._broadcast(text))`.
-This is safe specifically because `_on_game_event` is ALWAYS invoked
+contract - but its body does no real I/O itself; it only schedules
+`asyncio.create_task(self._broadcast_event(event))`, which does the
+real, awaited sends via self._protocol. This is safe specifically
+because `_on_game_event` is ALWAYS invoked
 from inside a call to `self._game_session.request_move(...)` or
 `.wait(...)`, both of which are themselves always called from this
 class's own async methods (`_handle_message`, `run_tick_loop`) - so a
@@ -192,12 +254,16 @@ sent, and no connected client had any way to detect the game had
 ended. Once format_game_event started returning a real "EVT:GAMEOVER:"
 message for it (kungfu_chess/notation/game_event_wire_format.py's own
 docstring), this class needed ZERO code changes to start sending it -
-the exact same `wire_text = format_game_event(event); if wire_text is
-not None: await self._broadcast(wire_text)` line below now simply stops
+the exact same `wire_text = self._protocol.format_event(event); if
+wire_text is not None: await self._protocol.broadcast(...)` line below
+(originally `format_game_event`/`self._broadcast` directly, before
+refactor/server-application-presentation-split relocated the actual
+formatting/sending mechanics to ProtocolHandler - see this module's own
+"THE APPLICATION/PRESENTATION BOUNDARY" section) now simply stops
 producing None for this one event type. This is the intended, minimal
 shape of that module's own None-return contract: a caller here never
 needs to special-case which event types currently have wire support -
-it only ever needs to ask format_game_event, once.
+it only ever needs to ask format_event, once.
 
 SCORE / MOVE-LOG / TIMER BROADCAST (later stage - server-score-
 moveslog-timer-broadcast): `_broadcast_event` now sends ONE MORE
@@ -220,8 +286,8 @@ snapshots (`self._session.score_observer.snapshot()`,
 `self._session.engine.state.clock_ms`, exactly mirroring how
 `_current_board_text` already reads `self._session.engine.board`
 directly rather than owning any board state itself. Reuses the exact
-same `_broadcast` connection-iteration method every other message in
-this class already uses - no second broadcast path.
+same `self._protocol.broadcast` call every other message in this class
+already uses - no second broadcast path.
 
 SHAPE FOR A FUTURE ROOMS STAGE (F) - noted explicitly, NOT built now
 (YAGNI): today, `self._game_session`/`self._colors`/the four event-bus
@@ -253,17 +319,19 @@ know where any piece was in the meantime. WHY THE FIX POINT IS HERE, IN
 `handle_connection`: this is already the one place that both (a) knows
 this is one specific, just-joined connection (not "broadcast to
 everyone") and (b) already sends that connection a direct,
-point-to-point message (`assigned_color:...` via `_safe_send`) -
+point-to-point message (`assigned_color:...` via `self._protocol.send`,
+originally `_safe_send` before refactor/server-application-
+presentation-split relocated it to ProtocolHandler unchanged) -
 reusing that exact same single-connection send path for the current
 board state, right after it, needed no new connection-tracking
-mechanism at all. `_current_board_text()` is a new, tiny private
-helper - the exact `BoardPrinter().print(self._session.engine.board)`
-call `_on_game_event` already made, factored out and now called from
-BOTH places, so there is still only ONE board-serialization code path
-in this class, not two. This is a point-to-point send to the
-just-joined connection ONLY (a plain `_safe_send` call, not
-`_broadcast`) - an already-connected opponent does not need or want a
-redundant duplicate board state just because a second player joined.
+mechanism at all. `_current_board_text()` is a tiny private helper -
+delegates to `self._protocol.format_board_text(self._session.engine.
+board)`, called from BOTH this method and `_broadcast_event`, so there
+is still only ONE board-serialization CALL SITE in this class, not two.
+This is a point-to-point send to the just-joined connection ONLY (a
+plain `self._protocol.send` call, not `self._protocol.broadcast`) - an
+already-connected opponent does not need or want a redundant duplicate
+board state just because a second player joined.
 The "server_full" rejection branch (above, in this same method) returns
 before this new send is ever reached, so it is completely unaffected -
 re-verified directly, and covered by
@@ -312,9 +380,13 @@ _BROADCAST_EVENT_TYPES = (
 
 
 class GameServer:
-    """Coordinates one shared GameSession with real WebSocket
-    connections - see module docstring for the full reasoning behind
-    every decision below."""
+    """The APPLICATION half of the server track's APPLICATION/
+    PRESENTATION split - coordinates one shared GameSession with real
+    WebSocket connections, delegating every wire-parsing/formatting/send
+    concern to a held ProtocolHandler (self._protocol). See module
+    docstring for the full reasoning behind every decision below,
+    including the explicit "THE APPLICATION/PRESENTATION BOUNDARY"
+    section for the borderline judgment calls this split required."""
 
     def __init__(
         self,
@@ -551,10 +623,10 @@ class GameServer:
                 MoveAccepted/JumpAccepted/MoveRejected/PieceArrived/
                 GameOver are subscribed to in __init__, so `event` is
                 always one of those five here; no isinstance filtering
-                is needed inside this method itself (format_game_event,
-                called from _broadcast_event below, does its own
-                isinstance check to decide whether an extra wire-format
-                message is even applicable).
+                is needed inside this method itself (self._protocol.
+                format_event, called from _broadcast_event below, does
+                its own isinstance check to decide whether an extra
+                wire-format message is even applicable).
 
         Returns:
             None.
