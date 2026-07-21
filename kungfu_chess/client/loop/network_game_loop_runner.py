@@ -93,15 +93,22 @@ relitigate; each is documented again at its own point of use below):
    completely untouched; only this class and kungfu_chess/view/
    renderer.py's build_snapshot_from_board gain new capability this
    stage).
-2. NO SCORE/MOVES-LOG TRACKING: SidePanelRenderer is still reused (per
-   this stage's own "reuse existing rendering pieces" requirement), but
-   fed a permanently-empty ScoreSnapshot (0-0) and MovesLogSnapshot (no
-   entries) - there is no local ScoreObserver/MovesLogObserver to feed
-   it real data (both are Observers of a local GameEventPublisher's own
-   event stream, which does not exist in network mode). A future stage
-   could reconstruct real score/log data by diffing successive parsed
-   Boards, or by extending the wire protocol with structured event
-   metadata instead of plain board text; out of scope here.
+2. NO SCORE/MOVES-LOG TRACKING (SUPERSEDED - see "SCORE / MOVE-LOG /
+   CAPTURED-PIECES / TIMER OVER THE NETWORK" below, a later stage):
+   SidePanelRenderer was originally fed a permanently-empty
+   ScoreSnapshot (0-0) and MovesLogSnapshot (no entries) - there was no
+   local ScoreObserver/MovesLogObserver to feed it real data (both are
+   Observers of a local GameEventPublisher's own event stream, which
+   does not exist in network mode). The server-score-moveslog-timer-
+   broadcast stage closed exactly this gap at the protocol level (a new
+   "STATE:" wire message carrying real score/log/elapsed-clock data);
+   this later stage is the first to actually CONSUME it client-side -
+   see that section below for the full reasoning. _EMPTY_SCORE/
+   _EMPTY_LOG (below) are KEPT, not deleted: they are still the correct
+   INITIAL value before this client's first "STATE:" broadcast ever
+   arrives (the same "correct, honest default before real data exists"
+   pattern `self.board = None` already establishes for SCOPE DECISION 4
+   below).
 3. NO GAME-OVER DETECTION: raw board-state broadcast text carries no
    explicit game-over signal (see build_snapshot_from_board's own
    docstring) - GameSnapshot.game_over is always False in network
@@ -461,6 +468,102 @@ event's own translation, since nothing today actually reads
 defender_piece_id at all (PieceAnimator ignores this whole event) -
 flagged explicitly rather than left as a silent surprise for whichever
 future consumer first reads it.
+
+SCORE / MOVE-LOG / CAPTURED-PIECES / TIMER OVER THE NETWORK (later
+stage - feature/network-side-panel-captured-pieces-timer): the server-
+score-moveslog-timer-broadcast stage (already on main) made
+server/game_server.py broadcast a "STATE:" wire message (kungfu_chess/
+notation/game_state_snapshot_wire_format.py) carrying a real
+ScoreSnapshot, a real MovesLogSnapshot, and the real, elapsed
+GameEngine.state.clock_ms - alongside (not instead of) the existing
+"EVT:"/board-text broadcasts - but nothing here ever recognized or
+parsed it: `poll_and_process`'s own dispatch only ever checked for
+EVENT_MESSAGE_PREFIX, falling through everything else (including
+"STATE:...") to `_apply_broadcast`, whose own BoardParser call fails
+silently on it (re-verified directly: a "STATE:..." line is not valid
+board text, so `error is not None` and it returns doing nothing) -
+this stage's own real broadcast was therefore being received and
+silently discarded, exactly the gap this stage closes.
+
+THE FIX - `_apply_state_snapshot`: `poll_and_process` now also checks
+`text.startswith(STATE_SNAPSHOT_MESSAGE_PREFIX)` (before falling
+through to `_apply_broadcast`, mirroring the exact same
+prefix-dispatch shape the existing EVENT_MESSAGE_PREFIX check already
+uses) and parses it via the EXISTING, unmodified
+parse_game_state_snapshot (no second parser is written - this stage's
+own explicit requirement). ALWAYS REPLACES, NEVER MERGES: re-verified
+directly against game_state_snapshot_wire_format.py and
+server/game_server.py - `_current_state_snapshot_text` reads
+`self._session.score_observer.snapshot()`/`moves_log_observer.
+snapshot()` FRESH every time it's called, and both of those methods
+already return the FULL current running score / FULL accumulated log
+(never a delta) - so every "STATE:" message this client will ever
+receive is already a complete, authoritative snapshot; `self.
+_latest_score`/`_latest_log`/`_latest_clock_ms` are therefore simply
+OVERWRITTEN on each new one, never merged/accumulated locally (there
+is nothing to merge - merging would be actively wrong, since the new
+snapshot already includes everything the old one did, plus more).
+
+SidePanelRenderer ITSELF IS COMPLETELY UNCHANGED (per this stage's own
+requirement 5) - `_run_one_frame` simply now passes `self._latest_score`/
+`self._latest_log` where it used to pass the permanently-empty
+_EMPTY_SCORE/_EMPTY_LOG module constants (still used as the correct
+INITIAL value before the first "STATE:" broadcast ever arrives).
+
+CAPTURED-PIECES DISPLAY (CapturedPiecesRenderer, kungfu_chess/client/
+ui/captured_pieces_renderer.py): derived PURELY from the SAME
+self._latest_log already being held for SidePanelRenderer - no new
+server-side tracking, no new wire data, just a second, independent
+consumer of data already present (see that module's own docstring for
+the full grouping-logic/layout reasoning). Drawn onto main_canvas
+immediately after each color's own SidePanelRenderer.render call, using
+the identical (x, width, color) triple, so it lands in the exact same
+panel region, below that panel's own Time/Move table.
+
+GAME TIMER (GameTimerRenderer, kungfu_chess/client/ui/
+game_timer_renderer.py): needs a NEW top strip of canvas space
+(TIMER_STRIP_HEIGHT) that did not exist before this stage -
+`self._board_origin_y` and `self._total_canvas_height` both grow by
+that amount. This is safe and self-contained: re-verified directly
+that CoordinateLabelRenderer/SidePanelRenderer already compute every
+one of their own drawing positions relative to the board_origin_x/y
+parameters/canvas height they are GIVEN (never a hardcoded absolute
+offset) - CoordinateLabelRenderer's own file-letter row, in particular,
+is positioned at `board_origin_y - LABEL_MARGIN + ...`, so it
+automatically shifts down along with the board by exactly
+TIMER_STRIP_HEIGHT, opening up precisely a TIMER_STRIP_HEIGHT-tall,
+previously-nonexistent band at the very top of the canvas for the
+timer to occupy, with zero changes needed to either of those two
+existing renderers. GameLoopRunner/local play is NOT touched by this
+(per requirement 5) - this canvas-layout change is local to THIS
+class's own __init__/`_run_one_frame` only.
+
+ELAPSED-TIME DISPLAY: INTERPOLATED, NOT STATIC, BETWEEN BROADCASTS
+(mirrors Stage B7.5's own established "client-local timing between
+authoritative updates" pattern, per this stage's own explicit
+suggestion to do so if interpolating): a "STATE:" broadcast only
+arrives when a MoveAccepted/JumpAccepted/PieceArrived fires (server/
+game_server.py's own broadcast trigger, re-verified directly) - during
+any real lull in play (both players thinking, no move for several
+seconds), a raw last-known clock_ms value would visibly FREEZE, which
+is wrong for a display a player expects to behave like a real running
+stopwatch. `self._latest_clock_ms_received_at` (this client's own
+`self._clock()` value at the moment the latest "STATE:" was parsed) is
+recorded alongside `self._latest_clock_ms`, and `_displayed_clock_ms()`
+adds however much of THIS CLIENT'S OWN real time has elapsed since then
+- exactly the same "no server clock synchronization needed, only
+elapsed-time measurement" principle Stage B7.5 already established for
+pixel-sliding progress (both the server's own tick loop and this
+client's own frame loop advance at real wall-clock speed, so the two
+stay closely in sync with no drift-correction logic needed; each new,
+real "STATE:" broadcast is itself the correction, simply overwriting
+whatever small interpolation error may have accumulated). Before the
+very first "STATE:" broadcast ever arrives, `self._latest_clock_ms_
+received_at` is initialized at construction time (`self._clock()`), so
+the displayed timer shows a harmless "00:00" ticking up from
+CONNECTION time, not a crash or a None-guard - the same "correct,
+honest default" treatment this class already gives `self.board = None`
+before the first board-text broadcast.
 """
 
 from __future__ import annotations
@@ -490,8 +593,10 @@ from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.client.surface.asset_cache import AssetCache
 from kungfu_chess.client.surface.img import Img
 from kungfu_chess.client.surface.img_surface import ImgSurface
+from kungfu_chess.client.ui.captured_pieces_renderer import CapturedPiecesRenderer
 from kungfu_chess.client.ui.coordinate_label_renderer import LABEL_MARGIN, CoordinateLabelRenderer
 from kungfu_chess.client.ui.cooldown_overlay_renderer import CooldownOverlayRenderer
+from kungfu_chess.client.ui.game_timer_renderer import TIMER_STRIP_HEIGHT, GameTimerRenderer
 from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH, SidePanelRenderer
 from kungfu_chess.io.board_parser import BoardParser
 from kungfu_chess.model.board import Board
@@ -502,6 +607,11 @@ from kungfu_chess.notation.game_event_wire_format import (
     EVENT_MESSAGE_PREFIX,
     MalformedGameEventWireFormatError,
     parse_game_event,
+)
+from kungfu_chess.notation.game_state_snapshot_wire_format import (
+    STATE_SNAPSHOT_MESSAGE_PREFIX,
+    MalformedGameStateSnapshotWireFormatError,
+    parse_game_state_snapshot,
 )
 from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
 from kungfu_chess.view.renderer import InFlightMotion, Renderer, build_snapshot_from_board, motion_progress
@@ -647,16 +757,34 @@ class NetworkGameLoopRunner:
         # clock, since no such shared clock exists in network mode.
         self.cooldown_tracker = CooldownTracker()
 
+        # See module docstring's "SCORE / MOVE-LOG / CAPTURED-PIECES /
+        # TIMER OVER THE NETWORK" section - the correct, honest INITIAL
+        # values before this client's first real "STATE:" broadcast
+        # ever arrives (the exact same permanently-shared-until-real-
+        # data-arrives constants this class already used as a
+        # placeholder, now genuinely overwritten by _apply_state_
+        # snapshot once real data exists).
+        self._latest_score = _EMPTY_SCORE
+        self._latest_log = _EMPTY_LOG
+        self._latest_clock_ms = 0
+        self._latest_clock_ms_received_at = self._clock()
+
         self.asset_cache = AssetCache()
 
         # See module docstring's SCOPE DECISION 6 - computed once, from
         # an assumed board size, since no real board is known yet.
+        # board_origin_y/total_canvas_height both grow by
+        # TIMER_STRIP_HEIGHT (see module docstring's "GAME TIMER"
+        # section) - a new top strip of canvas space this stage
+        # introduces, that did not exist before it.
         self._board_pixel_width = _ASSUMED_BOARD_SIZE * CELL_SIZE
         self._board_pixel_height = _ASSUMED_BOARD_SIZE * CELL_SIZE
         self._board_origin_x = PANEL_WIDTH + LABEL_MARGIN
-        self._board_origin_y = LABEL_MARGIN
+        self._board_origin_y = LABEL_MARGIN + TIMER_STRIP_HEIGHT
         self._total_canvas_width = self._board_origin_x + self._board_pixel_width + LABEL_MARGIN + PANEL_WIDTH
-        self._total_canvas_height = self._board_pixel_height + LABEL_MARGIN + LABEL_MARGIN
+        self._total_canvas_height = (
+            self._board_pixel_height + LABEL_MARGIN + LABEL_MARGIN + TIMER_STRIP_HEIGHT
+        )
 
         if not headless:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -743,6 +871,58 @@ class NetworkGameLoopRunner:
             return
 
         self._log_resync_mismatch(board)
+
+    def _apply_state_snapshot(self, text: str) -> None:
+        """Parse one raw "STATE:" broadcast (kungfu_chess/notation/
+        game_state_snapshot_wire_format.py) and REPLACE this runner's
+        held score/log/elapsed-clock state with it wholesale - see
+        module docstring's "SCORE / MOVE-LOG / CAPTURED-PIECES / TIMER
+        OVER THE NETWORK" section for the full reasoning behind why
+        this is always a replacement, never a merge (every "STATE:"
+        message is already a complete, authoritative snapshot).
+
+        Args:
+            text: The raw broadcast text - already confirmed by the
+                caller (poll_and_process) to start with
+                STATE_SNAPSHOT_MESSAGE_PREFIX.
+
+        Returns:
+            None.
+
+        A malformed message is silently ignored - matching this
+        project's "malformed input never crashes the process"
+        convention (see _apply_broadcast's/_apply_wire_event's own
+        identical policy); a real, running server never actually
+        produces one.
+        """
+
+        try:
+            score, log, clock_ms = parse_game_state_snapshot(text)
+        except MalformedGameStateSnapshotWireFormatError:
+            return
+
+        self._latest_score = score
+        self._latest_log = log
+        self._latest_clock_ms = clock_ms
+        self._latest_clock_ms_received_at = self._clock()
+
+    def _displayed_clock_ms(self) -> int:
+        """The elapsed game time to actually SHOW right now - the last
+        known server-authoritative value, plus however much of this
+        CLIENT's OWN real time has elapsed since it was received - see
+        module docstring's "ELAPSED-TIME DISPLAY" section for the full
+        reasoning (mirrors Stage B7.5's own client-local-interpolation
+        pattern, applied here to a running clock instead of a pixel
+        slide).
+
+        Returns:
+            An int, always >= self._latest_clock_ms (real elapsed time
+            can only ever move forward between broadcasts, never
+            backward).
+        """
+
+        elapsed_since_received_ms = int((self._clock() - self._latest_clock_ms_received_at) * 1000)
+        return self._latest_clock_ms + elapsed_since_received_ms
 
     def _log_resync_mismatch(self, resync_board: Board) -> None:
         """Compare `resync_board` (freshly parsed from a LATER
@@ -1108,16 +1288,23 @@ class NetworkGameLoopRunner:
             None.
 
         Dispatches each raw message by its own distinct prefix (Stage
-        B7 - see kungfu_chess/notation/game_event_wire_format.py's own
-        docstring for why a wire-format event message can never be
-        confused with a board-text broadcast, or vice versa): a wire
-        event goes to _apply_wire_event, everything else to the
-        pre-existing _apply_broadcast.
+        B7 / server-score-moveslog-timer-broadcast - see
+        kungfu_chess/notation/game_event_wire_format.py's and
+        kungfu_chess/notation/game_state_snapshot_wire_format.py's own
+        docstrings for why neither wire-format message can ever be
+        confused with each other or with a board-text broadcast): a
+        wire event goes to _apply_wire_event, a state snapshot goes to
+        _apply_state_snapshot (this stage's own addition - see module
+        docstring's "SCORE / MOVE-LOG / CAPTURED-PIECES / TIMER OVER
+        THE NETWORK" section), everything else to the pre-existing
+        _apply_broadcast.
         """
 
         for text in self.network_client.poll_incoming():
             if text.startswith(EVENT_MESSAGE_PREFIX):
                 self._apply_wire_event(text)
+            elif text.startswith(STATE_SNAPSHOT_MESSAGE_PREFIX):
+                self._apply_state_snapshot(text)
             else:
                 self._apply_broadcast(text)
 
@@ -1244,18 +1431,33 @@ class NetworkGameLoopRunner:
         board_height = self.board.height if self.board is not None else _ASSUMED_BOARD_SIZE
         CoordinateLabelRenderer(main_canvas).render(board_width, board_height, self._board_origin_x, self._board_origin_y)
 
-        # Empty placeholder score/log - see module docstring's SCOPE
-        # DECISION 2.
+        # Real, server-authoritative score/log (see module docstring's
+        # "SCORE / MOVE-LOG / CAPTURED-PIECES / TIMER OVER THE NETWORK"
+        # section) - SidePanelRenderer itself is completely unchanged;
+        # only the data fed to it changed, from the permanently-empty
+        # placeholders to whatever the latest real "STATE:" broadcast
+        # last set. CapturedPiecesRenderer draws immediately after each
+        # color's own panel, in the exact same (x, width, color) region,
+        # deriving its own display purely from the SAME self._latest_log.
+        right_panel_x = self._total_canvas_width - PANEL_WIDTH
         SidePanelRenderer(main_canvas).render(
-            x=0, width=PANEL_WIDTH, color=Color.WHITE, score=_EMPTY_SCORE, log=_EMPTY_LOG
+            x=0, width=PANEL_WIDTH, color=Color.WHITE, score=self._latest_score, log=self._latest_log
+        )
+        CapturedPiecesRenderer(main_canvas, self.asset_cache).render(
+            x=0, width=PANEL_WIDTH, color=Color.WHITE, log=self._latest_log
         )
         SidePanelRenderer(main_canvas).render(
-            x=self._total_canvas_width - PANEL_WIDTH,
-            width=PANEL_WIDTH,
-            color=Color.BLACK,
-            score=_EMPTY_SCORE,
-            log=_EMPTY_LOG,
+            x=right_panel_x, width=PANEL_WIDTH, color=Color.BLACK, score=self._latest_score, log=self._latest_log
         )
+        CapturedPiecesRenderer(main_canvas, self.asset_cache).render(
+            x=right_panel_x, width=PANEL_WIDTH, color=Color.BLACK, log=self._latest_log
+        )
+
+        # Real, server-authoritative elapsed game time (interpolated
+        # between broadcasts - see module docstring's "ELAPSED-TIME
+        # DISPLAY" section), centered above the board region.
+        timer_x = self._board_origin_x + self._board_pixel_width // 2 - 40
+        GameTimerRenderer(main_canvas).render(self._displayed_clock_ms(), x=timer_x)
 
         if self._headless:
             return
