@@ -156,6 +156,7 @@ every click, so no setter method needs to be added to it).
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import cv2
@@ -180,6 +181,11 @@ from kungfu_chess.view.renderer import Renderer, build_snapshot_from_board
 DEFAULT_WINDOW_NAME = "Kung Fu Chess (network)"
 QUIT_KEY = "q"
 CANVAS_BACKGROUND_COLOR = (0, 0, 0)
+
+# TEMPORARY debug instrumentation - see game_loop.py's own identical
+# flag/docstring note; applied identically here per this fix's own
+# requirement to fix both runners the same way.
+_DEBUG_CLICKS = bool(os.environ.get("KF_CHESS_DEBUG_CLICKS"))
 
 # See module docstring's SCOPE DECISION 6 - the only board size
 # GameSession has ever produced, used purely to size the canvas before
@@ -267,6 +273,27 @@ class NetworkGameLoopRunner:
         self.mouse_adapter = MouseAdapter(mapper, self.click_controller)
         if not headless:
             self.mouse_adapter.attach(window_name)
+            if _DEBUG_CLICKS:
+                self._attach_debug_mouse_callback(window_name)
+
+    def _attach_debug_mouse_callback(self, window_name: str) -> None:
+        """TEMPORARY debug instrumentation (KF_CHESS_DEBUG_CLICKS) -
+        identical mechanism to GameLoopRunner's own (see that class's
+        own docstring for the full reasoning)."""
+
+        def debug_mouse_event(event, x, y, flags, param) -> None:
+            self.mouse_adapter.on_mouse_event(event, x, y, flags, param)
+            if event == cv2.EVENT_LBUTTONDOWN:
+                mapper = self.mouse_adapter._mapper
+                image_position = mapper.to_image(x, y)
+                print(
+                    f"[KF_DEBUG click] raw_screen=({x},{y}) "
+                    f"mapper_origin={mapper.window_origin} mapper_scale={mapper.window_scale:.6f} "
+                    f"image_position=({image_position.x:.2f},{image_position.y:.2f}) "
+                    f"selected_cell={self.click_controller.selected}"
+                )
+
+        cv2.setMouseCallback(window_name, debug_mouse_event)
 
     def _apply_broadcast(self, text: str) -> None:
         """Parse one raw board-state broadcast and update both this
@@ -389,6 +416,12 @@ class NetworkGameLoopRunner:
         scale, origin_x, origin_y = compute_fit_scale_and_origin(
             self._total_canvas_width, self._total_canvas_height, actual_width, actual_height
         )
+        if _DEBUG_CLICKS:
+            print(
+                f"[KF_DEBUG frame] window_rect=({_actual_x},{_actual_y},{actual_width},{actual_height}) "
+                f"canvas=({self._total_canvas_width},{self._total_canvas_height}) "
+                f"scale={scale:.6f} origin=({origin_x:.3f},{origin_y:.3f})"
+            )
         if scale > 0:
             self.mouse_adapter._mapper = ScreenToImageMapper(
                 window_origin=(round(origin_x), round(origin_y)), window_scale=scale

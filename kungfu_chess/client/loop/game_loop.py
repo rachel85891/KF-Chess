@@ -407,6 +407,7 @@ written for).
 
 from __future__ import annotations
 
+import os
 import time
 
 import cv2
@@ -440,6 +441,14 @@ from kungfu_chess.view.renderer import Renderer, build_snapshot
 
 DEFAULT_WINDOW_NAME = "Kung Fu Chess"
 QUIT_KEY = "q"
+
+# TEMPORARY debug instrumentation for investigating the resizable-
+# window click-mapping bug (fix/resizable-window-click-mapping-bug) -
+# gated behind an env var so it never fires by default; see this
+# file's own "RESIZABLE WINDOW" docstring section for why this exists
+# and what it logs. To be removed or left permanently gated once the
+# investigation concludes.
+_DEBUG_CLICKS = bool(os.environ.get("KF_CHESS_DEBUG_CLICKS"))
 
 # Pure black backdrop for the reference image's redesigned layout
 # (Stage 15 - was a dark navy-brown approximation in Stage 13c; the
@@ -587,6 +596,8 @@ class GameLoopRunner:
         self.mouse_adapter = MouseAdapter(mapper, self.controller, on_jump_requested=self._request_jump)
         if not headless:
             self.mouse_adapter.attach(window_name)
+            if _DEBUG_CLICKS:
+                self._attach_debug_mouse_callback(window_name)
 
         # Played exactly once, HERE - the end of __init__ - not inside
         # run() or _run_one_frame. See module docstring's "SOUND
@@ -599,6 +610,32 @@ class GameLoopRunner:
         # semantically correct AND the only practically testable place
         # for a true "exactly once, at construction" event.
         self.sound_manager.play_game_start()
+
+    def _attach_debug_mouse_callback(self, window_name: str) -> None:
+        """TEMPORARY debug instrumentation (KF_CHESS_DEBUG_CLICKS) for
+        investigating the resizable-window click-mapping bug - wraps
+        the real mouse callback to log the raw screen coordinates, the
+        mapper actually used to resolve THIS click, the resulting
+        image position, and the resolved selection - without modifying
+        MouseAdapter/ScreenToImageMapper/Controller at all (re-
+        registers the cv2 callback AFTER MouseAdapter.attach already
+        did, so this wrapper becomes the one cv2 actually invokes, and
+        it forwards to the real mouse_adapter.on_mouse_event itself).
+        """
+
+        def debug_mouse_event(event, x, y, flags, param) -> None:
+            self.mouse_adapter.on_mouse_event(event, x, y, flags, param)
+            if event == cv2.EVENT_LBUTTONDOWN:
+                mapper = self.mouse_adapter._mapper
+                image_position = mapper.to_image(x, y)
+                print(
+                    f"[KF_DEBUG click] raw_screen=({x},{y}) "
+                    f"mapper_origin={mapper.window_origin} mapper_scale={mapper.window_scale:.6f} "
+                    f"image_position=({image_position.x:.2f},{image_position.y:.2f}) "
+                    f"selected_cell={self.controller.selected}"
+                )
+
+        cv2.setMouseCallback(window_name, debug_mouse_event)
 
     def _mark_game_over(self) -> None:
         """The _GameOverListener's callback - kept as its own tiny
@@ -725,6 +762,12 @@ class GameLoopRunner:
         scale, origin_x, origin_y = compute_fit_scale_and_origin(
             self._total_canvas_width, self._total_canvas_height, actual_width, actual_height
         )
+        if _DEBUG_CLICKS:
+            print(
+                f"[KF_DEBUG frame] window_rect=({_actual_x},{_actual_y},{actual_width},{actual_height}) "
+                f"canvas=({self._total_canvas_width},{self._total_canvas_height}) "
+                f"scale={scale:.6f} origin=({origin_x:.3f},{origin_y:.3f})"
+            )
         if scale > 0:
             self.mouse_adapter._mapper = ScreenToImageMapper(
                 window_origin=(round(origin_x), round(origin_y)), window_scale=scale
