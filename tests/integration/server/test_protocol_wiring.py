@@ -209,6 +209,138 @@ def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid
     asyncio.run(scenario())
 
 
+def test_legal_jump_from_correct_color_client_is_accepted_and_a_later_jump_landed_is_broadcast():
+    async def scenario():
+        async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
+            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.recv()  # assigned_color
+                await client2.recv()
+                await client1.recv()  # join-time board state
+                await client2.recv()
+
+                # White's own a-file rook, its own starting square.
+                await client1.send("JWRa1")
+
+                # JumpAccepted's own wire event (no board-text follows
+                # a JumpAccepted specifically - re-verified directly,
+                # _on_game_event's own board-text broadcast fires for
+                # every one of _BROADCAST_EVENT_TYPES regardless, so one
+                # board-text snapshot is still sent right after, exactly
+                # mirroring a move's own accepted-event pair).
+                jump_accepted_wire = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+
+                assert "JUMP" in jump_accepted_wire
+
+                # Real wait for the tick loop to advance real time past
+                # the jump's own real airborne duration - the landing's
+                # own wire event, then its own board-text snapshot.
+                jump_landed_wire = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # JumpLanded wire
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+
+        assert "LANDED" in jump_landed_wire
+
+    asyncio.run(scenario())
+
+
+def test_jump_command_with_wrong_color_prefix_for_the_connection_is_rejected():
+    async def scenario():
+        async with _running_game_server() as (uri, _game_server):
+            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.recv()  # client1 is White
+                await client2.recv()  # client2 is Black
+                await client1.recv()  # join-time board state
+                await client2.recv()
+
+                # client1 IS White, but claims to jump as Black here.
+                await client1.send("JBRa8")
+                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+
+                assert "wrong_color" in rejection
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client2.recv(), timeout=0.3)
+
+    asyncio.run(scenario())
+
+
+def test_jump_command_for_a_cell_not_matching_the_claimed_piece_is_rejected():
+    async def scenario():
+        async with _running_game_server() as (uri, _game_server):
+            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.recv()
+                await client2.recv()
+                await client1.recv()
+                await client2.recv()
+
+                # a1 is really a Rook, not a Queen - piece_mismatch.
+                await client1.send("JWQa1")
+                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+
+                assert "piece_mismatch" in rejection
+
+    asyncio.run(scenario())
+
+
+def test_malformed_jump_command_does_not_crash_the_server_which_keeps_accepting_valid_commands():
+    async def scenario():
+        async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
+            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.recv()
+                await client2.recv()
+                await client1.recv()
+                await client2.recv()
+
+                await client1.send("J")  # far too short to be a real jump command
+                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                assert "rejected" in rejection
+
+                # The server process itself must still be healthy
+                # afterward - proven by a real, subsequent legal jump
+                # still working normally.
+                await client1.send("JWRa1")
+                jump_accepted_wire = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+
+        assert "JUMP" in jump_accepted_wire
+
+    asyncio.run(scenario())
+
+
+def test_jump_rejected_by_the_real_engine_gets_a_direct_jump_rejected_response():
+    async def scenario():
+        async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
+            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.recv()
+                await client2.recv()
+                await client1.recv()
+                await client2.recv()
+
+                await client1.send("JWRa1")
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+
+                # The SAME rook is still airborne - a second jump request
+                # for it right now must be rejected by the real engine
+                # (ExtraEngine.request_jump's own is_airborne guard) -
+                # this specific outcome has no game event of its own (see
+                # module docstring), so it needs this direct response.
+                await client1.send("JWRa1")
+                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+
+                assert rejection == "rejected:jump_rejected"
+
+    asyncio.run(scenario())
+
+
 def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_further_activity():
     """Distinct from the "legal move is broadcast" test above: this one
     asserts on TIMING, not just final content - proving the broadcast

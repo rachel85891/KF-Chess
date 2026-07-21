@@ -79,6 +79,36 @@ MoveRejected event for that case, which this class's own broadcaster
 same as any other real game event - there is nothing this class needs
 to additionally send for that case.
 
+JUMP COMMAND ROUTING AND REJECTION SCHEME (later stage - jump-network-
+wiring-and-cooldown-display): incoming messages are dispatched by
+`_handle_message` based on a single, unambiguous leading-character
+check - `message[:1].upper() == JUMP_COMMAND_PREFIX` ("J") means a jump
+command (kungfu_chess/notation/jump_command.py's own "J<W|B><K|Q|R|
+B|N|P><file><rank>" grammar), anything else is handled exactly as
+before, as a move command. This can never misroute a genuine move
+command: server/move_command.py's own grammar always starts with a
+bare color letter ('W' or 'B'), never 'J' (re-verified directly against
+that module). Jump rejection reuses the EXACT SAME three "rejected:
+<reason>" tokens as moves - "malformed:<detail>" (now from
+MalformedJumpCommandError instead), "wrong_color", "piece_mismatch" -
+via a shared `_piece_matches` helper (refactored out of the old
+move-only `_piece_matches_board`, so the same one real-board check
+serves both commands rather than being duplicated) - PLUS one new
+token, "jump_rejected", for the one case moves never needed a
+direct-response token for: ExtraEngine.request_jump (re-verified
+directly, kungfu_chess/extra/extra_engine.py) returns a bare bool with
+NO reason string at all when it declines (already airborne, mid-motion,
+still on cooldown) - unlike a move's own engine-level rejection, there
+is no MoveRejected-style event GameEventPublisher publishes for a
+declined jump to broadcast instead (see event_publisher.py's own
+request_jump docstring: "there is nothing honest to put in a
+MoveRejected.reason here without inventing text ExtraEngine itself
+never produced"). Since no event exists for this class's own
+broadcaster to react to, this is the one jump-rejection case that
+genuinely needs its own direct, point-to-point response, exactly like
+the three malformed/wrong_color/piece_mismatch cases above it, rather
+than being left to the (nonexistent) event-driven path.
+
 WHY THE BROADCASTER BRIDGES A SYNC CALLBACK INTO AN ASYNC SEND:
 kungfu_chess.bus.EventBus.subscribe (Stage A1) requires a plain
 synchronous callable - `Callable[[object], None]` - and GameSession.
@@ -120,10 +150,17 @@ cadence for as long as the process lives, entirely decoupled from
 STAGE B7 - REAL WIRE-FORMAT EVENTS, ALONGSIDE (NOT INSTEAD OF) BOARD
 TEXT: `_on_game_event`'s broadcaster now also sends a structured,
 single-line wire-format message (kungfu_chess/notation/
-game_event_wire_format.py) for MoveAccepted/JumpAccepted/PieceArrived,
-immediately before the existing board-text snapshot for the same
-event - see `_broadcast_event`'s own docstring for the exact ordering
-guarantee. WHY ALONGSIDE, NOT REPLACING: the board-text broadcast is
+game_event_wire_format.py) for MoveAccepted/JumpAccepted/PieceArrived
+(and, since the jump-network-wiring-and-cooldown-display stage,
+JumpLanded too - see that module's own "JumpLanded ADDITION" docstring
+section), immediately before the existing board-text snapshot for the
+same event - see `_broadcast_event`'s own docstring for the exact
+ordering guarantee. JumpLanded needed no changes to `_on_game_event`/
+`_broadcast_event` themselves to start broadcasting correctly - only
+_BROADCAST_EVENT_TYPES (below) gained one more subscribed type, and
+format_game_event already returns real wire text for it - exactly the
+same OCP-safe extension point PromotionEvent could have used had it
+needed broadcasting too. WHY ALONGSIDE, NOT REPLACING: the board-text broadcast is
 this project's own established fallback/sanity-check safety net (every
 existing client and test already depends on receiving it) - this stage
 adds richer, structured per-motion data for a client that wants to
@@ -193,17 +230,27 @@ from typing import Dict, Optional
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
-from kungfu_chess.client.events.game_events import GameOver, JumpAccepted, MoveAccepted, MoveRejected, PieceArrived
+from kungfu_chess.client.events.game_events import (
+    GameOver,
+    JumpAccepted,
+    JumpLanded,
+    MoveAccepted,
+    MoveRejected,
+    PieceArrived,
+)
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.color import Color
+from kungfu_chess.model.piece import PieceKind
+from kungfu_chess.model.position import Position
 from kungfu_chess.notation.game_event_wire_format import format_game_event
+from kungfu_chess.notation.jump_command import JUMP_COMMAND_PREFIX, MalformedJumpCommandError, parse_jump_command
 from server.connection_manager import ConnectionManager
 from server.game_session import GameSession
-from server.move_command import MalformedCommandError, ParsedMoveCommand, parse_move_command
+from server.move_command import MalformedCommandError, parse_move_command
 
 TICK_INTERVAL_S = 1 / 30
 
-_BROADCAST_EVENT_TYPES = (MoveAccepted, JumpAccepted, MoveRejected, PieceArrived, GameOver)
+_BROADCAST_EVENT_TYPES = (MoveAccepted, JumpAccepted, JumpLanded, MoveRejected, PieceArrived, GameOver)
 
 
 class GameServer:
@@ -284,14 +331,38 @@ class GameServer:
             self._colors.pop(connection, None)
 
     async def _handle_message(self, connection: ServerConnection, assigned_color: Color, message: object) -> None:
-        """Parse and dispatch one raw move-command message from
-        `connection` - see module docstring's "MOVE COMMAND REJECTION
-        SCHEME" for the exact rejection responses this sends.
+        """Dispatch one raw incoming message from `connection` to
+        either the jump-command or move-command handler, based on a
+        single, unambiguous leading-character check - see module
+        docstring's "JUMP COMMAND ROUTING AND REJECTION SCHEME" section
+        for the full reasoning behind why this check can never
+        misroute a genuine move command.
 
         Args:
             connection: The connection `message` arrived on.
             assigned_color: The color this connection was assigned at
                 join time (see handle_connection).
+            message: The raw text (or bytes) websockets delivered.
+
+        Returns:
+            None.
+        """
+
+        if isinstance(message, str) and message[:1].upper() == JUMP_COMMAND_PREFIX:
+            await self._handle_jump_message(connection, assigned_color, message)
+            return
+
+        await self._handle_move_message(connection, assigned_color, message)
+
+    async def _handle_move_message(self, connection: ServerConnection, assigned_color: Color, message: object) -> None:
+        """Parse and dispatch one raw move-command message - see module
+        docstring's "MOVE COMMAND REJECTION SCHEME" for the exact
+        rejection responses this sends.
+
+        Args:
+            connection: The connection `message` arrived on.
+            assigned_color: The color this connection was assigned at
+                join time.
             message: The raw text (or bytes) websockets delivered.
 
         Returns:
@@ -308,7 +379,7 @@ class GameServer:
             await self._safe_send(connection, "rejected:wrong_color")
             return
 
-        if not self._piece_matches_board(parsed):
+        if not self._piece_matches(parsed.color, parsed.piece_kind, parsed.from_cell):
             # See this method's own docstring reference in the module
             # docstring: this needs a real board to check against,
             # which move_command.py deliberately has none of - so the
@@ -325,26 +396,68 @@ class GameServer:
         # either outcome.
         self._session.request_move(parsed.from_cell, parsed.to_cell)
 
-    def _piece_matches_board(self, parsed: ParsedMoveCommand) -> bool:
-        """Whether `parsed`'s claimed color/piece kind actually matches
-        what's on its own claimed source square right now - the
-        real-board check move_command.py's own docstring defers to
-        this class for.
+    async def _handle_jump_message(self, connection: ServerConnection, assigned_color: Color, message: object) -> None:
+        """Parse and dispatch one raw jump-command message - see module
+        docstring's "JUMP COMMAND ROUTING AND REJECTION SCHEME" for the
+        exact rejection responses this sends, including the one new
+        "jump_rejected" token moves never needed.
 
         Args:
-            parsed: The already-parsed command to check.
+            connection: The connection `message` arrived on.
+            assigned_color: The color this connection was assigned at
+                join time.
+            message: The raw text (or bytes) websockets delivered.
+
+        Returns:
+            None.
+        """
+
+        try:
+            parsed = parse_jump_command(message)
+        except MalformedJumpCommandError as exc:
+            await self._safe_send(connection, f"rejected:malformed:{exc}")
+            return
+
+        if parsed.color is not assigned_color:
+            await self._safe_send(connection, "rejected:wrong_color")
+            return
+
+        if not self._piece_matches(parsed.color, parsed.piece_kind, parsed.cell):
+            await self._safe_send(connection, "rejected:piece_mismatch")
+            return
+
+        accepted = self._session.request_jump(parsed.cell)
+        if not accepted:
+            # See module docstring's own "JUMP COMMAND ROUTING AND
+            # REJECTION SCHEME" section for why this is the one jump
+            # rejection case that needs a direct response here, rather
+            # than an event-driven broadcast like a move's own
+            # MoveRejected: ExtraEngine.request_jump exposes no reason
+            # string at all for this outcome.
+            await self._safe_send(connection, "rejected:jump_rejected")
+
+    def _piece_matches(self, color: Color, piece_kind: PieceKind, cell: Position) -> bool:
+        """Whether a claimed color/piece kind actually matches what's
+        on `cell` right now - the real-board check both
+        move_command.py's and jump_command.py's own docstrings defer
+        to this class for (neither pure parser has, or needs, a real
+        Board reference of its own).
+
+        Args:
+            color: The claimed color.
+            piece_kind: The claimed piece kind.
+            cell: The claimed source/own cell to check.
 
         Returns:
             True if a piece of the claimed color and kind occupies
-            parsed.from_cell right now; False otherwise (including an
-            empty source square, which also can't match any claimed
-            piece).
+            `cell` right now; False otherwise (including an empty
+            cell, which also can't match any claimed piece).
         """
 
-        piece = self._session.engine.board.piece_at(parsed.from_cell)
+        piece = self._session.engine.board.piece_at(cell)
         if piece is None:
             return False
-        return piece.color is parsed.color and piece.kind is parsed.piece_kind
+        return piece.color is color and piece.kind is piece_kind
 
     def _on_game_event(self, event: object) -> None:
         """The real EventBus subscriber (Stage A3/B2's own documented

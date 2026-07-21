@@ -10,7 +10,8 @@ suite in this project does.
 from __future__ import annotations
 
 from kungfu_chess.bus.event_bus import EventBus
-from kungfu_chess.client.events.game_events import MoveAccepted
+from kungfu_chess.client.events.game_events import JumpAccepted, JumpLanded, MoveAccepted
+from kungfu_chess.extra.jump import JUMP_DURATION_MS
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
@@ -99,6 +100,42 @@ def test_event_bus_is_a_real_eventbus_and_receives_a_real_move_accepted():
     assert received == [
         MoveAccepted(piece_id=pawn.id, from_cell=from_cell, to_cell=to_cell, duration_ms=2 * MS_PER_SQUARE)
     ]
+
+
+def test_request_jump_publishes_a_real_jump_accepted_and_later_a_real_jump_landed():
+    session = GameSession()
+    cell = Position(row=7, col=0)  # white rook, starting square
+    rook = session.engine.board.piece_at(cell)
+
+    jump_accepted_events: list = []
+    jump_landed_events: list = []
+    session.event_bus.subscribe(JumpAccepted, jump_accepted_events.append)
+    session.event_bus.subscribe(JumpLanded, jump_landed_events.append)
+
+    accepted = session.request_jump(cell)
+
+    assert accepted is True
+    assert jump_accepted_events == [
+        JumpAccepted(piece_id=rook.id, from_cell=cell, to_cell=cell, duration_ms=JUMP_DURATION_MS)
+    ]
+    assert jump_landed_events == []  # not landed yet - still airborne
+
+    session.wait(JUMP_DURATION_MS)
+
+    assert jump_landed_events == [JumpLanded(piece_id=rook.id, cell=cell)]
+
+
+def test_request_jump_on_an_empty_cell_is_rejected_and_publishes_nothing():
+    session = GameSession()
+    empty_cell = Position(row=4, col=4)
+
+    events: list = []
+    session.event_bus.subscribe(JumpAccepted, events.append)
+
+    accepted = session.request_jump(empty_cell)
+
+    assert accepted is False
+    assert events == []
 
 
 def test_two_independent_game_sessions_do_not_share_state():

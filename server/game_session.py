@@ -196,6 +196,35 @@ class GameSession:
 
         return self.publisher.request_move(from_cell, to_cell)
 
+    def request_jump(self, cell: Position) -> bool:
+        """Thin pass-through to GameEventPublisher.request_jump -
+        mirrors request_move's own reasoning exactly (see module
+        docstring's "NO CLICK/PIXEL-COORDINATE HANDLING" section).
+
+        Deliberately NOT `self.extra_engine.request_jump(cell)`
+        directly, even though that attribute already exists and
+        already has a `request_jump` method of its own (re-verified
+        directly in kungfu_chess/extra/extra_engine.py before writing
+        this): only the PUBLISHER's own request_jump also publishes a
+        real JumpAccepted (kungfu_chess/client/events/event_publisher.py,
+        re-verified directly) - calling ExtraEngine directly would
+        silently skip that publish step entirely, breaking the whole
+        event-driven broadcast chain server/game_server.py's own
+        _on_game_event subscriber depends on to ever learn a jump was
+        accepted at all.
+
+        Args:
+            cell: The Position the jumping piece currently occupies -
+                a single cell, not a from/to pair (ExtraEngine.
+                request_jump's own contract).
+
+        Returns:
+            The real bool from GameEventPublisher.request_jump,
+            unchanged.
+        """
+
+        return self.publisher.request_jump(cell)
+
     def wait(self, ms: int) -> List[ArrivalEvent]:
         """Thin pass-through to GameEventPublisher.wait.
 
