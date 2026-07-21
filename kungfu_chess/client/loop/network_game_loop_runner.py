@@ -75,37 +75,24 @@ inheritance), not a hack.
 
 SCOPE DECISIONS (Stage B6, explicit and accepted - do not
 relitigate; each is documented again at its own point of use below):
-1. SPRITE ANIMATION, BUT NOT PIXEL-POSITION INTERPOLATION (Stage B6's
-   original "NO SMOOTH ANIMATION" gap, PARTIALLY closed by Stage B7 -
-   see "STAGE B7 - REAL EVENT-DRIVEN ANIMATION" below for the full
-   reasoning on exactly what changed and, just as importantly, what
-   deliberately did NOT): a real PieceAnimatorRegistry now runs in
-   network mode, reacting to real, translated MoveAccepted/JumpAccepted/
-   PieceArrived events - a piece's SPRITE now genuinely transitions
-   idle -> move/jump -> idle, the same live per-frame walk-cycle
-   GameLoopRunner's own local play already shows. What this stage does
-   NOT add: PIXEL-position interpolation (a piece visibly sliding,
-   pixel-by-pixel, between two cells while its motion is in flight) -
-   that is build_snapshot's own SEPARATE mechanism (kungfu_chess/view/
-   renderer.py), driven by a local GameEngine's RealTimeArbiter.
-   active_motions()/engine.state.clock_ms, neither of which this class
-   has or is permitted to add this stage (see "Do NOT modify
-   PieceAnimatorRegistry, PieceAnimator, GameLoopRunner, or Controller"
-   in this stage's own task, which - by naming only NetworkGameLoopRunner
-   and the server's broadcaster as gaining new capability - implicitly
-   also excludes renderer.py/build_snapshot_from_board from this
-   stage's scope). Net effect: a piece's on-screen POSITION still
-   updates in one discrete jump, exactly when the next board-text
-   resync (or, more precisely now, the next successfully-translated
-   PieceArrived - see "STAGE B7" below) updates its logical cell -
-   but for the FULL DURATION of that motion, its SPRITE already shows
-   real move/jump animation frames, not a frozen idle pose. This is a
-   real, honest, deliberately-scoped gap, not an oversight - closing it
-   fully would require either giving NetworkGameLoopRunner its own
-   client-side Motion-interpolation mechanism (duplicating
-   RealTimeArbiter's own job) or extending build_snapshot_from_board
-   itself (out of this stage's own explicit scope) - left to a future
-   stage.
+1. SPRITE ANIMATION, AND (as of Stage B7.5) PIXEL-POSITION
+   INTERPOLATION TOO (Stage B6's original "NO SMOOTH ANIMATION" gap,
+   closed in two parts - Stage B7 first, Stage B7.5 completing it -
+   see "STAGE B7 - REAL EVENT-DRIVEN ANIMATION" and "STAGE B7.5 -
+   CLIENT-SIDE PIXEL SLIDING" below for the full reasoning): a real
+   PieceAnimatorRegistry runs in network mode, reacting to real,
+   translated MoveAccepted/JumpAccepted/PieceArrived events - a
+   piece's SPRITE genuinely transitions idle -> move/jump -> idle
+   (Stage B7). As of Stage B7.5, a piece's on-screen POSITION also
+   genuinely slides, pixel-by-pixel, between its from_cell and to_cell
+   for the real duration of its motion - see "STAGE B7.5" below for
+   how this is computed without a local GameEngine/RealTimeArbiter at
+   all (this class still has neither, and still isn't permitted to
+   gain one - Stage B7.5's own task is explicit that
+   PieceAnimatorRegistry/PieceAnimator/GameLoopRunner/Controller stay
+   completely untouched; only this class and kungfu_chess/view/
+   renderer.py's build_snapshot_from_board gain new capability this
+   stage).
 2. NO SCORE/MOVES-LOG TRACKING: SidePanelRenderer is still reused (per
    this stage's own "reuse existing rendering pieces" requirement), but
    fed a permanently-empty ScoreSnapshot (0-0) and MovesLogSnapshot (no
@@ -279,13 +266,95 @@ auto-corrected - the same category of "documented, accepted gap for a
 genuinely rare edge case" this codebase already applies elsewhere
 (e.g. SCOPE DECISION 4's own pre-existing "no initial state on join"
 gap, before that was separately fixed at the protocol level).
+
+STAGE B7.5 - CLIENT-SIDE PIXEL SLIDING: Stage B7 above wired real
+SPRITE-state animation but left a piece's on-screen POSITION snapping
+in one discrete jump on arrival (see SCOPE DECISION 1). This stage
+closes that gap using data Stage B7 ALREADY transmits over the wire
+but previously discarded after only feeding it to
+piece_animator_registry: every MoveAccepted/JumpAccepted already
+carries from_cell/to_cell/duration_ms.
+
+WHY THE CLIENT'S OWN REAL WALL-CLOCK TIME IS SUFFICIENT, WITH NO
+SERVER CLOCK SYNCHRONIZATION NEEDED (the central design decision this
+stage rests on): build_snapshot's own local-play interpolation
+(kungfu_chess/view/renderer.py) computes progress from a SHARED
+clock - one process's single GameEngine.state.clock_ms, read by both
+the code that STARTED the motion and the code that later RENDERS it,
+so there is only ever one clock in play. Network play has no shared
+clock at all - but it doesn't need one: a linear slide only needs to
+know two things, "where did it start, where does it end" (from_cell/
+to_cell, transmitted exactly) and "how long should the whole slide
+visually last" (duration_ms, transmitted exactly, computed
+server-side from real board distance and PIECE_SPEED - docs/spec.md
+§10). Given those, this class can independently measure its OWN
+elapsed time since IT received the MoveAccepted/JumpAccepted (via
+`self._clock()` - see below), and produce a progress fraction that
+reaches exactly 1.0 after exactly duration_ms of THIS CLIENT'S OWN
+real time has passed - visually indistinguishable from a
+synchronized-clock computation, modulo one real, honestly-accepted
+effect: the slide's own START is delayed by however long the
+MoveAccepted message itself took to travel over the network (real,
+typically single-digit-to-low-double-digit milliseconds on a LAN/
+localhost) - the slide is a beat LATE, never desynchronized in
+DURATION or DIRECTION. This is an accepted simplification, not a
+compromise the task asks to remove: no server timestamp is
+transmitted, and none is needed for a visually correct slide.
+
+`self._clock` IS INJECTABLE (a `Callable[[], float]`, defaulting to
+`time.perf_counter` - this project's own established real-elapsed-time
+convention, e.g. GameLoopRunner.run/GameServer.run_tick_loop, used here
+in place of the task's own example `time.monotonic()` for that
+consistency) - purely so tests can supply a controllable, fake time
+source (a plain object with a settable `.value` the test bumps
+directly) instead of a real `time.sleep`, mirroring this codebase's
+general "inject the thing that varies" convention (e.g.
+GameEventPublisher's own `ordering_policy`, `event_bus` parameters) -
+not a new pattern invented for this stage alone.
+
+CLIENT-SIDE MOTION TRACKING (`self._active_motions: Dict[int,
+_ClientMotion]`, keyed by CLIENT-LOCAL piece_id - the SAME id space
+`self._server_piece_cache`/`piece_animator_registry` already use, per
+Stage B7's own translation work): populated in
+_handle_move_or_jump_accepted (right alongside the existing
+piece_animator_registry.on_event forwarding - same translated piece,
+same from_cell/to_cell/duration_ms, just also recorded for rendering
+purposes), and removed in _handle_piece_arrived the moment that
+piece's own arrival is processed - a piece with no entry renders
+statically at its own board cell (build_snapshot_from_board's own
+existing, unchanged default), exactly matching how a piece that just
+arrived should look: parked at its real, final position.
+
+SRP - THIS TRACKING DOES NOT DUPLICATE OR CONFLICT WITH
+piece_animator_registry: the two run independently, side by side,
+tracking entirely different data for entirely different consumers -
+`_active_motions` holds ONLY timing/position data
+(from_cell/to_cell/duration_ms/started_at), consumed once per frame by
+_compute_motions_for_rendering to produce pixel positions for
+ImgSurface/Renderer; piece_animator_registry holds ONLY sprite/
+animation-state data (idle/move/jump/frame-index), consumed by
+ImgSurface to pick which sprite image to draw. Neither reads the
+other's data at all - exactly the same "two independent, side-by-side
+mechanisms" shape build_snapshot/PieceAnimatorRegistry already have
+for local play (re-verified directly: build_snapshot's own in-flight
+interpolation and PieceAnimatorRegistry's own on_event/advance_all
+share no data or calls between them there either).
+
+_compute_motions_for_rendering is its own, separately-callable method
+(not inlined into _run_one_frame) specifically so it can be unit-
+tested directly, with an injected fake clock, without needing to
+drive the whole render pipeline (cv2/Img/ImgSurface) at all - the same
+"separate the logic from the loop/window shell around it" principle
+this codebase already applies everywhere else (e.g. GameLoopRunner's
+own _run_one_frame extracted from run() for the identical reason).
 """
 
 from __future__ import annotations
 
 import os
 import time
-from typing import Dict, Optional, Union
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Union
 
 import cv2
 
@@ -313,7 +382,7 @@ from kungfu_chess.notation.game_event_wire_format import (
     parse_game_event,
 )
 from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
-from kungfu_chess.view.renderer import Renderer, build_snapshot_from_board
+from kungfu_chess.view.renderer import InFlightMotion, Renderer, build_snapshot_from_board, motion_progress
 
 DEFAULT_WINDOW_NAME = "Kung Fu Chess (network)"
 QUIT_KEY = "q"
@@ -346,11 +415,36 @@ class ConnectionRejectedError(NetworkGameLoopRunnerError):
     None return for this exact case)."""
 
 
+@dataclass(frozen=True)
+class _ClientMotion:
+    """One piece's client-side-tracked in-flight motion - see module
+    docstring's "STAGE B7.5 - CLIENT-SIDE PIXEL SLIDING" section for
+    the full reasoning. Real wall-clock timing data recorded when this
+    client's own MoveAccepted/JumpAccepted translation succeeds (see
+    _handle_move_or_jump_accepted); consumed every frame by
+    _compute_motions_for_rendering to produce a real, clamped progress
+    fraction (via renderer.motion_progress) and, from that, a real
+    interpolated pixel position (via renderer.interpolate_cell_pixel,
+    inside build_snapshot_from_board). Removed the moment the matching
+    PieceArrived is processed (see _handle_piece_arrived)."""
+
+    from_cell: Position
+    to_cell: Position
+    duration_ms: int
+    started_at: float
+
+
 class NetworkGameLoopRunner:
     """The network-mode composition root - see module docstring for
     the full reasoning behind every decision below."""
 
-    def __init__(self, uri: str, window_name: str = DEFAULT_WINDOW_NAME, headless: bool = False) -> None:
+    def __init__(
+        self,
+        uri: str,
+        window_name: str = DEFAULT_WINDOW_NAME,
+        headless: bool = False,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
         """Connect to `uri`, learn this client's assigned color, and
         wire every reused rendering/input component around it - see
         module docstring for the full reasoning.
@@ -366,6 +460,17 @@ class NetworkGameLoopRunner:
                 class's own docstring for the full reasoning, which
                 applies here unchanged: cv2 GUI calls abort the whole
                 process on a display-less machine).
+            clock: Callable returning the current time as a float
+                (Stage B7.5) - defaults to time.perf_counter (this
+                project's own established real-elapsed-time
+                convention). Injectable (DIP) purely so tests can
+                supply a controllable, fake time source instead of a
+                real sleep - see module docstring's "STAGE B7.5"
+                section for the full reasoning. Only ever used for
+                measuring ELAPSED time (a later self._clock() call
+                minus an earlier one) - never compared against any
+                absolute/wall-clock meaning, so any monotonically
+                comparable float source works.
 
         Returns:
             None.
@@ -378,6 +483,7 @@ class NetworkGameLoopRunner:
         self._headless = headless
         self._window_name = window_name
         self._quit_requested = False
+        self._clock = clock
 
         self.network_client = NetworkGameClient()
         self.assigned_color = self.network_client.connect(uri)
@@ -404,6 +510,12 @@ class NetworkGameLoopRunner:
         # piece_animator_registry.on_event.
         self.piece_animator_registry: Optional[PieceAnimatorRegistry] = None
         self._server_piece_cache: Dict[int, Piece] = {}
+
+        # Stage B7.5 - see module docstring's "STAGE B7.5 - CLIENT-SIDE
+        # PIXEL SLIDING" section for the full reasoning. Keyed by
+        # CLIENT-LOCAL piece_id, the same id space
+        # piece_animator_registry/_server_piece_cache already use.
+        self._active_motions: Dict[int, _ClientMotion] = {}
 
         self.asset_cache = AssetCache()
 
@@ -603,11 +715,13 @@ class NetworkGameLoopRunner:
             self._handle_piece_arrived(event)
 
     def _handle_move_or_jump_accepted(self, event: Union[MoveAccepted, JumpAccepted]) -> None:
-        """Translate a real MoveAccepted/JumpAccepted's server piece_id
-        and forward a reconstructed, client-local copy of it to
+        """Translate a real MoveAccepted/JumpAccepted's server piece_id,
+        forward a reconstructed, client-local copy of it to
         piece_animator_registry.on_event - the exact same method
         GameLoopRunner's own local publisher subscription calls it
-        with (see module docstring's "STAGE B7" section).
+        with (see module docstring's "STAGE B7" section) - and record
+        it as an active client-side motion for pixel-position rendering
+        (Stage B7.5 - see module docstring's "STAGE B7.5" section).
 
         Args:
             event: The real, wire-parsed MoveAccepted or JumpAccepted.
@@ -621,8 +735,9 @@ class NetworkGameLoopRunner:
         until its own later PieceArrived (see _handle_piece_arrived).
         A translation failure (see _translate_piece) or no
         piece_animator_registry yet (self.board itself still None) is
-        a safe, silent no-op - this event's own animation transition is
-        simply skipped (module docstring's own documented, narrow gap).
+        a safe, silent no-op - this event's own animation transition
+        (AND its own pixel-sliding motion) is simply skipped (module
+        docstring's own documented, narrow gap).
         """
 
         piece = self._translate_piece(event.piece_id, event.from_cell)
@@ -634,13 +749,21 @@ class NetworkGameLoopRunner:
         )
         self.piece_animator_registry.on_event(translated)
 
+        self._active_motions[piece.id] = _ClientMotion(
+            from_cell=event.from_cell, to_cell=event.to_cell, duration_ms=event.duration_ms, started_at=self._clock()
+        )
+
     def _handle_piece_arrived(self, event: PieceArrived) -> None:
         """Translate a real PieceArrived's server piece_id, apply its
         real position change directly onto self.board (in place,
         preserving every Piece's identity/id - see module docstring's
-        "PROBLEM 2"/"RECONCILIATION POLICY" section), and forward a
+        "PROBLEM 2"/"RECONCILIATION POLICY" section), forward a
         reconstructed, client-local copy of the event to
-        piece_animator_registry.on_event.
+        piece_animator_registry.on_event, and remove this piece's
+        active client-side motion, if any (Stage B7.5 - see module
+        docstring's "STAGE B7.5" section): this piece is no longer in
+        flight, so it now renders statically at its own (just-updated)
+        board cell again, exactly like every other non-moving piece.
 
         Args:
             event: The real, wire-parsed PieceArrived.
@@ -651,11 +774,15 @@ class NetworkGameLoopRunner:
         A translation failure (see _translate_piece - the documented,
         narrow "joined mid-motion" gap) or self.board still being None
         is a safe, silent no-op: neither self.board nor
-        piece_animator_registry is touched for this event at all -
-        that specific piece's position will only ever be caught by a
-        later _log_resync_mismatch diagnostic, never silently
-        auto-corrected (see module docstring for why this is an
-        accepted trade-off, not an oversight).
+        piece_animator_registry nor self._active_motions is touched
+        for this event at all - that specific piece's position will
+        only ever be caught by a later _log_resync_mismatch
+        diagnostic, never silently auto-corrected (see module
+        docstring for why this is an accepted trade-off, not an
+        oversight). A piece with no active motion entry at all (e.g.
+        its own MoveAccepted was itself never successfully recorded)
+        makes this removal a harmless no-op too (dict.pop's own
+        default).
 
         captured_piece_id translation is best-effort only: if the
         captured piece's own server_piece_id was never itself observed
@@ -673,6 +800,8 @@ class NetworkGameLoopRunner:
         if self.board.piece_at(event.cell) is not None:
             self.board.remove_piece(event.cell)
         self.board.move_piece(piece.cell, event.cell)
+
+        self._active_motions.pop(piece.id, None)
 
         captured_piece = None if event.captured_piece_id is None else self._server_piece_cache.get(event.captured_piece_id)
         translated = PieceArrived(
@@ -717,20 +846,53 @@ class NetworkGameLoopRunner:
             None.
 
         Measures real wall-clock delta_ms exactly like GameLoopRunner's
-        own run() (time.perf_counter() before/after each iteration) -
-        Stage B7 needs this real value to drive
+        own run() (time.perf_counter() before/after each iteration,
+        here via self._clock() - see __init__'s own docstring for why
+        this is injectable) - Stage B7 needs this real value to drive
         piece_animator_registry.advance_all in _run_one_frame; before
         Stage B7 no per-frame timing was needed at all in network mode.
         """
 
-        last_time = time.perf_counter()
+        last_time = self._clock()
         while not self._should_exit():
-            now = time.perf_counter()
+            now = self._clock()
             delta_ms = int((now - last_time) * 1000)
             last_time = now
             self._run_one_frame(delta_ms)
 
         self.close()
+
+    def _compute_motions_for_rendering(self) -> Dict[int, InFlightMotion]:
+        """Compute a real, clamped progress fraction for every active
+        client-side motion, from this client's own real elapsed time
+        since it received that motion's own MoveAccepted/JumpAccepted
+        (Stage B7.5 - see module docstring's "STAGE B7.5" section for
+        the full reasoning, including why no server clock sync is
+        needed).
+
+        Returns:
+            {piece_id: InFlightMotion(from_cell, to_cell, progress)}
+            for every entry currently in self._active_motions - ready
+            to pass directly as build_snapshot_from_board's own
+            `active_motions` argument. Empty (not None) when no motion
+            is active - build_snapshot_from_board already treats an
+            empty dict identically to None (every piece renders
+            statically), so this method never needs to special-case
+            "nothing in flight" itself.
+
+        Extracted as its own method (not inlined into _run_one_frame)
+        specifically so it can be unit-tested directly, with an
+        injected fake self._clock, without needing to drive the whole
+        render pipeline (cv2/Img/ImgSurface) at all.
+        """
+
+        now = self._clock()
+        motions: Dict[int, InFlightMotion] = {}
+        for piece_id, motion in self._active_motions.items():
+            elapsed_ms = int((now - motion.started_at) * 1000)
+            progress = motion_progress(elapsed_ms, motion.duration_ms)
+            motions[piece_id] = InFlightMotion(from_cell=motion.from_cell, to_cell=motion.to_cell, progress=progress)
+        return motions
 
     def _run_one_frame(self, delta_ms: int = 0) -> None:
         """Run exactly one iteration: poll+apply new broadcasts, advance
@@ -771,7 +933,11 @@ class NetworkGameLoopRunner:
         surface = ImgSurface(board_canvas, self.asset_cache, self.piece_animator_registry)
 
         if self.board is not None:
-            snapshot = build_snapshot_from_board(self.board, selected=self.click_controller.selected)
+            snapshot = build_snapshot_from_board(
+                self.board,
+                selected=self.click_controller.selected,
+                active_motions=self._compute_motions_for_rendering(),
+            )
             Renderer(surface).render(snapshot)
         else:
             # No board known yet at all (SCOPE DECISION 4) - draw an
