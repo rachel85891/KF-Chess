@@ -111,6 +111,7 @@ from typing import Callable, List, Optional, Protocol, Sequence
 
 from kungfu_chess.bus.event_bus import EventBus
 from kungfu_chess.client.events.game_events import (
+    AttackerIntercepted,
     GameOver,
     JumpAccepted,
     JumpLanded,
@@ -347,11 +348,23 @@ class GameEventPublisher:
         in one call. This is also what actually makes JUMP landing/
         interception happen at all (see module docstring) - without
         this, an accepted jump would start but never resolve.
-        interception_events (ExtraEngine.wait's first return value) is
-        deliberately not turned into a published event here - out of
-        this stage's JUMP-only scope; a future stage can add an
-        InterceptionEvent-style event the same way this one adds
-        JumpAccepted. `promoted` (ExtraEngine.wait's fourth return
+        `interception_events` (ExtraEngine.wait's first return value,
+        now turned into a published event - closes the gap JumpLanded's
+        own docstring already flagged, "InterceptionEvent, not yet
+        published as a client event") becomes one AttackerIntercepted
+        per interception, the exact same pattern `landing_events`
+        already established for JumpLanded below: piece/cell (and,
+        here, defender) fields are read directly off the real,
+        model-layer InterceptionEvent and repackaged as a client-layer
+        dataclass - no new publishing mechanism, no re-derivation of
+        data the model layer already computed. Placed FIRST in
+        `pending` (ahead of landing_events/arrival_events) simply
+        mirroring ExtraEngine.wait's own return-tuple order (interception_events is its first
+        element) - not because any strict chronological ordering
+        between these different event KINDS is otherwise guaranteed
+        or required (client_spec.md §10's own default ordering policy
+        is a plain FIFO over whatever this method assembles, same as
+        every other batch here). `promoted` (ExtraEngine.wait's fourth return
         value) IS now turned into a published PromotionEvent (Stage
         14) - previously discarded entirely (`_promoted`), since
         nothing consumed it before Stage 14's SoundManager needed a
@@ -376,10 +389,19 @@ class GameEventPublisher:
         why this is a NEW event type rather than a reused PieceArrived.
         """
 
-        _interception_events, landing_events, arrival_events, promoted = self._extra_engine.wait(ms)
+        interception_events, landing_events, arrival_events, promoted = self._extra_engine.wait(ms)
         promoted_piece_ids = {piece.id for piece in promoted}
 
         pending: List[object] = []
+        for interception in interception_events:
+            pending.append(
+                AttackerIntercepted(
+                    piece_id=interception.attacker.id,
+                    cell=interception.cell,
+                    defender_piece_id=interception.defender.id,
+                )
+            )
+
         for landing in landing_events:
             pending.append(JumpLanded(piece_id=landing.piece.id, cell=landing.cell))
 

@@ -82,11 +82,11 @@ class JumpLanded:
     captured_piece_id, means "the piece that just arrived captured
     whoever already occupied its destination" - a relationship that
     does not exist for a jump landing. A jump's own interception
-    mechanic (extra/jump.py's InterceptionEvent, not yet published as a
-    client event - out of this event's scope) destroys the ATTACKER
-    trying to land on the airborne piece, never a piece the defender
-    itself displaces; the defender's own landing never captures
-    anything. Reusing PieceArrived (always with captured_piece_id=None)
+    mechanic (extra/jump.py's InterceptionEvent, published as its own
+    AttackerIntercepted client event - see that dataclass's own
+    docstring) destroys the ATTACKER trying to land on the airborne
+    piece, never a piece the defender itself displaces; the defender's
+    own landing never captures anything. Reusing PieceArrived (always with captured_piece_id=None)
     would also silently feed every existing PieceArrived consumer a
     payload shaped like a genuine arrival it structurally is not:
     SoundManager would treat it as a plain "move" echo, PieceAnimator's
@@ -103,6 +103,46 @@ class JumpLanded:
 
     piece_id: int
     cell: Position
+
+
+@dataclass(frozen=True)
+class AttackerIntercepted:
+    """A jump's own interception mechanic (extra/jump.py's
+    InterceptionEvent, resolved inside JumpTracker.resolve_due) has
+    destroyed piece_id (the attacker) - it is GONE from the board, not
+    merely idle or captured-by-arrival. Closes the gap JumpLanded's own
+    docstring already flagged: "InterceptionEvent, not yet published as
+    a client event."
+
+    piece_id is the ATTACKER's own id - deliberately the primary
+    subject field here (unlike PieceArrived, where piece_id names the
+    piece that arrived and a SEPARATE captured_piece_id names whatever
+    it displaced): an interception has no "arriving piece" at all, the
+    attacker's own motion is cancelled, never completed, so the
+    destroyed piece IS the one and only thing this event is about.
+
+    cell reuses InterceptionEvent's own `cell` field verbatim (per this
+    fix's own requirement to reuse that shape's information, not
+    re-derive it) - the INTERCEPTION's own location (the defender's
+    airborne cell the attacker was trying to reach), not necessarily
+    the attacker's own last board position: an attacker intercepted via
+    jump.py's Trigger 1 (its own motion resolving while the target is
+    still airborne) is destroyed at its OWN source cell, having never
+    actually reached `cell` - a consumer that needs to remove the
+    attacker from a live Board must look up its own currently-tracked
+    position by piece_id (Piece.cell), never assume it equals `cell`.
+    Kept as informational context (matches jump.py's own naming/shape),
+    not a removal target.
+
+    defender_piece_id names the surviving piece whose jump caused this
+    - included as useful, zero-cost context (mirrors PieceArrived's own
+    captured_piece_id precedent: a secondary fact about the same
+    moment). Unlike captured_piece_id, this is never Optional: an
+    interception cannot happen without a real, airborne defender."""
+
+    piece_id: int
+    cell: Position
+    defender_piece_id: int
 
 
 @dataclass(frozen=True)

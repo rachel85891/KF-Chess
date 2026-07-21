@@ -6,6 +6,7 @@ from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
 from kungfu_chess.client.events.event_publisher import GameEventPublisher, MotionNotFoundError
 from kungfu_chess.client.events.game_events import (
+    AttackerIntercepted,
     GameOver,
     JumpAccepted,
     JumpLanded,
@@ -385,6 +386,50 @@ def test_wait_publishes_jump_landed_when_a_jump_lands():
     publisher.wait(JUMP_DURATION_MS)
 
     assert observer.events == [JumpLanded(piece_id=rook.id, cell=Position(row=0, col=0))]
+
+
+def test_wait_publishes_attacker_intercepted_when_a_jump_intercepts_an_attacker():
+    # Mirrors tests/unit/test_jump.py's own established interception
+    # scenario exactly (Trigger 2: the jump's own duration elapses with
+    # an already-in-flight attacker still pending).
+    grid = _empty_grid(4, 4)
+    defender = _piece(Color.WHITE, PieceKind.PAWN, Position(row=0, col=0))
+    attacker = _piece(Color.BLACK, PieceKind.ROOK, Position(row=0, col=3))
+    grid[0][0] = defender
+    grid[0][3] = attacker
+    board = Board(grid)
+    engine = GameEngine(board)
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+
+    publisher.request_jump(Position(row=0, col=0))
+    engine.request_move(Position(row=0, col=3), Position(row=0, col=0))
+    observer.events.clear()  # drop JumpAccepted from request_jump above
+
+    publisher.wait(1000)
+
+    intercepted_events = [event for event in observer.events if isinstance(event, AttackerIntercepted)]
+    assert intercepted_events == [
+        AttackerIntercepted(piece_id=attacker.id, cell=Position(row=0, col=0), defender_piece_id=defender.id)
+    ]
+
+
+def test_wait_publishes_no_attacker_intercepted_when_no_interception_occurs():
+    grid = _empty_grid(3, 3)
+    rook = _piece(Color.WHITE, PieceKind.ROOK, Position(row=0, col=0))
+    grid[0][0] = rook
+    engine = GameEngine(Board(grid))
+    publisher = GameEventPublisher(ExtraEngine(engine))
+    observer = RecordingObserver()
+    publisher.subscribe(observer)
+
+    publisher.request_jump(Position(row=0, col=0))
+    observer.events.clear()
+
+    publisher.wait(JUMP_DURATION_MS)
+
+    assert all(not isinstance(event, AttackerIntercepted) for event in observer.events)
 
 
 def test_wait_publishes_no_jump_landed_when_no_jump_is_airborne():
