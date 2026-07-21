@@ -407,6 +407,60 @@ _handle_jump_landed - mirroring GameLoopRunner's own "told BEFORE
 wait()/on_event runs" ordering exactly, just triggered by a real
 received wire event instead of a local wait() call about to advance a
 shared clock.
+
+BUGFIX - AttackerIntercepted NEVER REMOVED THE ATTACKER FROM THIS
+CLIENT'S OWN BOARD (fix/interception-event-and-network-removal): a real,
+pre-existing bug, mostly invisible locally (the real engine's own
+Board already reflects the removal there, so local rendering happened
+to look right by accident) but a visible, confusing one over the
+network - an intercepted attacker's motion is CANCELLED, never
+completed, so it never received a PieceArrived at all; this class's
+own Board copy and _active_motions tracking both only ever react to
+PieceArrived (see _handle_piece_arrived above) - meaning the destroyed
+attacker never disappeared from a connected client's own screen and
+never stopped rendering mid-motion. THE FIX: AttackerIntercepted (a
+new event - see kungfu_chess/client/events/game_events.py's own
+docstring for the full shape/naming reasoning) is now handled by
+_handle_attacker_intercepted, mirroring _handle_piece_arrived's/
+_handle_jump_landed's own established shape exactly: translate the
+attacker's own server piece_id via the SAME _translate_piece cache
+(from_cell=None, since AttackerIntercepted carries none - the same
+narrow, accepted "joined mid-motion" translation gap PROBLEM 1 already
+documents applies here identically), then remove it from self.board at
+its own CLIENT-TRACKED `piece.cell` - deliberately NOT `event.cell`
+(re-verified directly against jump.py's own InterceptionEvent: `cell`
+there is the DEFENDER's own airborne cell, the interception's own
+location, not necessarily where the attacker itself currently sits on
+the board - an attacker intercepted via jump.py's Trigger 1 is
+destroyed at its OWN source cell, having never reached `cell` at all;
+see AttackerIntercepted's own docstring for the identical warning).
+This reuses Board.remove_piece verbatim - the exact same board-mutation
+primitive _handle_piece_arrived already calls for an ordinary capture,
+not a second, parallel removal mechanism. Also pops the attacker's own
+_active_motions entry (Stage B7.5), for the identical reason
+_handle_piece_arrived/_handle_jump_landed already do: an intercepted
+attacker's own MoveAccepted/JumpAccepted DID populate one, and nothing
+would otherwise ever clear it (no PieceArrived is coming for this
+piece, ever). The translated event is still forwarded to
+piece_animator_registry.on_event, for parity with local play (where
+PieceAnimatorRegistry's already-generic, type-agnostic subscription
+would receive this event regardless of anything this class does) -
+see piece_animator.py's own "PART B DECISION" docstring section for why
+PieceAnimator itself deliberately does nothing upon receiving it (the
+piece's disappearance is achieved entirely by this method's own Board
+removal, never by an AnimationState transition).
+
+defender_piece_id translation is best-effort only, mirroring
+_handle_piece_arrived's own identical captured_piece_id policy: the
+defender's own server_piece_id should always already be cached by the
+time any interception referencing it can arrive (its own earlier
+JumpAccepted already populated the cache) - but in the same narrow,
+accepted "joined mid-motion" case where it somehow wasn't, the raw,
+untranslated server id is passed through rather than blocking this
+event's own translation, since nothing today actually reads
+defender_piece_id at all (PieceAnimator ignores this whole event) -
+flagged explicitly rather than left as a silent surprise for whichever
+future consumer first reads it.
 """
 
 from __future__ import annotations
@@ -420,7 +474,13 @@ import cv2
 
 from kungfu_chess.client.animation.piece_animator_registry import PieceAnimatorRegistry
 from kungfu_chess.client.events.cooldown_tracker import CooldownTracker
-from kungfu_chess.client.events.game_events import JumpAccepted, JumpLanded, MoveAccepted, PieceArrived
+from kungfu_chess.client.events.game_events import (
+    AttackerIntercepted,
+    JumpAccepted,
+    JumpLanded,
+    MoveAccepted,
+    PieceArrived,
+)
 from kungfu_chess.client.events.observers import MovesLogSnapshot, ScoreSnapshot
 from kungfu_chess.client.input.mouse_adapter import MouseAdapter
 from kungfu_chess.client.input.screen_mapper import ScreenToImageMapper
@@ -800,6 +860,8 @@ class NetworkGameLoopRunner:
             self._handle_piece_arrived(event)
         elif isinstance(event, JumpLanded):
             self._handle_jump_landed(event)
+        elif isinstance(event, AttackerIntercepted):
+            self._handle_attacker_intercepted(event)
 
     def _clock_ms(self) -> int:
         """Convert self._clock()'s own float (seconds - Stage B7.5's
@@ -978,6 +1040,62 @@ class NetworkGameLoopRunner:
 
         self.cooldown_tracker.set_current_clock_ms(self._clock_ms())
         self.cooldown_tracker.on_event(translated)
+
+    def _handle_attacker_intercepted(self, event: AttackerIntercepted) -> None:
+        """Translate a real AttackerIntercepted's server piece_id and
+        remove the destroyed attacker from self.board and
+        self._active_motions - see module docstring's "BUGFIX -
+        AttackerIntercepted NEVER REMOVED THE ATTACKER FROM THIS
+        CLIENT'S OWN BOARD" section for the full reasoning behind every
+        decision below.
+
+        Args:
+            event: The real, wire-parsed AttackerIntercepted.
+
+        Returns:
+            None.
+
+        Removes the attacker at its own CLIENT-TRACKED `piece.cell`,
+        deliberately NOT `event.cell` (the interception's own location
+        - the DEFENDER's airborne cell, per jump.py's own
+        InterceptionEvent convention, re-verified directly - not
+        necessarily where the attacker itself currently sits; see
+        AttackerIntercepted's own docstring for the identical warning).
+        Guarded by `self.board.piece_at(piece.cell) is piece` before
+        removing, mirroring the same defensive precision
+        _handle_piece_arrived's own board mutation already applies (via
+        `is not None`) - never blindly assumes the cell still holds
+        this exact piece.
+
+        A translation failure (see _translate_piece - the same narrow,
+        accepted "joined mid-motion" gap PROBLEM 1 documents) or
+        self.board still being None is a safe, silent no-op, mirroring
+        _handle_piece_arrived's/_handle_jump_landed's identical policy.
+        """
+
+        piece = self._translate_piece(event.piece_id, from_cell=None)
+        if piece is None or self.board is None:
+            return
+
+        if self.board.piece_at(piece.cell) is piece:
+            self.board.remove_piece(piece.cell)
+
+        self._active_motions.pop(piece.id, None)
+
+        # Best-effort only - see module docstring's own paragraph on
+        # this for why an untranslatable defender_piece_id falls back
+        # to the raw, untranslated server id rather than blocking this
+        # event's own translation (nothing today reads this field at
+        # all - PieceAnimator ignores this whole event, per
+        # piece_animator.py's own "PART B DECISION" section).
+        defender_piece = self._server_piece_cache.get(event.defender_piece_id)
+        translated_defender_piece_id = defender_piece.id if defender_piece is not None else event.defender_piece_id
+
+        translated = AttackerIntercepted(
+            piece_id=piece.id, cell=event.cell, defender_piece_id=translated_defender_piece_id
+        )
+        if self.piece_animator_registry is not None:
+            self.piece_animator_registry.on_event(translated)
 
     def poll_and_process(self) -> None:
         """Drain every new broadcast since the last call and apply each

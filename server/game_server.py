@@ -153,14 +153,23 @@ single-line wire-format message (kungfu_chess/notation/
 game_event_wire_format.py) for MoveAccepted/JumpAccepted/PieceArrived
 (and, since the jump-network-wiring-and-cooldown-display stage,
 JumpLanded too - see that module's own "JumpLanded ADDITION" docstring
-section), immediately before the existing board-text snapshot for the
-same event - see `_broadcast_event`'s own docstring for the exact
-ordering guarantee. JumpLanded needed no changes to `_on_game_event`/
+section - and, since fix/interception-event-and-network-removal,
+AttackerIntercepted - see that same module's "AttackerIntercepted
+ADDITION" section), immediately before the existing board-text
+snapshot for the same event - see `_broadcast_event`'s own docstring
+for the exact ordering guarantee. Neither JumpLanded nor
+AttackerIntercepted needed any changes to `_on_game_event`/
 `_broadcast_event` themselves to start broadcasting correctly - only
-_BROADCAST_EVENT_TYPES (below) gained one more subscribed type, and
-format_game_event already returns real wire text for it - exactly the
-same OCP-safe extension point PromotionEvent could have used had it
-needed broadcasting too. WHY ALONGSIDE, NOT REPLACING: the board-text broadcast is
+_BROADCAST_EVENT_TYPES (below) gained one more subscribed type each
+time, and format_game_event already returns real wire text for both -
+exactly the same OCP-safe extension point PromotionEvent could have
+used had it needed broadcasting too. AttackerIntercepted is
+deliberately NOT one of the event types that also triggers the score/
+move-log/clock snapshot broadcast below (see that section) - an
+interception never changes score or the move log (ScoreObserver/
+MovesLogObserver, re-verified directly, react only to PieceArrived-
+with-capture and MoveAccepted/JumpAccepted; AttackerIntercepted is a
+type neither of them has any reaction to at all). WHY ALONGSIDE, NOT REPLACING: the board-text broadcast is
 this project's own established fallback/sanity-check safety net (every
 existing client and test already depends on receiving it) - this stage
 adds richer, structured per-motion data for a client that wants to
@@ -255,6 +264,7 @@ from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.client.events.game_events import (
+    AttackerIntercepted,
     GameOver,
     JumpAccepted,
     JumpLanded,
@@ -275,7 +285,15 @@ from server.move_command import MalformedCommandError, parse_move_command
 
 TICK_INTERVAL_S = 1 / 30
 
-_BROADCAST_EVENT_TYPES = (MoveAccepted, JumpAccepted, JumpLanded, MoveRejected, PieceArrived, GameOver)
+_BROADCAST_EVENT_TYPES = (
+    MoveAccepted,
+    JumpAccepted,
+    JumpLanded,
+    AttackerIntercepted,
+    MoveRejected,
+    PieceArrived,
+    GameOver,
+)
 
 
 class GameServer:
