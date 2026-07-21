@@ -289,16 +289,14 @@ from kungfu_chess.client.events.game_events import (
     MoveRejected,
     PieceArrived,
 )
-from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
-from kungfu_chess.notation.game_event_wire_format import format_game_event
-from kungfu_chess.notation.game_state_snapshot_wire_format import format_game_state_snapshot
-from kungfu_chess.notation.jump_command import JUMP_COMMAND_PREFIX, MalformedJumpCommandError, parse_jump_command
+from kungfu_chess.notation.jump_command import MalformedJumpCommandError, ParsedJumpCommand
 from server.connection_manager import ConnectionManager
 from server.game_session import GameSession
-from server.move_command import MalformedCommandError, parse_move_command
+from server.move_command import MalformedCommandError, ParsedMoveCommand
+from server.protocol_handler import SERVER_FULL_MESSAGE, ProtocolHandler
 
 TICK_INTERVAL_S = 1 / 30
 
@@ -319,11 +317,14 @@ class GameServer:
     every decision below."""
 
     def __init__(
-        self, session: Optional[GameSession] = None, connection_manager: Optional[ConnectionManager] = None
+        self,
+        session: Optional[GameSession] = None,
+        connection_manager: Optional[ConnectionManager] = None,
+        protocol_handler: Optional[ProtocolHandler] = None,
     ) -> None:
-        """Construct (or accept injected) GameSession/ConnectionManager
-        and subscribe this instance's own broadcaster to the session's
-        event bus.
+        """Construct (or accept injected) GameSession/ConnectionManager/
+        ProtocolHandler and subscribe this instance's own broadcaster to
+        the session's event bus.
 
         Args:
             session: The GameSession to coordinate. Defaults to None,
@@ -333,6 +334,16 @@ class GameServer:
             connection_manager: The ConnectionManager to coordinate.
                 Defaults to None, which constructs a fresh, real,
                 empty ConnectionManager - injectable for tests.
+            protocol_handler: The ProtocolHandler (server/
+                protocol_handler.py, refactor/server-application-
+                presentation-split) this instance delegates every
+                wire-parsing/formatting/send concern to. Defaults to
+                None, which constructs a fresh, real, stateless
+                ProtocolHandler (the real production case, and the only
+                case any existing caller/test needs - re-verified
+                directly, nothing constructs this class with a fake/mock
+                ProtocolHandler today) - injectable (DIP) for the exact
+                same reason session/connection_manager already are.
 
         Returns:
             None.
@@ -340,6 +351,7 @@ class GameServer:
 
         self._session = session if session is not None else GameSession()
         self._connection_manager = connection_manager if connection_manager is not None else ConnectionManager()
+        self._protocol = protocol_handler if protocol_handler is not None else ProtocolHandler()
         self._colors: Dict[ServerConnection, Color] = {}
 
         for event_type in _BROADCAST_EVENT_TYPES:
@@ -362,7 +374,7 @@ class GameServer:
         """
 
         if self._connection_manager.connection_count >= 2:
-            await self._safe_send(connection, "server_full")
+            await self._protocol.send(connection, SERVER_FULL_MESSAGE)
             await connection.close()
             return
 
@@ -375,11 +387,11 @@ class GameServer:
         # out ("white"/"black"), not the terse single-letter
         # Color.value ("w"/"b") the wire protocol itself uses - this
         # message is for a human/log to read, not parsed by anything.
-        await self._safe_send(connection, f"assigned_color:{color.name.lower()}")
+        await self._protocol.send(connection, self._protocol.format_assigned_color(color))
         # See module docstring's "BUGFIX - INITIAL BOARD STATE ON
         # JOIN" - a direct, point-to-point send to THIS connection
         # only, not a broadcast to every connection.
-        await self._safe_send(connection, self._current_board_text())
+        await self._protocol.send(connection, self._current_board_text())
 
         try:
             async for message in connection:
@@ -391,12 +403,11 @@ class GameServer:
             self._colors.pop(connection, None)
 
     async def _handle_message(self, connection: ServerConnection, assigned_color: Color, message: object) -> None:
-        """Dispatch one raw incoming message from `connection` to
-        either the jump-command or move-command handler, based on a
-        single, unambiguous leading-character check - see module
-        docstring's "JUMP COMMAND ROUTING AND REJECTION SCHEME" section
-        for the full reasoning behind why this check can never
-        misroute a genuine move command.
+        """Parse one raw incoming message via self._protocol
+        (server/protocol_handler.py's own leading-character dispatch -
+        see module docstring's "JUMP COMMAND ROUTING AND REJECTION
+        SCHEME" section for why this can never misroute a genuine move
+        command) and dispatch the result to the matching handler.
 
         Args:
             connection: The connection `message` arrived on.
@@ -406,37 +417,50 @@ class GameServer:
 
         Returns:
             None.
+
+        A parse failure (either MalformedCommandError or
+        MalformedJumpCommandError - re-verified directly, both are the
+        SAME parser calls self._protocol.parse_incoming_command used to
+        make before this split, just relocated) produces the identical
+        "rejected:malformed:<detail>" response either way, matching this
+        method's own pre-split behavior exactly (both branches formatted
+        this response identically, so unifying the except clause here
+        changes nothing observable).
         """
 
-        if isinstance(message, str) and message[:1].upper() == JUMP_COMMAND_PREFIX:
-            await self._handle_jump_message(connection, assigned_color, message)
+        try:
+            parsed = self._protocol.parse_incoming_command(message)
+        except (MalformedCommandError, MalformedJumpCommandError) as exc:
+            await self._protocol.send(connection, self._protocol.format_rejection(f"malformed:{exc}"))
             return
 
-        await self._handle_move_message(connection, assigned_color, message)
+        if isinstance(parsed, ParsedJumpCommand):
+            await self._handle_jump_command(connection, assigned_color, parsed)
+        else:
+            await self._handle_move_command(connection, assigned_color, parsed)
 
-    async def _handle_move_message(self, connection: ServerConnection, assigned_color: Color, message: object) -> None:
-        """Parse and dispatch one raw move-command message - see module
-        docstring's "MOVE COMMAND REJECTION SCHEME" for the exact
-        rejection responses this sends.
+    async def _handle_move_command(
+        self, connection: ServerConnection, assigned_color: Color, parsed: ParsedMoveCommand
+    ) -> None:
+        """Validate and dispatch one ALREADY-PARSED move command - see
+        module docstring's "MOVE COMMAND REJECTION SCHEME" for the
+        exact rejection responses this sends.
 
         Args:
-            connection: The connection `message` arrived on.
+            connection: The connection this command arrived on.
             assigned_color: The color this connection was assigned at
                 join time.
-            message: The raw text (or bytes) websockets delivered.
+            parsed: The already-parsed ParsedMoveCommand (see
+                _handle_message - parsing itself now lives on
+                self._protocol, not here; this method only ever
+                validates and acts on an already-structured command).
 
         Returns:
             None.
         """
 
-        try:
-            parsed = parse_move_command(message)
-        except MalformedCommandError as exc:
-            await self._safe_send(connection, f"rejected:malformed:{exc}")
-            return
-
         if parsed.color is not assigned_color:
-            await self._safe_send(connection, "rejected:wrong_color")
+            await self._protocol.send(connection, self._protocol.format_rejection("wrong_color"))
             return
 
         if not self._piece_matches(parsed.color, parsed.piece_kind, parsed.from_cell):
@@ -445,7 +469,7 @@ class GameServer:
             # which move_command.py deliberately has none of - so the
             # check happens here, the one place that already holds both
             # the parsed command and the real session/board.
-            await self._safe_send(connection, "rejected:piece_mismatch")
+            await self._protocol.send(connection, self._protocol.format_rejection("piece_mismatch"))
             return
 
         # A legal (or engine-rejected) move from here on is entirely
@@ -456,34 +480,31 @@ class GameServer:
         # either outcome.
         self._session.request_move(parsed.from_cell, parsed.to_cell)
 
-    async def _handle_jump_message(self, connection: ServerConnection, assigned_color: Color, message: object) -> None:
-        """Parse and dispatch one raw jump-command message - see module
-        docstring's "JUMP COMMAND ROUTING AND REJECTION SCHEME" for the
-        exact rejection responses this sends, including the one new
-        "jump_rejected" token moves never needed.
+    async def _handle_jump_command(
+        self, connection: ServerConnection, assigned_color: Color, parsed: ParsedJumpCommand
+    ) -> None:
+        """Validate and dispatch one ALREADY-PARSED jump command - see
+        module docstring's "JUMP COMMAND ROUTING AND REJECTION SCHEME"
+        for the exact rejection responses this sends, including the one
+        new "jump_rejected" token moves never needed.
 
         Args:
-            connection: The connection `message` arrived on.
+            connection: The connection this command arrived on.
             assigned_color: The color this connection was assigned at
                 join time.
-            message: The raw text (or bytes) websockets delivered.
+            parsed: The already-parsed ParsedJumpCommand (see
+                _handle_message).
 
         Returns:
             None.
         """
 
-        try:
-            parsed = parse_jump_command(message)
-        except MalformedJumpCommandError as exc:
-            await self._safe_send(connection, f"rejected:malformed:{exc}")
-            return
-
         if parsed.color is not assigned_color:
-            await self._safe_send(connection, "rejected:wrong_color")
+            await self._protocol.send(connection, self._protocol.format_rejection("wrong_color"))
             return
 
         if not self._piece_matches(parsed.color, parsed.piece_kind, parsed.cell):
-            await self._safe_send(connection, "rejected:piece_mismatch")
+            await self._protocol.send(connection, self._protocol.format_rejection("piece_mismatch"))
             return
 
         accepted = self._session.request_jump(parsed.cell)
@@ -494,7 +515,7 @@ class GameServer:
             # than an event-driven broadcast like a move's own
             # MoveRejected: ExtraEngine.request_jump exposes no reason
             # string at all for this outcome.
-            await self._safe_send(connection, "rejected:jump_rejected")
+            await self._protocol.send(connection, self._protocol.format_rejection("jump_rejected"))
 
     def _piece_matches(self, color: Color, piece_kind: PieceKind, cell: Position) -> bool:
         """Whether a claimed color/piece kind actually matches what's
@@ -557,9 +578,16 @@ class GameServer:
         Returns:
             None.
 
-        Reuses `_broadcast` for EVERY send (no duplicated connection-
-        iteration logic, per this stage's own DRY requirement) - a
-        MoveRejected produces no wire-format message (format_game_event
+        This method decides WHICH messages to send and in what order
+        for a given event (an APPLICATION/coordination decision about
+        game-event semantics - see module docstring's "THE APPLICATION/
+        PRESENTATION BOUNDARY" section for why this stays here rather
+        than moving to ProtocolHandler) - the actual formatting/sending
+        mechanics are all self._protocol's (refactor/server-
+        application-presentation-split). Reuses self._protocol.
+        broadcast for EVERY send (no duplicated connection-iteration
+        logic, per this stage's own DRY requirement) - a MoveRejected
+        produces no wire-format message (self._protocol.format_event
         returns None for it - not an animatable motion), so only the
         pre-existing board-text broadcast happens for that one event
         type, byte-for-byte unchanged from before this stage. GameOver
@@ -576,92 +604,58 @@ class GameServer:
         TIMER BROADCAST" section) its own resulting score/move-log/
         clock snapshot - never interleaved with a DIFFERENT event's own
         messages (this coroutine does not yield control between any of
-        these `await self._broadcast(...)` calls to any other code that
-        could send a message to the same connections in between).
+        these `await self._protocol.broadcast(...)` calls to any other
+        code that could send a message to the same connections in
+        between).
         """
 
-        wire_text = format_game_event(event)
+        wire_text = self._protocol.format_event(event)
         if wire_text is not None:
-            await self._broadcast(wire_text)
-        await self._broadcast(self._current_board_text())
+            await self._protocol.broadcast(self._connection_manager.connections(), wire_text)
+        await self._protocol.broadcast(self._connection_manager.connections(), self._current_board_text())
         if isinstance(event, (MoveAccepted, JumpAccepted, PieceArrived)):
-            await self._broadcast(self._current_state_snapshot_text())
+            await self._protocol.broadcast(
+                self._connection_manager.connections(), self._current_state_snapshot_text()
+            )
 
     def _current_state_snapshot_text(self) -> str:
         """The score/move-log/elapsed-clock snapshot broadcast added by
         this later stage - see module docstring's "SCORE / MOVE-LOG /
         TIMER BROADCAST" section for the full reasoning behind why
         this reads self._session's own observers/engine state directly
-        rather than owning any of it here.
+        rather than owning any of it here (an APPLICATION concern - the
+        actual wire-text FORMATTING of that data is self._protocol's,
+        per the module docstring's APPLICATION/PRESENTATION section).
 
         Returns:
             The current (ScoreSnapshot, MovesLogSnapshot,
             engine.state.clock_ms) triple, serialized via
-            format_game_state_snapshot.
+            self._protocol.format_state_snapshot.
         """
 
         score = self._session.score_observer.snapshot()
         log = self._session.moves_log_observer.snapshot()
         clock_ms = self._session.engine.state.clock_ms
-        return format_game_state_snapshot(score, log, clock_ms)
+        return self._protocol.format_state_snapshot(score, log, clock_ms)
 
     def _current_board_text(self) -> str:
         """The exact board-serialization call used for both the
         event-driven broadcaster (above) and the join-time send (see
         handle_connection and module docstring's "BUGFIX - INITIAL
         BOARD STATE ON JOIN") - kept as the single place this class
-        turns the current board into wire text, so there is exactly
-        one board-serialization code path, not two.
+        reads the current board and asks self._protocol to serialize
+        it, so there is exactly one board-serialization CALL SITE in
+        this class, not two (the actual serialization mechanics live on
+        self._protocol.format_board_text - see module docstring's
+        APPLICATION/PRESENTATION section).
 
         Returns:
-            The current board, serialized via the existing
-            BoardPrinter - the same textual convention this project's
-            tests already rely on for board assertions.
+            The current board, serialized via self._protocol.
+            format_board_text - the same textual convention this
+            project's tests already rely on for board assertions.
         """
 
-        return BoardPrinter().print(self._session.engine.board)
-
-    async def _broadcast(self, text: str) -> None:
-        """Send `text` to every currently-tracked connection.
-
-        Args:
-            text: The board-state text (BoardPrinter's own format) to
-                send to both players.
-
-        Returns:
-            None.
-
-        Iterates ConnectionManager.connections()'s own frozenset
-        snapshot (no connection-tracking logic duplicated here) - a
-        connection that closes mid-broadcast is handled by
-        _safe_send's own ConnectionClosed guard, mirroring Stage B1's
-        already-closed-connection policy (echo_message's own, now
-        retired, docstring) rather than inventing a new one.
-        """
-
-        for connection in self._connection_manager.connections():
-            await self._safe_send(connection, text)
-
-    async def _safe_send(self, connection: ServerConnection, text: str) -> None:
-        """Send `text` to `connection`, silently ignoring
-        ConnectionClosed - see module docstring's "WHY THE BROADCASTER
-        BRIDGES..." section and Stage B1's own already-closed-
-        connection policy, applied identically here: there is nothing
-        more useful to do with a failed send than what Stage B1 already
-        decided for its own echo path.
-
-        Args:
-            connection: The connection to send to.
-            text: The text to send.
-
-        Returns:
-            None.
-        """
-
-        try:
-            await connection.send(text)
-        except ConnectionClosed:
-            pass
+        return self._protocol.format_board_text(self._session.engine.board)
 
     async def run_tick_loop(self) -> None:
         """Advance this server's one real GameSession by real, measured
