@@ -38,6 +38,13 @@ same shape Stage B6's real client process will eventually have (one
 synchronous GUI thread + one NetworkGameClient background thread; the
 server being a separate OS process entirely, just simulated here via
 its own thread for test convenience).
+
+UPDATED for Stage D2's real auth handshake (feature/home-screen-d2-
+auth-protocol): connect() now requires real username/password arguments
+- every call below passes a distinct username per client
+("client1"/"client2"/"client"), with GameServer itself constructed with
+user_repository_db_path=":memory:" so no test here touches a real
+database file.
 """
 
 from __future__ import annotations
@@ -86,7 +93,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready))
 
     async def _serve(self, ready: threading.Event) -> None:
-        game_server = GameServer()
+        game_server = GameServer(user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -130,10 +137,10 @@ def test_connect_returns_the_correct_assigned_color_for_first_and_second_client(
     client1 = NetworkGameClient()
     client2 = NetworkGameClient()
     try:
-        assert client1.connect(test_server.uri) == Color.WHITE
+        assert client1.connect(test_server.uri, "client1", "password1") == Color.WHITE
         assert client1.assigned_color == Color.WHITE
 
-        assert client2.connect(test_server.uri) == Color.BLACK
+        assert client2.connect(test_server.uri, "client2", "password2") == Color.BLACK
         assert client2.assigned_color == Color.BLACK
     finally:
         client1.close()
@@ -146,8 +153,8 @@ def test_send_move_then_poll_eventually_surfaces_the_expected_broadcast():
     client1 = NetworkGameClient()
     client2 = NetworkGameClient()
     try:
-        assert client1.connect(test_server.uri) == Color.WHITE
-        assert client2.connect(test_server.uri) == Color.BLACK
+        assert client1.connect(test_server.uri, "client1", "password1") == Color.WHITE
+        assert client2.connect(test_server.uri, "client2", "password2") == Color.BLACK
 
         client1.send_move(Color.WHITE, PieceKind.PAWN, Position(row=6, col=4), Position(row=4, col=4))
 
@@ -186,8 +193,8 @@ def test_send_jump_then_poll_eventually_surfaces_the_jump_landed_broadcast():
     client1 = NetworkGameClient()
     client2 = NetworkGameClient()
     try:
-        assert client1.connect(test_server.uri) == Color.WHITE
-        assert client2.connect(test_server.uri) == Color.BLACK
+        assert client1.connect(test_server.uri, "client1", "password1") == Color.WHITE
+        assert client2.connect(test_server.uri, "client2", "password2") == Color.BLACK
 
         client1.send_jump(Color.WHITE, PieceKind.ROOK, Position(row=7, col=0))
 
@@ -218,7 +225,7 @@ def test_poll_incoming_returns_an_empty_list_when_nothing_new_has_arrived():
     test_server = _BackgroundTestServer()
     client = NetworkGameClient()
     try:
-        assert client.connect(test_server.uri) == Color.WHITE
+        assert client.connect(test_server.uri, "client", "password") == Color.WHITE
 
         # The server now sends one join-time board-state message right
         # after assigned_color (server/game_server.py's own initial-
@@ -243,8 +250,8 @@ def test_two_independent_clients_have_no_cross_talk_in_their_incoming_streams():
     client1 = NetworkGameClient()
     client2 = NetworkGameClient()
     try:
-        assert client1.connect(test_server.uri) == Color.WHITE
-        assert client2.connect(test_server.uri) == Color.BLACK
+        assert client1.connect(test_server.uri, "client1", "password1") == Color.WHITE
+        assert client2.connect(test_server.uri, "client2", "password2") == Color.BLACK
 
         # Each client's own join-time board-state message (see above)
         # is expected and drained here first - the real thing being
@@ -277,7 +284,7 @@ def test_close_after_a_real_connect_is_safe_and_does_not_hang():
     test_server = _BackgroundTestServer()
     client = NetworkGameClient()
     try:
-        assert client.connect(test_server.uri) == Color.WHITE
+        assert client.connect(test_server.uri, "client", "password") == Color.WHITE
     finally:
         client.close()
         client.close()  # idempotent even after a real connection
