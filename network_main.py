@@ -23,6 +23,30 @@ scripts/demo_stage10_play.py's own docstring for that established
 precedent, which this file deliberately does NOT follow, since this
 IS a real production entry point, not a demo).
 
+STAGE C1 ("Home Screen v1") - WHY THE SHELL LOGIN STEP WAS ADDED HERE,
+NOT AS A NEW, SEPARATE REPO-ROOT ENTRY POINT: unlike the "new repo-root
+file" reasoning above (a genuinely different CALLING CONVENTION - GUI+
+network vs. stdin/stdout DSL - justified giving network_main.py its
+own file instead of extending main.py/app.py), a shell username prompt
+in front of the SAME GUI+network flow does not introduce a new calling
+convention at all - a human still runs `python network_main.py
+[server_uri]` and ends up playing the same real networked game, just
+after one added text prompt. Splitting that into a THIRD, parallel
+entry point would duplicate this file's own argv-parsing/DEFAULT_URI
+convention for no genuine reason. This file's own `main()` therefore
+stays the single, thin composition root (mirrors docs/README.md's own
+established "thin entry point, real logic in an importable module"
+pattern - main.py/app.py's own one-line delegation to
+app_extra.run_extra) - it only resolves `uri` from argv (its own,
+pre-existing job) and delegates every actual login/connect/launch
+decision to kungfu_chess.client.home_screen.run_shell_login_and_launch
+(see that module's own docstring for the full reasoning behind the
+prompt/connect/welcome/launch sequence, and for why the username
+collected there is cosmetic-only at this stage). NetworkGameLoopRunner
+itself is untouched by this stage - run_shell_login_and_launch's own
+default connect_fn/launch_gui_fn reproduce this file's own previous
+connect/run/close sequence verbatim.
+
 Usage:
     python network_main.py [server_uri]
 
@@ -37,38 +61,24 @@ from __future__ import annotations
 
 import sys
 
-from kungfu_chess.client.loop.network_game_loop_runner import ConnectionRejectedError, NetworkGameLoopRunner
+from kungfu_chess.client.home_screen import run_shell_login_and_launch
 
 DEFAULT_URI = "ws://localhost:8765"
 
 
 def main() -> None:
-    """Connect to a real server and run a real networked game until
-    the window closes, 'q' is pressed, or the connection is rejected.
+    """Resolve the server URI from argv, then run the real Stage C1
+    shell login flow - which prompts for a username, connects, shows
+    the welcome (or server_full) message, and launches the real GUI -
+    see kungfu_chess.client.home_screen's own module docstring for the
+    full reasoning.
 
     Returns:
         None.
     """
 
     uri = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_URI
-
-    print(f"Connecting to {uri} ...")
-    try:
-        runner = NetworkGameLoopRunner(uri)
-    except ConnectionRejectedError as exc:
-        print(f"Could not join: {exc}")
-        return
-
-    print(f"Connected. You are playing as: {runner.assigned_color.name}")
-    print("Left-click your own piece, then left-click a destination to move it.")
-    print("Press 'q' or close the window to quit.")
-
-    try:
-        runner.run()
-    finally:
-        runner.close()
-
-    print("Game loop ended.")
+    run_shell_login_and_launch(uri)
 
 
 if __name__ == "__main__":
