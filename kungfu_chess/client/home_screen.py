@@ -141,6 +141,27 @@ the account's real, server-returned rating
 rating - see that class's own "STAGE D2" docstring section) is appended
 to the same message this function already produced, rather than a
 second, separate message - one human-readable summary line, not two.
+
+STAGE E1 - REAL MATCHMAKING (feature/matchmaking-elo-queue-e1, CTD26
+slides' own "Play button" framing): after a successful login/signup,
+the server no longer joins a fixed game immediately - it enters a real
+matchmaking queue (server/application/matchmaking_queue.py), reporting
+"searching_for_opponent" while waiting, and either a real opponent match
+or, after 60 real seconds with none found, a "matchmaking_timeout"
+outcome. `connect_fn`'s own contract gains a fourth parameter,
+`on_searching_for_opponent` - a callback `_default_connect` forwards
+straight through to NetworkGameLoopRunner's own identically-named
+parameter (which forwards it, in turn, to NetworkGameClient.connect's
+own - see that class's own "STAGE E1" docstring section for the full
+chain). `run_shell_login_and_launch` supplies
+`lambda: output_fn(SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE)` as that
+callback, so the shell prints the searching message at the REAL moment
+the server confirms it (never eagerly/optimistically printed before
+that, since a wrong password could still be discovered instead - this
+stage's own explicit "AFTER successful login/signup" wording). A real
+matchmaking timeout is a THIRD real ConnectionRejectedError.reason
+value (alongside "wrong_password"/"server_full"), shown via its own
+MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE.
 """
 
 from __future__ import annotations
@@ -153,7 +174,7 @@ from kungfu_chess.model.color import Color
 
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], None]
-ConnectFn = Callable[[str, str, str], NetworkGameLoopRunner]
+ConnectFn = Callable[[str, str, str, Callable[[], None]], NetworkGameLoopRunner]
 
 USERNAME_PROMPT_TEXT = "Enter your username: "
 _EMPTY_USERNAME_MESSAGE = "Username cannot be empty - please try again."
@@ -161,6 +182,8 @@ PASSWORD_PROMPT_TEXT = "Enter your password: "
 _EMPTY_PASSWORD_MESSAGE = "Password cannot be empty - please try again."
 SERVER_FULL_DISPLAY_MESSAGE = "Server is full - only two players are supported right now."
 WRONG_PASSWORD_DISPLAY_MESSAGE = "Incorrect password for that username - please try again."
+SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE = "Searching for an opponent (this may take up to a minute)..."
+MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE = "No opponent found within the time limit - please try again later."
 _MOVE_INSTRUCTIONS = (
     "Left-click your own piece, then left-click a destination to move it.",
     "Press 'q' or close the window to quit.",
@@ -253,16 +276,21 @@ def format_welcome_message(username: str, color: Color, rating: int) -> str:
     return f"Welcome, {username}! You are playing as {color.name}. Rating: {rating}."
 
 
-def _default_connect(uri: str, username: str, password: str) -> NetworkGameLoopRunner:
+def _default_connect(
+    uri: str, username: str, password: str, on_searching_for_opponent: Callable[[], None]
+) -> NetworkGameLoopRunner:
     """The real production connect_fn - see module docstring's "WHY
     `connect_fn` TAKES `(uri, username)`" section (Stage C1) and "STAGE
-    D2" section for why this tiny wrapper exists rather than passing
-    NetworkGameLoopRunner itself as the default: `username`/`password`
-    must reach that class's own constructor as KEYWORD arguments (never
-    positionally, to avoid colliding with its `window_name`/`headless`/
-    `clock` positional parameters)."""
+    D2"/"STAGE E1" sections for why this tiny wrapper exists rather
+    than passing NetworkGameLoopRunner itself as the default:
+    `username`/`password`/`on_searching_for_opponent` must reach that
+    class's own constructor as KEYWORD arguments (never positionally,
+    to avoid colliding with its `window_name`/`headless`/`clock`
+    positional parameters)."""
 
-    return NetworkGameLoopRunner(uri, username=username, password=password)
+    return NetworkGameLoopRunner(
+        uri, username=username, password=password, on_searching_for_opponent=on_searching_for_opponent
+    )
 
 
 def _default_launch_gui(runner: NetworkGameLoopRunner) -> None:
@@ -302,11 +330,13 @@ def run_shell_login_and_launch(
             "Connecting to ..." status line, the welcome/rejection
             message, and the move instructions).
         password_input_fn: See prompt_password.
-        connect_fn: Called as `connect_fn(uri, username, password)`.
-            Defaults to _default_connect - see module docstring for why
-            constructing a real NetworkGameLoopRunner IS the exact,
-            unmodified real connection call, not a second one, and why
-            `username`/`password` are threaded through it.
+        connect_fn: Called as `connect_fn(uri, username, password,
+            on_searching_for_opponent)`. Defaults to _default_connect -
+            see module docstring for why constructing a real
+            NetworkGameLoopRunner IS the exact, unmodified real
+            connection call, not a second one, and why
+            `username`/`password`/`on_searching_for_opponent` are
+            threaded through it.
         launch_gui_fn: Defaults to _default_launch_gui - see module
             docstring.
 
@@ -317,20 +347,24 @@ def run_shell_login_and_launch(
     "SRP" section - this is the one place all four steps are wired
     together): a username, then a password, are collected BEFORE any
     connection attempt (connect_fn needs both), connecting happens next
-    (the one point that can raise ConnectionRejectedError), and the
-    welcome message can only be formatted AFTER a successful connect (it
-    needs the real, server-assigned color AND rating - there is nothing
-    to report before that). A ConnectionRejectedError is caught here and
-    shown via WRONG_PASSWORD_DISPLAY_MESSAGE if `exc.reason ==
+    (the one point that can raise ConnectionRejectedError, and that may
+    now print the searching-for-opponent message partway through, via
+    the injected callback, before it either succeeds or times out), and
+    the welcome message can only be formatted AFTER a successful connect
+    (it needs the real, server-assigned color AND rating - there is
+    nothing to report before that). A ConnectionRejectedError is caught
+    here and shown via WRONG_PASSWORD_DISPLAY_MESSAGE if `exc.reason ==
     "wrong_password"`, SERVER_FULL_DISPLAY_MESSAGE if `exc.reason ==
-    "server_full"`, or a generic fallback showing `exc.reason` verbatim
-    for any other (defensive - this client's own connect_fn always sends
-    a well-formed AUTH command, so a "malformed:..." reason should never
-    actually reach this branch in practice, but is not silently
-    misreported as "server full" if it somehow did). launch_gui_fn is
-    reached (and therefore ever called) only on the non-rejected path,
-    per this stage's own explicit requirement that a rejected
-    connection must never attempt to construct/launch a GUI.
+    "server_full"`, MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE if `exc.reason
+    == "matchmaking_timeout"` (Stage E1), or a generic fallback showing
+    `exc.reason` verbatim for any other (defensive - this client's own
+    connect_fn always sends a well-formed AUTH command, so a
+    "malformed:..." reason should never actually reach this branch in
+    practice, but is not silently misreported as "server full" if it
+    somehow did). launch_gui_fn is reached (and therefore ever called)
+    only on the non-rejected path, per this stage's own explicit
+    requirement that a rejected connection must never attempt to
+    construct/launch a GUI.
     """
 
     username = prompt_username(input_fn, output_fn)
@@ -338,12 +372,16 @@ def run_shell_login_and_launch(
 
     output_fn(f"Connecting to {uri} ...")
     try:
-        runner = connect_fn(uri, username, password)
+        runner = connect_fn(
+            uri, username, password, lambda: output_fn(SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE)
+        )
     except ConnectionRejectedError as exc:
         if exc.reason == "wrong_password":
             output_fn(WRONG_PASSWORD_DISPLAY_MESSAGE)
         elif exc.reason == "server_full":
             output_fn(SERVER_FULL_DISPLAY_MESSAGE)
+        elif exc.reason == "matchmaking_timeout":
+            output_fn(MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE)
         else:
             output_fn(f"Connection rejected: {exc.reason}")
         return

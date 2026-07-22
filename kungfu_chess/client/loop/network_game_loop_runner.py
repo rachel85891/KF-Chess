@@ -808,6 +808,7 @@ class NetworkGameLoopRunner:
         window_name: str = DEFAULT_WINDOW_NAME,
         headless: bool = False,
         clock: Callable[[], float] = time.perf_counter,
+        on_searching_for_opponent: Optional[Callable[[], None]] = None,
     ) -> None:
         """Connect to `uri` with real credentials, learn this client's
         assigned color and rating, and wire every reused rendering/
@@ -846,15 +847,23 @@ class NetworkGameLoopRunner:
                 minus an earlier one) - never compared against any
                 absolute/wall-clock meaning, so any monotonically
                 comparable float source works.
+            on_searching_for_opponent: Called (with no arguments) each
+                time the server reports this connection is still
+                waiting for a matchmaking opponent (Stage E1 - see
+                NetworkGameClient.connect's own identical parameter)
+                - forwarded straight through, unchanged. Defaults to
+                None (no callback); this class itself never reacts to
+                it.
 
         Returns:
             None.
 
         Raises:
             ConnectionRejectedError: If the server rejected this
-                connection - "server_full", or a real login failure
-                (see module docstring's "STAGE D2" section - `reason`
-                distinguishes the two).
+                connection - "server_full", a real login failure, or a
+                real matchmaking timeout (see module docstring's
+                "STAGE D2" section and NetworkGameClient's own "STAGE
+                E1" section - `reason` distinguishes all three).
         """
 
         self._headless = headless
@@ -864,7 +873,7 @@ class NetworkGameLoopRunner:
         self.username = username
 
         self.network_client = NetworkGameClient()
-        self.assigned_color = self.network_client.connect(uri, username, password)
+        self.assigned_color = self.network_client.connect(uri, username, password, on_searching_for_opponent)
         if self.assigned_color is None:
             reason = self.network_client.rejection_reason
             self.network_client.close()
