@@ -59,7 +59,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
-from server.game_server import GameServer
+from server.application.game_server import GameServer
 
 _RECV_TIMEOUT_S = 5.0
 

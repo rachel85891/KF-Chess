@@ -45,8 +45,8 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.io.board_printer import BoardPrinter
-from server.game_server import GameServer
-from server.game_session import GameSession
+from server.application.game_server import GameServer
+from server.application.game_session import GameSession
 
 _STARTING_BOARD_TEXT = BoardPrinter().print(GameSession().engine.board)
 _RECV_TIMEOUT_S = 5.0

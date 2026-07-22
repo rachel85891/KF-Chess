@@ -361,10 +361,10 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.notation.jump_command import MalformedJumpCommandError, ParsedJumpCommand
-from server.connection_manager import ConnectionManager
-from server.game_session import GameSession
-from server.move_command import MalformedCommandError, ParsedMoveCommand
-from server.protocol_handler import SERVER_FULL_MESSAGE, ProtocolHandler
+from server.application.game_session import GameSession
+from server.presentation.connection_manager import ConnectionManager
+from server.presentation.move_command import MalformedCommandError, ParsedMoveCommand
+from server.presentation.protocol_handler import SERVER_FULL_MESSAGE, ProtocolHandler
 
 TICK_INTERVAL_S = 1 / 30
 

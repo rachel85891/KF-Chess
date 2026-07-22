@@ -100,7 +100,7 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.notation.game_event_wire_format import format_game_event
 from kungfu_chess.notation.game_state_snapshot_wire_format import format_game_state_snapshot
 from kungfu_chess.notation.jump_command import JUMP_COMMAND_PREFIX, ParsedJumpCommand, parse_jump_command
-from server.move_command import ParsedMoveCommand, parse_move_command
+from server.presentation.move_command import ParsedMoveCommand, parse_move_command
 
 SERVER_FULL_MESSAGE = "server_full"
 _REJECTION_PREFIX = "rejected:"

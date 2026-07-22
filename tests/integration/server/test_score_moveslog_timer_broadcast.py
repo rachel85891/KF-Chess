@@ -42,8 +42,8 @@ from kungfu_chess.notation.game_state_snapshot_wire_format import (
     STATE_SNAPSHOT_MESSAGE_PREFIX,
     parse_game_state_snapshot,
 )
-from server.game_server import GameServer
-from server.game_session import GameSession
+from server.application.game_server import GameServer
+from server.application.game_session import GameSession
 
 _RECV_TIMEOUT_S = 5.0
 

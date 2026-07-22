@@ -19,7 +19,7 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.notation.move_command_format import format_move_command
-from server.move_command import ParsedMoveCommand, parse_move_command
+from server.presentation.move_command import ParsedMoveCommand, parse_move_command
 
 _CASES = [
     (Color.WHITE, PieceKind.QUEEN, Position(row=6, col=4), Position(row=3, col=4)),

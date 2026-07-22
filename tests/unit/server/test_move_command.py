@@ -12,7 +12,7 @@ import pytest
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
-from server.move_command import MalformedCommandError, ParsedMoveCommand, parse_move_command
+from server.presentation.move_command import MalformedCommandError, ParsedMoveCommand, parse_move_command
 
 
 def test_parses_a_well_formed_white_queen_move():

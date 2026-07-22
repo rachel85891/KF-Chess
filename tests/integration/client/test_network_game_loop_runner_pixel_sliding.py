@@ -31,8 +31,8 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
-from server.game_server import GameServer
-from server.game_session import GameSession
+from server.application.game_server import GameServer
+from server.application.game_session import GameSession
 
 _JOIN_TIMEOUT_S = 5.0
 _POLL_INTERVAL_S = 0.05

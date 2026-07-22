@@ -22,8 +22,8 @@ from contextlib import asynccontextmanager
 
 import websockets
 
-from server.connection_manager import ConnectionManager
 from server.main import build_handler, echo_message
+from server.presentation.connection_manager import ConnectionManager
 
 
 @asynccontextmanager

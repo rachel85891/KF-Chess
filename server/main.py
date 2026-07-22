@@ -103,8 +103,8 @@ import websockets
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.exceptions import ConnectionClosed
 
-from server.connection_manager import ConnectionManager
-from server.game_server import GameServer
+from server.application.game_server import GameServer
+from server.presentation.connection_manager import ConnectionManager
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8765
