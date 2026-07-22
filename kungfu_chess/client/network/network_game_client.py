@@ -141,6 +141,43 @@ network_game_loop_runner.NetworkGameLoopRunner, this same stage) reads
 `self.rejection_reason` after seeing `self.assigned_color is None`,
 exactly the same "read a plain attribute after the fact" pattern this
 class's own pre-existing `self.assigned_color` already established.
+
+STAGE E1 - REAL MATCHMAKING: THE "FIRST MESSAGE" IS NOW A REAL
+SEQUENCE, NOT ALWAYS EXACTLY ONE MESSAGE (feature/matchmaking-elo-
+queue-e1): a successfully-authenticated connection now ALWAYS receives
+"searching_for_opponent" first (GameServer no longer joins a fixed
+session immediately) - `_do_connect` now LOOPS, reading messages until
+one is NOT the searching-for-opponent literal, invoking the new,
+optional `on_searching_for_opponent` callback each time it IS seen
+(there is exactly one such message per real connection, but the loop
+shape does not assume that - it simply keeps reading until the FINAL
+outcome arrives). That final message is now one of FOUR possible
+shapes instead of three: the pre-existing assigned_color/server_full/
+rejected, plus a new "matchmaking_timeout:<detail>" message (see
+server/presentation/protocol_handler.py's own "STAGE E1 - MATCHMAKING
+WIRE TEXT" docstring section for why this is its own distinct prefix,
+not a "rejected:..." message) - `_parse_join_response` maps this to
+`rejection_reason="matchmaking_timeout"`, the same "plain fixed
+keyword" shape `"server_full"`/`"wrong_password"` already use, so every
+existing caller that only ever branches on `self.rejection_reason`'s
+own string value needs no structural change to handle this third real
+rejection cause.
+
+`connect()` MAY NOW BLOCK FOR UP TO THE SERVER'S OWN CONFIGURED
+MATCHMAKING TIMEOUT (60 real seconds, by default), NOT JUST FOR THE
+TIME IT TAKES TO ESTABLISH A CONNECTION: an intentional, necessary
+consequence of real matchmaking (this stage's own task: "wait for
+either a match... or a timeout message") - `connect()` remains a
+single, still-synchronous, still-blocking call from the calling
+thread's own perspective (unchanged contract), it simply may now take
+much longer in practice than the previous, near-instant handshake did.
+`on_searching_for_opponent` is the mechanism a caller uses to give its
+own user real-time feedback DURING that longer wait (e.g.
+kungfu_chess.client.home_screen prints a "searching for opponent"
+line the moment this callback fires, rather than only knowing
+afterward that time passed) - see kungfu_chess.client.loop.
+network_game_loop_runner.NetworkGameLoopRunner's own docstring for how
+this is threaded one level further up.
 """
 
 from __future__ import annotations
@@ -149,7 +186,7 @@ import asyncio
 import queue
 import threading
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -165,6 +202,14 @@ from kungfu_chess.notation.move_command_format import format_move_command
 _ASSIGNED_COLOR_PREFIX = "assigned_color:"
 _SERVER_FULL_MESSAGE = "server_full"
 _REJECTION_PREFIX = "rejected:"
+# Stage E1 - duplicated here (not imported from server/), matching
+# _SERVER_FULL_MESSAGE/_REJECTION_PREFIX's own established "a client
+# must never import from server/" convention (see
+# kungfu_chess/notation/algebraic_notation.py's own docstring for the
+# full reasoning this already established).
+_SEARCHING_FOR_OPPONENT_MESSAGE = "searching_for_opponent"
+_MATCHMAKING_TIMEOUT_PREFIX = "matchmaking_timeout:"
+_MATCHMAKING_TIMEOUT_REASON = "matchmaking_timeout"
 
 _THREAD_START_TIMEOUT_S = 5.0
 _CLOSE_TIMEOUT_S = 5.0
@@ -197,16 +242,18 @@ class _JoinResponse:
 
 
 def _parse_join_response(message: str) -> _JoinResponse:
-    """Parse the server's very first message into a _JoinResponse - see
-    module docstring's "THE FIRST-MESSAGE RESPONSE NOW HAS THREE
-    POSSIBLE SHAPES" section for the full reasoning behind each branch.
+    """Parse the server's FINAL first-stage message (after any
+    "searching_for_opponent" messages have already been drained by
+    _do_connect's own loop - see module docstring's "STAGE E1" section)
+    into a _JoinResponse.
 
     Args:
-        message: The raw first message from the server - expected to
-            be "assigned_color:<color>:<rating>", "server_full", or
-            "rejected:<reason>" (see server/application/game_server.py's
-            own handle_connection, re-checked directly for these exact
-            literal shapes before writing this).
+        message: The raw message from the server - expected to be
+            "assigned_color:<color>:<rating>", "server_full",
+            "matchmaking_timeout:<detail>", or "rejected:<reason>" (see
+            server/application/game_server.py's own handle_connection,
+            re-checked directly for these exact literal shapes before
+            writing this).
 
     Returns:
         A _JoinResponse - success (color+rating) or rejection
@@ -214,11 +261,14 @@ def _parse_join_response(message: str) -> _JoinResponse:
 
     Raises:
         UnexpectedJoinResponseError: If `message` matches none of the
-            three documented forms.
+            four documented forms.
     """
 
     if message == _SERVER_FULL_MESSAGE:
         return _JoinResponse(color=None, rating=None, rejection_reason=_SERVER_FULL_MESSAGE)
+
+    if message.startswith(_MATCHMAKING_TIMEOUT_PREFIX):
+        return _JoinResponse(color=None, rating=None, rejection_reason=_MATCHMAKING_TIMEOUT_REASON)
 
     if message.startswith(_REJECTION_PREFIX):
         reason = message[len(_REJECTION_PREFIX) :]
@@ -269,14 +319,21 @@ class NetworkGameClient:
         self._connection: Optional[ClientConnection] = None
         self._incoming: "queue.Queue[str]" = queue.Queue()
 
-    def connect(self, uri: str, username: str, password: str) -> Optional[Color]:
+    def connect(
+        self,
+        uri: str,
+        username: str,
+        password: str,
+        on_searching_for_opponent: Optional[Callable[[], None]] = None,
+    ) -> Optional[Color]:
         """Start this client's background thread + event loop, open a
         real WebSocket connection to `uri`, send the real AUTH command
-        (Stage D2 - see module docstring's "STAGE D2 - REAL AUTH
-        HANDSHAKE" section), and receive the server's one-time join
-        response - see module docstring's "WHY THE FIRST MESSAGE... IS
-        HANDLED SEPARATELY" section for why this method blocks the
-        calling thread for exactly this much, and no more.
+        (Stage D2), and wait for the real matchmaking outcome (Stage
+        E1 - a match, or a timeout) - see module docstring's "WHY THE
+        FIRST MESSAGE... IS HANDLED SEPARATELY" and "STAGE E1" sections
+        for why this method blocks the calling thread for exactly this
+        much (now potentially much longer than before Stage E1), and no
+        more.
 
         Args:
             uri: The WebSocket URI to connect to (e.g.
@@ -287,14 +344,20 @@ class NetworkGameClient:
             password: The account's plaintext password - sent to the
                 server as part of the same AUTH command; never stored
                 on this object beyond this one call.
+            on_searching_for_opponent: Called (with no arguments) each
+                time this connection receives the server's real
+                "searching_for_opponent" message - see module
+                docstring's "STAGE E1" section. Defaults to None (no
+                callback) - purely for a caller that wants real-time
+                feedback during a potentially long wait; never required
+                for correctness.
 
         Returns:
             The Color this connection was assigned (also stored as
             self.assigned_color), or None if the server rejected this
-            connection - either "server_full" (see
-            server/application/game_server.py's own third-plus-
-            connection policy) or a real login failure (self.
-            rejection_reason distinguishes the two - see module
+            connection or it timed out waiting for a match (self.
+            rejection_reason distinguishes "server_full",
+            "wrong_password", and "matchmaking_timeout" - see module
             docstring).
 
         Raises:
@@ -303,7 +366,9 @@ class NetworkGameClient:
 
         self._start_background_loop()
 
-        future = asyncio.run_coroutine_threadsafe(self._do_connect(uri, username, password), self._loop)
+        future = asyncio.run_coroutine_threadsafe(
+            self._do_connect(uri, username, password, on_searching_for_opponent), self._loop
+        )
         self.assigned_color = future.result()
         return self.assigned_color
 
@@ -331,22 +396,28 @@ class NetworkGameClient:
         if not loop_ready.wait(timeout=_THREAD_START_TIMEOUT_S):
             raise NetworkGameClientError("background event loop failed to start in time")
 
-    async def _do_connect(self, uri: str, username: str, password: str) -> Optional[Color]:
+    async def _do_connect(
+        self, uri: str, username: str, password: str, on_searching_for_opponent: Optional[Callable[[], None]]
+    ) -> Optional[Color]:
         """Runs ON the background loop's own thread (scheduled via
         run_coroutine_threadsafe by connect(), above): open the real
         connection, send the real AUTH command (Stage D2 - this
         connection's own very first message, before anything is ever
-        read back), receive the one-time join response, and start the
-        long-running receive loop as a plain task on this SAME loop
-        (safe here - unlike send_move, this runs already inside the
-        loop's own thread, so a bare asyncio task is the correct,
-        simpler primitive; run_coroutine_threadsafe is only needed to
-        get INTO this thread from another one in the first place).
+        read back), then loop reading messages until the REAL,
+        FINAL first-stage outcome arrives (Stage E1 - see module
+        docstring's "STAGE E1" section for why this is now a loop, not
+        a single read), and start the long-running receive loop as a
+        plain task on this SAME loop (safe here - unlike send_move,
+        this runs already inside the loop's own thread, so a bare
+        asyncio task is the correct, simpler primitive;
+        run_coroutine_threadsafe is only needed to get INTO this thread
+        from another one in the first place).
 
         Args:
             uri: The WebSocket URI to connect to.
             username: See connect().
             password: See connect().
+            on_searching_for_opponent: See connect().
 
         Returns:
             The parsed join response's own color (see
@@ -357,10 +428,18 @@ class NetworkGameClient:
 
         self._connection = await websockets.connect(uri)
         await self._connection.send(format_auth_command(username, password))
-        first_message = await self._connection.recv()
+
+        while True:
+            message = await self._connection.recv()
+            if message == _SEARCHING_FOR_OPPONENT_MESSAGE:
+                if on_searching_for_opponent is not None:
+                    on_searching_for_opponent()
+                continue
+            break
+
         asyncio.get_running_loop().create_task(self._receive_loop())
 
-        parsed = _parse_join_response(first_message)
+        parsed = _parse_join_response(message)
         self.rating = parsed.rating
         self.rejection_reason = parsed.rejection_reason
         return parsed.color
