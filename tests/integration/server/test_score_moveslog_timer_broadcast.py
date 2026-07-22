@@ -24,6 +24,15 @@ Board's actual dimensions (re-verified directly in that module's own
 docstring) - so algebraic squares for this test's small 3x3 board still
 compute correctly via the same fixed rank=8-row/file=chr(col) formula,
 exactly as they would against a full 8x8 board.
+
+UPDATED for Stage D2's real auth handshake (feature/home-screen-d2-
+auth-protocol, see server/application/game_server.py's own "STAGE D2 -
+REAL AUTH HANDSHAKE" docstring section): both clients below now send a
+real "AUTH:<username>:<password>" command as their own very first
+message before receiving assigned_color. _RECV_TIMEOUT_S is widened
+from 5.0 to accommodate real, accepted PBKDF2 authentication latency
+(see test_protocol_wiring.py's own identical note for the full
+reasoning).
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
+from kungfu_chess.notation.auth_command_format import format_auth_command
 from kungfu_chess.notation.game_state_snapshot_wire_format import (
     STATE_SNAPSHOT_MESSAGE_PREFIX,
     parse_game_state_snapshot,
@@ -45,7 +55,7 @@ from kungfu_chess.notation.game_state_snapshot_wire_format import (
 from server.application.game_server import GameServer
 from server.application.game_session import GameSession
 
-_RECV_TIMEOUT_S = 5.0
+_RECV_TIMEOUT_S = 20.0
 
 
 def _empty_grid(rows: int, cols: int) -> list[list[None]]:
@@ -66,7 +76,7 @@ def _capture_ready_session() -> GameSession:
 
 @asynccontextmanager
 async def _running_game_server(session: GameSession):
-    game_server = GameServer(session=session)
+    game_server = GameServer(session=session, user_repository_db_path=":memory:")
     server = await websockets.serve(game_server.handle_connection, "localhost", 0)
     tick_task = asyncio.create_task(game_server.run_tick_loop())
     try:
@@ -87,6 +97,8 @@ def test_a_real_capture_broadcasts_the_correct_score_move_log_and_advancing_elap
         session = _capture_ready_session()
         async with _running_game_server(session) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()  # assigned_color
                 await client2.recv()
                 await client1.recv()  # join-time board state

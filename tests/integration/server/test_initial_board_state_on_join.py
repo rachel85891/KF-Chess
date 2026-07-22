@@ -33,6 +33,17 @@ wire-event + board-text pair for MoveAccepted/JumpAccepted/PieceArrived
 - this test file's own event-driven-broadcast test drains one more
 message per such event again; final assertions on board-text content
 are unchanged.
+
+UPDATED AGAIN for Stage D2's real auth handshake (feature/home-screen-
+d2-auth-protocol, see server/application/game_server.py's own "STAGE D2
+- REAL AUTH HANDSHAKE" docstring section): every client below must now
+send a real "AUTH:<username>:<password>" command as its own very first
+message before it can ever receive assigned_color - the still-rejected
+THIRD/server_full client needs no change (that rejection happens before
+the server ever reads anything it sent). _RECV_TIMEOUT_S is widened
+from 5.0 to accommodate real, accepted PBKDF2 authentication latency
+(see test_protocol_wiring.py's own identical note for the full
+reasoning).
 """
 
 from __future__ import annotations
@@ -45,16 +56,17 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.io.board_printer import BoardPrinter
+from kungfu_chess.notation.auth_command_format import format_auth_command
 from server.application.game_server import GameServer
 from server.application.game_session import GameSession
 
 _STARTING_BOARD_TEXT = BoardPrinter().print(GameSession().engine.board)
-_RECV_TIMEOUT_S = 5.0
+_RECV_TIMEOUT_S = 20.0
 
 
 @asynccontextmanager
 async def _running_game_server(start_tick_loop: bool = False):
-    game_server = GameServer()
+    game_server = GameServer(user_repository_db_path=":memory:")
     server = await websockets.serve(game_server.handle_connection, "localhost", 0)
     tick_task = asyncio.create_task(game_server.run_tick_loop()) if start_tick_loop else None
     try:
@@ -75,6 +87,7 @@ def test_first_client_receives_the_starting_board_state_right_after_assigned_col
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client:
+                await client.send(format_auth_command("alice", "password"))
                 welcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
                 board_state = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
 
@@ -88,10 +101,12 @@ def test_second_client_also_receives_its_own_correct_starting_board_independentl
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1:
+                await client1.send(format_auth_command("client1", "password1"))
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # assigned_color:white
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board state
 
                 async with websockets.connect(uri) as client2:
+                    await client2.send(format_auth_command("client2", "password2"))
                     welcome2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                     board_state2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
 
@@ -105,6 +120,8 @@ def test_third_connection_is_still_rejected_with_server_full_and_receives_no_boa
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
@@ -126,6 +143,8 @@ def test_existing_event_driven_broadcasts_still_work_after_the_join_time_board_s
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # assigned_color:white
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # join-time board state
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # assigned_color:black
