@@ -18,6 +18,8 @@ this logic untestable without a real terminal/network/display.
 from __future__ import annotations
 
 from kungfu_chess.client.home_screen import (
+    MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE,
+    SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE,
     SERVER_FULL_DISPLAY_MESSAGE,
     WRONG_PASSWORD_DISPLAY_MESSAGE,
     format_welcome_message,
@@ -142,7 +144,7 @@ def test_successful_login_connects_with_the_collected_credentials_prints_the_cor
     connect_calls: list[tuple[str, object, object]] = []
     launch_calls: list[object] = []
 
-    def fake_connect(uri: str, username: object, password: object):
+    def fake_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
         connect_calls.append((uri, username, password))
         return fake_runner
 
@@ -171,7 +173,7 @@ def test_server_full_response_shows_the_correct_message_and_never_launches_the_g
     io = _FakeIO(["Alice", "correct horse battery staple"])
     launch_calls: list[object] = []
 
-    def rejecting_connect(uri: str, username: object, password: object):
+    def rejecting_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
         raise ConnectionRejectedError(f"server rejected this connection (server_full): {uri}", reason="server_full")
 
     def fake_launch(runner: object) -> None:
@@ -194,7 +196,7 @@ def test_wrong_password_response_shows_the_correct_message_and_never_launches_th
     io = _FakeIO(["Alice", "wrong password"])
     launch_calls: list[object] = []
 
-    def rejecting_connect(uri: str, username: object, password: object):
+    def rejecting_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
         raise ConnectionRejectedError(f"server rejected this connection (wrong_password): {uri}", reason="wrong_password")
 
     def fake_launch(runner: object) -> None:
@@ -214,6 +216,58 @@ def test_wrong_password_response_shows_the_correct_message_and_never_launches_th
     assert launch_calls == []
 
 
+def test_matchmaking_timeout_response_shows_the_correct_message_and_never_launches_the_gui():
+    io = _FakeIO(["Alice", "correct horse battery staple"])
+    launch_calls: list[object] = []
+
+    def rejecting_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
+        raise ConnectionRejectedError(
+            f"server rejected this connection (matchmaking_timeout): {uri}", reason="matchmaking_timeout"
+        )
+
+    def fake_launch(runner: object) -> None:
+        launch_calls.append(runner)
+
+    run_shell_login_and_launch(
+        "ws://localhost:8765",
+        input_fn=io.input_fn,
+        output_fn=io.output_fn,
+        password_input_fn=io.password_input_fn,
+        connect_fn=rejecting_connect,
+        launch_gui_fn=fake_launch,
+    )
+
+    assert MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE in io.printed
+    assert SERVER_FULL_DISPLAY_MESSAGE not in io.printed
+    assert WRONG_PASSWORD_DISPLAY_MESSAGE not in io.printed
+    assert launch_calls == []
+
+
+def test_searching_for_opponent_callback_prints_the_correct_message_when_the_real_connect_fn_invokes_it():
+    # connect_fn is handed a callback (mirrors the real _default_connect
+    # -> NetworkGameLoopRunner -> NetworkGameClient chain) - this proves
+    # run_shell_login_and_launch supplies one that prints the correct
+    # message, and only when/if connect_fn actually calls it (real,
+    # server-confirmed feedback - never printed eagerly beforehand).
+    io = _FakeIO(["Alice", "correct horse battery staple"])
+
+    def connect_that_reports_searching(uri: str, username: object, password: object, on_searching_for_opponent):
+        on_searching_for_opponent()
+        on_searching_for_opponent()  # a real server could send this more than once
+        return _FakeRunner(Color.WHITE)
+
+    run_shell_login_and_launch(
+        "ws://localhost:8765",
+        input_fn=io.input_fn,
+        output_fn=io.output_fn,
+        password_input_fn=io.password_input_fn,
+        connect_fn=connect_that_reports_searching,
+        launch_gui_fn=lambda runner: None,
+    )
+
+    assert io.printed.count(SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE) == 2
+
+
 def test_username_then_password_are_prompted_before_any_connection_attempt():
     # Proves the ORDER: username, then password, then connecting - not
     # any other order.
@@ -228,7 +282,7 @@ def test_username_then_password_are_prompted_before_any_connection_attempt():
         order.append("password_prompt")
         return io.password_input_fn(prompt)
 
-    def fake_connect(uri: str, username: object, password: object):
+    def fake_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
         order.append("connect")
         return _FakeRunner(Color.WHITE)
 
