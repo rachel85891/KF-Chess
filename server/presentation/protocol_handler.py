@@ -93,6 +93,33 @@ GameServer never imports server/presentation/auth_command.py directly
 either (this class stays the ONE place that owns "which parser applies
 to a given raw message").
 
+STAGE E1 - MATCHMAKING WIRE TEXT (feature/matchmaking-elo-queue-e1):
+two new, connect-time-only messages, sent by GameServer between a
+successful AUTH and the (now possibly much later) assigned_color
+response - see that class's own module docstring for the full sequence
+these fit into.
+  - `SEARCHING_FOR_OPPONENT_MESSAGE` ("searching_for_opponent") - a
+    bare module-level literal, mirroring `SERVER_FULL_MESSAGE`'s own
+    shape exactly (a plain, self-contained status string) rather than
+    the colon-delimited "rejected:<reason>" convention - this is
+    informational, not a rejection, so it does not belong in that
+    vocabulary.
+  - `format_matchmaking_timeout(timeout_seconds)` - its own dedicated
+    "matchmaking_timeout:<detail>" prefix, DELIBERATELY DISTINCT from
+    the existing "rejected:<reason>" convention (unlike wrong_password,
+    which reuses that vocabulary) - a client that has been waiting in
+    the matchmaking queue receives this as its own THIRD possible
+    first-stage outcome, alongside assigned_color and server_full/
+    rejected; giving it a genuinely different prefix (rather than
+    "rejected:matchmaking_timeout") makes it unambiguous at the wire
+    level that this is a distinct category of outcome - a timeout, not
+    a rejection of anything the client did wrong. Takes
+    `timeout_seconds` as a parameter (rather than a fixed string)
+    purely so the human-readable detail text always reflects
+    whatever real timeout GameServer was actually configured with
+    (its own default is 60, per this stage's own "one-minute timeout"
+    requirement, but tests override it to a short duration).
+
 SENDING (`send`/`broadcast`): the exact ConnectionClosed-swallowing
 policy GameServer's own (now retired) `_safe_send`/`_broadcast` already
 established, moved here unchanged - see server/main.py's own
@@ -138,6 +165,8 @@ from server.presentation.move_command import ParsedMoveCommand, parse_move_comma
 
 SERVER_FULL_MESSAGE = "server_full"
 _REJECTION_PREFIX = "rejected:"
+SEARCHING_FOR_OPPONENT_MESSAGE = "searching_for_opponent"
+_MATCHMAKING_TIMEOUT_PREFIX = "matchmaking_timeout:"
 
 
 class ProtocolHandler:
@@ -205,6 +234,16 @@ class ProtocolHandler:
         """
 
         return parse_auth_command(message)
+
+    def format_matchmaking_timeout(self, timeout_seconds: float) -> str:
+        """The "matchmaking_timeout:<detail>" message a connection
+        receives if it waited in the matchmaking queue longer than
+        `timeout_seconds` with no compatible opponent found - see
+        module docstring's "STAGE E1 - MATCHMAKING WIRE TEXT" section
+        for why this is its own distinct prefix, not a "rejected:..."
+        message."""
+
+        return f"{_MATCHMAKING_TIMEOUT_PREFIX} no opponent found within {timeout_seconds:g} seconds"
 
     def format_rejection(self, reason: str) -> str:
         """The single "rejected:<reason>" wire convention every direct,
