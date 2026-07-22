@@ -307,6 +307,144 @@ deliberately does not build any dict-of-rooms/room-id parsing now -
 there is exactly one real caller (this stage's own tests and
 server/main.py) and no real second room to design against yet.
 
+STAGE D2 - REAL AUTH HANDSHAKE (feature/home-screen-d2-auth-protocol):
+`handle_connection` now performs one more real exchange BEFORE any
+color is ever assigned - the client's very first message on a newly
+accepted connection must now be a real "AUTH:<username>:<password>"
+command (kungfu_chess.notation.auth_command_format.format_auth_command
+is the client-side counterpart that builds it -
+kungfu_chess.client.network.network_game_client sends it immediately
+after opening the connection, before reading anything back). This
+replaces Stage C1's cosmetic-only username (which was never
+transmitted at all - see kungfu_chess.client.home_screen's own former
+"SCOPE" docstring section, now superseded) with a REAL, server-verified
+account, backed by server/persistence/user_repository.py's
+UserRepository.
+
+ORDERING - THE "server_full" CHECK STAYS FIRST, UNCHANGED, BEFORE EVER
+READING THE AUTH MESSAGE: re-verified directly against this stage's own
+requirement to keep the third-plus-connection policy's existing
+behavior/tests untouched - a full server rejects and closes a
+connection WITHOUT ever needing to read anything that connection sent
+(the client's own already-sent AUTH message, if any, is simply never
+read in that case, which is harmless - the connection is about to be
+closed regardless). This is why every pre-existing "server_full"
+test/scenario needed zero changes despite this whole stage's own
+otherwise-sweeping change to the connect-time exchange.
+
+CREATE-OR-LOGIN, DECIDED HERE VIA UserRepository.create_account'S OWN
+RETURN VALUE (`_authenticate`, below): a username that does not yet
+exist is signed up on the spot (rating starts at
+UserRepository.DEFAULT_STARTING_RATING) - re-using
+create_account's own real, already-tested "returns False if the
+username already exists" contract as the SIGNAL for "this is a LOGIN,
+not a SIGNUP" is simpler and more directly correct than a separate,
+redundant existence check first (the same "reuse the real operation's
+own outcome as the decision, don't re-derive it" principle
+UserRepository's own create_account already applies internally via the
+real PRIMARY KEY constraint, re-verified directly). If create_account
+returns False (already exists), verify_login decides whether this is a
+real login or a wrong-password rejection - UserRepository's own
+username-enumeration-safety guarantee (that module's own docstring)
+means this class never needs its own separate "does this username
+exist" check either.
+
+WHY UserRepository'S OWN SYNCHRONOUS CALLS ARE OFFLOADED TO A SINGLE,
+DEDICATED WORKER THREAD - NOT asyncio.to_thread's OWN DEFAULT EXECUTOR
+(this stage's own "Part A" requirement, answering UserRepository's own
+documented "THREADING/ASYNC CONTRACT - EXPLICITLY DEFERRED TO STAGE D2"
+gap): every one of GameServer's own async methods runs on asyncio's
+single event-loop thread (this class's own "WHY THE BROADCASTER
+BRIDGES A SYNC CALLBACK..." section already establishes this as the
+one, shared thread every coroutine here runs on) - a synchronous
+sqlite3 call (real disk I/O, or even real CPU-bound PBKDF2 hashing)
+executed directly on that thread would block EVERY connection this
+server is juggling, including the real-time tick loop (run_tick_loop),
+for as long as that one call takes.
+
+`asyncio.to_thread` itself (`loop.run_in_executor(None, ...)` under the
+hood) was tried FIRST, and rejected: its DEFAULT executor draws from a
+pool of MULTIPLE, not-guaranteed-identical worker threads across
+separate calls - but sqlite3.Connection objects (UserRepository's own
+`self._connection`, re-verified directly - never overridden with
+`check_same_thread=False`, which this stage is not permitted to add,
+since UserRepository itself must not be modified) are bound FOREVER to
+whichever single OS thread constructed them; any call from a DIFFERENT
+thread raises `sqlite3.ProgrammingError` immediately, unconditionally
+(confirmed directly: this is exactly what running the real integration
+tests below against a naive `asyncio.to_thread(self._user_repository.
+create_account, ...)` produced on the very first call). THE FIX:
+`self._user_repository_executor`, a `concurrent.futures.
+ThreadPoolExecutor(max_workers=1)` constructed once in `__init__` and
+held for this GameServer instance's whole lifetime - every single
+UserRepository-touching call (including the UserRepository object's own
+CONSTRUCTION - see "LAZY, THREAD-PINNED CONSTRUCTION" below) is
+submitted to THIS one, persistent executor via
+`loop.run_in_executor(self._user_repository_executor, ...)`, which -
+because the executor has exactly ONE worker thread it reuses for every
+submitted job, for as long as the executor exists - guarantees every
+call, from the very first to the very last, runs on the literal SAME OS
+thread. This is explicitly "an equivalent" to asyncio.to_thread (this
+stage's own task wording permits one) - the standard, documented
+pattern for offloading calls into a thread-affine resource (sqlite3
+being the textbook example) without blocking the event loop.
+
+LAZY, THREAD-PINNED CONSTRUCTION (WHY THIS STAGE COULD NOT ACCEPT AN
+ALREADY-BUILT UserRepository INSTANCE, UNLIKE session/
+connection_manager/protocol_handler's own identical-LOOKING DIP
+pattern): the thread-affinity constraint above applies to construction
+too - `sqlite3.connect()` itself is what records the "owning" thread.
+Accepting an already-constructed UserRepository instance (built by
+whatever thread called `GameServer(user_repository=...)`, almost always
+the event-loop thread itself in real use, or a test's own main thread)
+would bind its connection to THAT thread - a thread this class's own
+persistent worker thread (above) is, by definition, never the same as.
+Every call would then fail identically to the naive-to_thread case
+above, regardless of which executor performs it. THE FIX: GameServer
+instead accepts `user_repository_db_path: Optional[str]` (a real
+filesystem path, or ":memory:" - the same two forms UserRepository's
+own constructor already accepts) rather than a ready object, and
+constructs the real UserRepository itself, LAZILY, the first time
+`_authenticate` ever runs - submitted to, and therefore actually
+executed ON, the exact same persistent single-worker executor every
+later call also uses (see `_authenticate`'s own docstring for the
+lazy-init check). This preserves this stage's own "ONE UserRepository
+instance for the server's whole lifetime, not per-connection"
+requirement exactly (constructed once, cached in `self._user_repository`,
+reused for every subsequent authentication) - it only moves WHEN and on
+WHICH THREAD that one construction happens, from eager/event-loop-
+thread (broken) to lazy/persistent-worker-thread (correct). Tests that
+need an isolated database (this stage's own real-network integration
+tests) pass `user_repository_db_path=":memory:"` or a real tmp_path
+file - verifying behavior through the real wire protocol (and, for
+"no session state created," this class's own already-plain-Python
+`_connection_manager`/`_colors` state - neither is sqlite-backed, so
+neither has any thread-affinity concern at all), never by holding a
+direct reference to the internally-owned UserRepository instance
+itself (which, per the above, cannot safely be touched from any thread
+other than this class's own persistent worker thread anyway).
+
+WRONG-PASSWORD REJECTION REUSES THE EXISTING "rejected:<reason>"
+CONVENTION (format_rejection("wrong_password")), NOT A NEW BARE LITERAL
+LIKE SERVER_FULL_MESSAGE: this project already has a rich "rejected:
+<reason>" vocabulary (malformed/wrong_color/piece_mismatch/
+jump_rejected) for connection-specific outcomes - adding "wrong_password"
+as one more reason token is the more DRY, consistent choice over
+inventing a second bare-literal convention alongside SERVER_FULL_MESSAGE.
+The BEHAVIORAL pattern this stage's own task asks to mirror from
+server_full - send a clear message, then close the connection, WITHOUT
+ever calling connection_manager.add() or assigning a color - is
+followed exactly, even though the wire TEXT itself reuses the existing
+rejection vocabulary rather than server_full's own bare-literal shape.
+A malformed AUTH command (MalformedAuthCommandError) is rejected via
+the SAME "rejected:malformed:<detail>" text move/jump commands already
+produce for their own malformed cases - there is no ambiguity for a
+client about which stage of the connection this arrived at, since a
+"rejected:..." message received as the very FIRST message on a fresh
+connection can only ever be this stage's own auth rejection (an
+ordinary in-game "rejected:..." response only ever arrives AFTER the
+join sequence has already completed).
+
 BUGFIX - INITIAL BOARD STATE ON JOIN: a real usability gap found during
 manual testing, fixed here. WHY THE GAP EXISTED: `_on_game_event` (the
 broadcaster) is only ever invoked by the event_bus in reaction to a
@@ -342,6 +480,7 @@ dedicated rejection test.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import time
 from typing import Dict, Optional
 
@@ -362,6 +501,8 @@ from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.notation.jump_command import MalformedJumpCommandError, ParsedJumpCommand
 from server.application.game_session import GameSession
+from server.persistence.user_repository import UserRepository
+from server.presentation.auth_command import MalformedAuthCommandError
 from server.presentation.connection_manager import ConnectionManager
 from server.presentation.move_command import MalformedCommandError, ParsedMoveCommand
 from server.presentation.protocol_handler import SERVER_FULL_MESSAGE, ProtocolHandler
@@ -393,10 +534,11 @@ class GameServer:
         session: Optional[GameSession] = None,
         connection_manager: Optional[ConnectionManager] = None,
         protocol_handler: Optional[ProtocolHandler] = None,
+        user_repository_db_path: Optional[str] = None,
     ) -> None:
         """Construct (or accept injected) GameSession/ConnectionManager/
-        ProtocolHandler and subscribe this instance's own broadcaster to
-        the session's event bus.
+        ProtocolHandler/UserRepository and subscribe this instance's own
+        broadcaster to the session's event bus.
 
         Args:
             session: The GameSession to coordinate. Defaults to None,
@@ -416,6 +558,24 @@ class GameServer:
                 directly, nothing constructs this class with a fake/mock
                 ProtocolHandler today) - injectable (DIP) for the exact
                 same reason session/connection_manager already are.
+            user_repository_db_path: The real filesystem path (or
+                ":memory:") the real UserRepository (server/persistence/
+                user_repository.py, Stage D1) this instance authenticates
+                every connection against is constructed with - see
+                module docstring's "STAGE D2 - REAL AUTH HANDSHAKE" and
+                "LAZY, THREAD-PINNED CONSTRUCTION" sections for the full
+                reasoning, including why this accepts a PATH rather than
+                an already-built UserRepository instance (unlike
+                session/connection_manager/protocol_handler's own
+                instance-injection DIP shape). Defaults to None, which
+                constructs a fresh, real UserRepository using ITS OWN
+                default (UserRepository.DEFAULT_DB_PATH) - the real
+                production case; this stage's own real-network
+                integration tests pass ":memory:" or a real tmp_path
+                file so they never touch the real, default database
+                file. The actual UserRepository object is constructed
+                LAZILY (see _authenticate's own docstring), not here -
+                only the path is stored by this constructor.
 
         Returns:
             None.
@@ -424,18 +584,28 @@ class GameServer:
         self._session = session if session is not None else GameSession()
         self._connection_manager = connection_manager if connection_manager is not None else ConnectionManager()
         self._protocol = protocol_handler if protocol_handler is not None else ProtocolHandler()
+        self._user_repository_db_path = user_repository_db_path
+        self._user_repository: Optional[UserRepository] = None
+        # See module docstring's "WHY UserRepository'S OWN SYNCHRONOUS
+        # CALLS ARE OFFLOADED..." section - exactly one worker thread,
+        # reused for every UserRepository-touching call (including its
+        # own lazy construction) for this instance's whole lifetime, so
+        # sqlite3's own check_same_thread constraint is never violated.
+        self._user_repository_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._colors: Dict[ServerConnection, Color] = {}
 
         for event_type in _BROADCAST_EVENT_TYPES:
             self._session.event_bus.subscribe(event_type, self._on_game_event)
 
     async def handle_connection(self, connection: ServerConnection) -> None:
-        """websockets.serve's own per-connection handler - assigns a
-        color by join order (or rejects outright if the server is
-        already full - see module docstring's "THIRD-PLUS CONNECTION
-        POLICY"), then reads move commands from this connection until
-        it disconnects, gracefully or abruptly (mirrors Stage B1's own
-        handle_connection's identical disconnect handling).
+        """websockets.serve's own per-connection handler - rejects
+        outright if the server is already full (see module docstring's
+        "THIRD-PLUS CONNECTION POLICY"), otherwise authenticates the
+        connection (see module docstring's "STAGE D2 - REAL AUTH
+        HANDSHAKE" section) and assigns a color by join order, then
+        reads move commands from this connection until it disconnects,
+        gracefully or abruptly (mirrors Stage B1's own handle_connection's
+        identical disconnect handling).
 
         Args:
             connection: The real ServerConnection websockets.serve
@@ -450,6 +620,31 @@ class GameServer:
             await connection.close()
             return
 
+        try:
+            raw_auth_message = await connection.recv()
+        except ConnectionClosed:
+            # The client disconnected before ever sending its own AUTH
+            # command - nothing was ever tracked for it, so there is
+            # nothing left to clean up.
+            return
+
+        try:
+            parsed_auth = self._protocol.parse_incoming_auth_command(raw_auth_message)
+        except MalformedAuthCommandError as exc:
+            # See module docstring's "WRONG-PASSWORD REJECTION REUSES
+            # THE EXISTING..." section for why this reuses the same
+            # "rejected:malformed:<detail>" text move/jump commands
+            # already produce for their own malformed cases.
+            await self._protocol.send(connection, self._protocol.format_rejection(f"malformed:{exc}"))
+            await connection.close()
+            return
+
+        rating = await self._authenticate(parsed_auth.username, parsed_auth.password)
+        if rating is None:
+            await self._protocol.send(connection, self._protocol.format_rejection("wrong_password"))
+            await connection.close()
+            return
+
         color = Color.WHITE if self._connection_manager.connection_count == 0 else Color.BLACK
         self._colors[connection] = color
         self._connection_manager.add(connection)
@@ -459,7 +654,9 @@ class GameServer:
         # out ("white"/"black"), not the terse single-letter
         # Color.value ("w"/"b") the wire protocol itself uses - this
         # message is for a human/log to read, not parsed by anything.
-        await self._protocol.send(connection, self._protocol.format_assigned_color(color))
+        # Now also carries the account's own real rating (Stage D2) -
+        # see ProtocolHandler.format_assigned_color's own docstring.
+        await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
         # See module docstring's "BUGFIX - INITIAL BOARD STATE ON
         # JOIN" - a direct, point-to-point send to THIS connection
         # only, not a broadcast to every connection.
@@ -473,6 +670,58 @@ class GameServer:
         finally:
             self._connection_manager.remove(connection)
             self._colors.pop(connection, None)
+
+    async def _authenticate(self, username: str, password: str) -> Optional[int]:
+        """Sign up (if `username` is new) or log in (if it already
+        exists), entirely on this instance's own persistent, single
+        worker thread - see module docstring's "CREATE-OR-LOGIN...",
+        "WHY UserRepository'S OWN SYNCHRONOUS CALLS ARE OFFLOADED...",
+        and "LAZY, THREAD-PINNED CONSTRUCTION" sections for the full
+        reasoning.
+
+        Args:
+            username: The claimed username from a real, already-parsed
+                ParsedAuthCommand.
+            password: The claimed password from that same command.
+
+        Returns:
+            The account's current rating on success (a brand-new
+            account starts at UserRepository.DEFAULT_STARTING_RATING);
+            None if `username` already existed and `password` was
+            wrong - the one real rejection case this method's own
+            caller (handle_connection) must reject the connection for.
+        """
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._user_repository_executor, self._authenticate_sync, username, password)
+
+    def _authenticate_sync(self, username: str, password: str) -> Optional[int]:
+        """The real, synchronous body of _authenticate - runs
+        EXCLUSIVELY on self._user_repository_executor's one worker
+        thread (never called directly from handle_connection/
+        _authenticate's own event-loop-thread code) - see
+        _authenticate's own docstring for the full reasoning.
+
+        Lazily constructs self._user_repository on its first call (see
+        module docstring's "LAZY, THREAD-PINNED CONSTRUCTION" section)
+        - by construction, every call to this method already runs on
+        the SAME single worker thread, so the object built here on the
+        first call is guaranteed to still be on its own owning thread
+        for every later call too.
+        """
+
+        if self._user_repository is None:
+            self._user_repository = (
+                UserRepository(db_path=self._user_repository_db_path)
+                if self._user_repository_db_path is not None
+                else UserRepository()
+            )
+
+        created = self._user_repository.create_account(username, password)
+        if not created and not self._user_repository.verify_login(username, password):
+            return None
+
+        return self._user_repository.get_rating(username)
 
     async def _handle_message(self, connection: ServerConnection, assigned_color: Color, message: object) -> None:
         """Parse one raw incoming message via self._protocol

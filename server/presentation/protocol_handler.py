@@ -60,6 +60,39 @@ kungfu_chess/notation/game_event_wire_format.py and
 kungfu_chess/notation/game_state_snapshot_wire_format.py before writing
 this, rather than assumed.
 
+STAGE D2 - format_assigned_color GAINS `rating` (feature/home-screen-
+d2-auth-protocol): the join-time message now carries the account's
+current rating alongside its color - "assigned_color:white:1200" -
+because GameServer's own new pre-assigned_color AUTH handshake (see
+that class's own module docstring) has, by the time it calls this
+method, already looked the rating up via UserRepository. Still a single
+line, still sent via the same `self._protocol.send` call site in
+GameServer.handle_connection - only the CONTENT of that one existing
+message grew a field, matching this stage's own explicit "proceed with
+the EXISTING assigned_color flow unchanged" requirement (the SEQUENCE
+of messages is untouched; only this one message's own text gained a
+new, trailing piece of data). Unlike the color half (spelled out for a
+human, never parsed by anything before this stage), the rating half
+IS now genuinely parsed by a real caller
+(kungfu_chess.client.network.network_game_client's own
+`_parse_join_response`) - see that module's own docstring for why this
+is still a plain, colon-delimited literal rather than a dedicated
+kungfu_chess/notation/*_wire_format.py module of its own: there is no
+second, independent parser for this exact message shape anywhere else
+in the codebase (unlike move/jump commands, which both a client
+FORMATTER and a server PARSER need to agree on independently) - the one
+real parser lives entirely client-side, reading text this exact method
+already produces, so a shared module would be pure ceremony with
+nothing genuinely shared between two independent implementations.
+
+PARSING THE NEW AUTH COMMAND (`parse_incoming_auth_command`): a thin,
+one-line delegation to server/presentation/auth_command.py's own
+parse_auth_command - kept here, mirroring parse_incoming_command's own
+existing delegation to parse_move_command/parse_jump_command, so
+GameServer never imports server/presentation/auth_command.py directly
+either (this class stays the ONE place that owns "which parser applies
+to a given raw message").
+
 SENDING (`send`/`broadcast`): the exact ConnectionClosed-swallowing
 policy GameServer's own (now retired) `_safe_send`/`_broadcast` already
 established, moved here unchanged - see server/main.py's own
@@ -100,6 +133,7 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.notation.game_event_wire_format import format_game_event
 from kungfu_chess.notation.game_state_snapshot_wire_format import format_game_state_snapshot
 from kungfu_chess.notation.jump_command import JUMP_COMMAND_PREFIX, ParsedJumpCommand, parse_jump_command
+from server.presentation.auth_command import ParsedAuthCommand, parse_auth_command
 from server.presentation.move_command import ParsedMoveCommand, parse_move_command
 
 SERVER_FULL_MESSAGE = "server_full"
@@ -139,16 +173,38 @@ class ProtocolHandler:
             return parse_jump_command(message)
         return parse_move_command(message)
 
-    def format_assigned_color(self, color: Color) -> str:
-        """The join-time "assigned_color:<color>" message a connection
-        receives exactly once, right after being accepted - spelled out
-        ("white"/"black"), not the terse single-letter Color.value
-        ("w"/"b") the rest of the wire protocol uses, since this
-        specific message is for a human/log to read, never parsed by
-        anything (re-verified directly: no test or client parses this
-        message's own content, only checks it CONTAINS "white"/"black")."""
+    def format_assigned_color(self, color: Color, rating: int) -> str:
+        """The join-time "assigned_color:<color>:<rating>" message a
+        connection receives exactly once, right after being accepted -
+        color is spelled out ("white"/"black"), not the terse
+        single-letter Color.value ("w"/"b") the rest of the wire
+        protocol uses, matching this message's own established
+        "human-readable" convention. See module docstring's "STAGE D2 -
+        format_assigned_color GAINS `rating`" section for why the
+        rating field was added, and why this stays a plain literal
+        rather than a dedicated wire-format module."""
 
-        return f"assigned_color:{color.name.lower()}"
+        return f"assigned_color:{color.name.lower()}:{rating}"
+
+    def parse_incoming_auth_command(self, message: object) -> ParsedAuthCommand:
+        """Parse one raw incoming auth (login/signup) message - see
+        module docstring's "PARSING THE NEW AUTH COMMAND" section.
+
+        Args:
+            message: The raw text (or bytes) websockets delivered - the
+                very FIRST message GameServer.handle_connection reads
+                from a connection, before any color is ever assigned.
+
+        Returns:
+            The parsed ParsedAuthCommand.
+
+        Raises:
+            MalformedAuthCommandError: From parse_auth_command, for a
+                message that isn't a valid "AUTH:<username>:<password>"
+                command.
+        """
+
+        return parse_auth_command(message)
 
     def format_rejection(self, reason: str) -> str:
         """The single "rejected:<reason>" wire convention every direct,
