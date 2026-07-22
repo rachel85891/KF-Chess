@@ -636,18 +636,13 @@ ever shown once, in the terminal, at connect time - it never reached
 this class, and there was no visual way for a player to tell which of
 the two on-screen panels was their own versus the opponent's
 (SidePanelRenderer's own title box already labels each side "White"/
-"Black", but has no notion of "which one is ME"). THE FIX: a new,
-optional `username: Optional[str] = None` constructor parameter,
-stored verbatim as `self.username` - defaulting to None so every
-EXISTING construction (every already-passing headless test/caller that
-never passed one) keeps working completely unchanged, per this
-feature's own explicit backward-compatibility requirement. This class
-itself never inspects or validates `username` beyond storing it - it
-remains exactly the cosmetic-only value home_screen.py's own docstring
-already documents (never sent to the server, never used for anything
-but local display); the actual rendering decision (what text to show,
-for which of the two panels, in what color) is entirely
-PlayerLabelRenderer's job (kungfu_chess/client/ui/
+"Black", but has no notion of "which one is ME"). THE FIX (superseded
+in its OWN "cosmetic-only" framing by Stage D2, immediately below, but
+not in its actual mechanism): `username` is stored verbatim as
+`self.username`. This class itself never inspects `username` beyond
+storing it and (as of Stage D2) sending it - the actual rendering
+decision (what text to show, for which of the two panels, in what
+color) is entirely PlayerLabelRenderer's job (kungfu_chess/client/ui/
 player_label_renderer.py, see that module's own docstring), called
 once per color inside `_run_one_frame` alongside the existing
 SidePanelRenderer/CapturedPiecesRenderer calls, with
@@ -658,6 +653,36 @@ opponent's real username (there is none to tell it - see that module's
 own docstring for why it always shows a fixed "Opponent" label
 instead). SidePanelRenderer itself is not modified by this change, per
 this feature's own explicit requirement.
+
+STAGE D2 - `username`/NEW `password` ARE NOW REQUIRED, REAL CREDENTIALS,
+NOT A COSMETIC-ONLY OPTIONAL VALUE (feature/home-screen-d2-auth-
+protocol): the previous stage's own "cosmetic-only, never sent to the
+server" framing is superseded - `username` (together with the new,
+required `password` parameter) is now sent to the server as a real
+login/signup credential (kungfu_chess.client.network.
+network_game_client.NetworkGameClient.connect's own new "STAGE D2 -
+REAL AUTH HANDSHAKE" section), used there to create-or-authenticate a
+real account. Both parameters therefore moved from optional (defaulting
+to None/absent) to REQUIRED, positioned right after `uri` - there is no
+longer any legitimate way to connect to a real server without them, so
+a missing default is the correct signal, not an oversight; every
+existing caller (tests, kungfu_chess.client.home_screen's own
+_default_connect) was updated in this same stage to supply real values.
+`password` itself is never stored on this object beyond the one
+`connect()` call inside this constructor (mirrors NetworkGameClient's
+own identical "never stored beyond this one call" policy) - only
+`username` is kept, for PlayerLabelRenderer's own continued display
+purpose above. `self.rating` (new) stores the account's real,
+server-returned rating (`self.network_client.rating`, read immediately
+after a successful connect) - available for a caller to display, though
+this stage does not itself add it to any GUI panel (see
+kungfu_chess.client.home_screen's own docstring for where it IS shown:
+the shell's own welcome message). ConnectionRejectedError (below) now
+carries a `reason` attribute (`self.network_client.rejection_reason`) -
+"server_full" or a real login failure reason (e.g. "wrong_password") -
+so a caller can distinguish the two instead of assuming every rejection
+is a full server, matching this same stage's own new REAL second
+rejection cause.
 """
 
 from __future__ import annotations
@@ -739,9 +764,17 @@ class NetworkGameLoopRunnerError(Exception):
 
 class ConnectionRejectedError(NetworkGameLoopRunnerError):
     """Raised at construction if the server rejected this connection
-    outright ("server_full" - see server/game_server.py's own
-    third-plus-connection policy, and NetworkGameClient.connect's own
-    None return for this exact case)."""
+    outright - "server_full" (see server/application/game_server.py's
+    own third-plus-connection policy) or, as of Stage D2, a real login
+    failure (e.g. "wrong_password") - and NetworkGameClient.connect's
+    own None return for either case. `reason` (new, Stage D2) carries
+    NetworkGameClient.rejection_reason verbatim, so a caller can tell
+    the two apart rather than assuming every rejection means a full
+    server."""
+
+    def __init__(self, message: str, reason: Optional[str]) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -770,19 +803,31 @@ class NetworkGameLoopRunner:
     def __init__(
         self,
         uri: str,
+        username: str,
+        password: str,
         window_name: str = DEFAULT_WINDOW_NAME,
         headless: bool = False,
         clock: Callable[[], float] = time.perf_counter,
-        username: Optional[str] = None,
     ) -> None:
-        """Connect to `uri`, learn this client's assigned color, and
-        wire every reused rendering/input component around it - see
-        module docstring for the full reasoning.
+        """Connect to `uri` with real credentials, learn this client's
+        assigned color and rating, and wire every reused rendering/
+        input component around it - see module docstring for the full
+        reasoning.
 
         Args:
             uri: The WebSocket server URI to connect to (e.g.
                 "ws://localhost:8765") - never hardcoded in this class,
                 matching NetworkGameClient's own convention.
+            username: The account's username - see module docstring's
+                "STAGE D2" section for why this is now REQUIRED (a real,
+                server-verified credential, not an optional cosmetic
+                value) - forwarded to NetworkGameClient.connect, and
+                also kept as `self.username` for PlayerLabelRenderer's
+                own continued display purpose (see module docstring's
+                "USERNAME REACHES THE GUI" section).
+            password: The account's plaintext password - forwarded to
+                NetworkGameClient.connect; never stored on this object
+                beyond this one call.
             window_name: The OpenCV window title.
             headless: If True, skip real window creation and mouse-
                 callback attachment - identical contract to
@@ -801,22 +846,15 @@ class NetworkGameLoopRunner:
                 minus an earlier one) - never compared against any
                 absolute/wall-clock meaning, so any monotonically
                 comparable float source works.
-            username: The LOCAL player's own cosmetic username
-                (kungfu_chess.client.home_screen.prompt_username's
-                return value), or None (the default) if none was ever
-                collected - see module docstring's "USERNAME REACHES
-                THE GUI" section. Defaults to None purely for backward
-                compatibility with any existing construction that never
-                passed one; never validated or transmitted anywhere by
-                this class itself, only stored and later read by
-                _run_one_frame's own PlayerLabelRenderer calls.
 
         Returns:
             None.
 
         Raises:
-            ConnectionRejectedError: If the server responded
-                "server_full" (see module docstring).
+            ConnectionRejectedError: If the server rejected this
+                connection - "server_full", or a real login failure
+                (see module docstring's "STAGE D2" section - `reason`
+                distinguishes the two).
         """
 
         self._headless = headless
@@ -826,10 +864,13 @@ class NetworkGameLoopRunner:
         self.username = username
 
         self.network_client = NetworkGameClient()
-        self.assigned_color = self.network_client.connect(uri)
+        self.assigned_color = self.network_client.connect(uri, username, password)
         if self.assigned_color is None:
+            reason = self.network_client.rejection_reason
             self.network_client.close()
-            raise ConnectionRejectedError(f"server rejected this connection (server_full): {uri}")
+            raise ConnectionRejectedError(f"server rejected this connection ({reason}): {uri}", reason=reason)
+
+        self.rating = self.network_client.rating
 
         self.board: Optional[Board] = None
         self.click_controller = NetworkClickController(
