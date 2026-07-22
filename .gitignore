@@ -4,3 +4,4 @@ __pycache__/
 .htmlcov/
 upload_flat/
 .claude/
+server/persistence/*.db
