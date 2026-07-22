@@ -96,14 +96,14 @@ class _FakeRunner:
         self.assigned_color = assigned_color
 
 
-def test_successful_login_connects_prints_the_correct_welcome_and_launches_the_gui():
+def test_successful_login_connects_with_the_collected_username_prints_the_correct_welcome_and_launches_the_gui():
     io = _FakeIO(["Alice"])
     fake_runner = _FakeRunner(Color.WHITE)
-    connect_calls: list[str] = []
+    connect_calls: list[tuple[str, object]] = []
     launch_calls: list[object] = []
 
-    def fake_connect(uri: str):
-        connect_calls.append(uri)
+    def fake_connect(uri: str, username: object):
+        connect_calls.append((uri, username))
         return fake_runner
 
     def fake_launch(runner: object) -> None:
@@ -117,7 +117,11 @@ def test_successful_login_connects_prints_the_correct_welcome_and_launches_the_g
         launch_gui_fn=fake_launch,
     )
 
-    assert connect_calls == ["ws://localhost:8765"]
+    # connect_fn is called with the ACTUAL username prompt_username
+    # collected (feature/display-username-and-local-player-label) - not
+    # just the uri - so NetworkGameLoopRunner's own username parameter
+    # can be threaded through by the real _default_connect.
+    assert connect_calls == [("ws://localhost:8765", "Alice")]
     assert launch_calls == [fake_runner]
     assert "Welcome, Alice! You are playing as WHITE." in io.printed
 
@@ -126,7 +130,7 @@ def test_server_full_response_shows_the_correct_message_and_never_launches_the_g
     io = _FakeIO(["Alice"])
     launch_calls: list[object] = []
 
-    def rejecting_connect(uri: str):
+    def rejecting_connect(uri: str, username: object):
         raise ConnectionRejectedError(f"server rejected this connection (server_full): {uri}")
 
     def fake_launch(runner: object) -> None:
@@ -154,7 +158,7 @@ def test_username_is_prompted_before_any_connection_attempt():
         order.append("prompt")
         return io.input_fn(prompt)
 
-    def fake_connect(uri: str):
+    def fake_connect(uri: str, username: object):
         order.append("connect")
         return _FakeRunner(Color.WHITE)
 

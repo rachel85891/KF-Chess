@@ -47,27 +47,42 @@ injected collaborators, server/application/game_session.py's own
 `board: Optional[Board] = None`).
 
 `connect_fn`/`launch_gui_fn` ARE INJECTED FOR THE SAME REASON, AND FOR
-NOTHING NEW BEYOND IT: `connect_fn` defaults to the real
-NetworkGameLoopRunner class itself - constructing one IS the exact,
-unmodified connection call network_main.py already performs today
-(NetworkGameLoopRunner's own __init__ owns and connects a real
-NetworkGameClient, raising ConnectionRejectedError on "server_full" -
-see that class's own module docstring). This module deliberately does
-NOT call NetworkGameClient.connect() a second, separate time itself -
-doing so would open a REDUNDANT second real connection instead of
-reusing the one real connection this same process already needs for
-the GUI, and would also duplicate NetworkGameLoopRunner's own already-
-correct "server_full" detection instead of reusing it. `launch_gui_fn`
-defaults to `_default_launch_gui`, below, which reproduces
-network_main.py's own pre-existing `try: runner.run() finally:
-runner.close()` sequence verbatim - the actual GUI/rendering code
-inside NetworkGameLoopRunner.run() is completely untouched by this
-stage, exactly as required. Both are injectable purely so
+NOTHING NEW BEYOND IT: `connect_fn` defaults to `_default_connect`,
+below, a tiny wrapper around the real NetworkGameLoopRunner class -
+constructing one IS the exact, unmodified connection call
+network_main.py already performs today (NetworkGameLoopRunner's own
+__init__ owns and connects a real NetworkGameClient, raising
+ConnectionRejectedError on "server_full" - see that class's own module
+docstring). This module deliberately does NOT call
+NetworkGameClient.connect() a second, separate time itself - doing so
+would open a REDUNDANT second real connection instead of reusing the
+one real connection this same process already needs for the GUI, and
+would also duplicate NetworkGameLoopRunner's own already-correct
+"server_full" detection instead of reusing it. `launch_gui_fn` defaults
+to `_default_launch_gui`, below, which reproduces network_main.py's own
+pre-existing `try: runner.run() finally: runner.close()` sequence
+verbatim - the actual GUI/rendering code inside
+NetworkGameLoopRunner.run() is completely untouched by this stage,
+exactly as required. Both are injectable purely so
 tests/unit/client/test_home_screen.py can substitute a fake connector
 (one that raises ConnectionRejectedError, to prove the server_full
 path never even attempts to launch a GUI) and a spy launcher (to prove
 the real one WOULD have been launched, without actually opening a real
 cv2 window/network connection in a unit test).
+
+WHY `connect_fn` TAKES `(uri, username)`, NOT JUST `(uri)` (feature/
+display-username-and-local-player-label): NetworkGameLoopRunner gained
+its own optional `username` constructor parameter (see that class's own
+module docstring's "USERNAME REACHES THE GUI" section) so the local
+player's own panel can show their real name instead of a generic label
+- but the username collected by prompt_username, below, is only ever
+known INSIDE run_shell_login_and_launch, after connect_fn's own default
+value was already bound at function-definition time. `_default_connect`
+exists specifically so `username` can still reach the real
+NetworkGameLoopRunner constructor AS a keyword argument (`username=
+username`), never positionally - passing it positionally would risk
+silently colliding with that class's own `window_name`/`headless`/
+`clock` positional parameters instead of its `username` one.
 
 SRP - THREE SEPARATE, INDEPENDENTLY TESTABLE UNITS, NOT ONE BLOCK:
 `prompt_username` (validation/re-prompt logic only),
@@ -81,13 +96,14 @@ distinct concerns.
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Optional
 
 from kungfu_chess.client.loop.network_game_loop_runner import ConnectionRejectedError, NetworkGameLoopRunner
 from kungfu_chess.model.color import Color
 
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], None]
+ConnectFn = Callable[[str, Optional[str]], NetworkGameLoopRunner]
 
 USERNAME_PROMPT_TEXT = "Enter your username: "
 _EMPTY_USERNAME_MESSAGE = "Username cannot be empty - please try again."
@@ -151,6 +167,17 @@ def format_welcome_message(username: str, color: Color) -> str:
     return f"Welcome, {username}! You are playing as {color.name}."
 
 
+def _default_connect(uri: str, username: Optional[str]) -> NetworkGameLoopRunner:
+    """The real production connect_fn - see module docstring's "WHY
+    `connect_fn` TAKES `(uri, username)`" section for why this tiny
+    wrapper exists rather than passing NetworkGameLoopRunner itself as
+    the default: `username` must reach that class's own constructor as
+    a KEYWORD argument (never positionally, to avoid colliding with its
+    `window_name`/`headless`/`clock` positional parameters)."""
+
+    return NetworkGameLoopRunner(uri, username=username)
+
+
 def _default_launch_gui(runner: NetworkGameLoopRunner) -> None:
     """The real production launch_gui_fn - reproduces
     network_main.py's own pre-existing `try: runner.run() finally:
@@ -169,7 +196,7 @@ def run_shell_login_and_launch(
     *,
     input_fn: InputFn = input,
     output_fn: OutputFn = print,
-    connect_fn: Callable[[str], NetworkGameLoopRunner] = NetworkGameLoopRunner,
+    connect_fn: ConnectFn = _default_connect,
     launch_gui_fn: Callable[[NetworkGameLoopRunner], None] = _default_launch_gui,
 ) -> None:
     """The Stage C1 orchestrator: prompt for a username, THEN connect,
@@ -185,9 +212,12 @@ def run_shell_login_and_launch(
             message this function itself prints (the "Connecting to
             ..." status line, the welcome/server_full message, and the
             move instructions).
-        connect_fn: Defaults to the real NetworkGameLoopRunner class -
-            see module docstring for why constructing one IS the exact,
-            unmodified real connection call, not a second one.
+        connect_fn: Called as `connect_fn(uri, username)`. Defaults to
+            _default_connect - see module docstring for why constructing
+            a real NetworkGameLoopRunner IS the exact, unmodified real
+            connection call, not a second one, and why `username` is
+            threaded through it (feature/display-username-and-local-
+            player-label).
         launch_gui_fn: Defaults to _default_launch_gui - see module
             docstring.
 
@@ -197,7 +227,7 @@ def run_shell_login_and_launch(
     Order, and why it cannot be reordered (see module docstring's
     "SRP" section - this is the one place all four steps are wired
     together): a username is collected BEFORE any connection attempt
-    (there is nothing server-related the username step needs to know),
+    (connect_fn needs it, per the "WHY `connect_fn` TAKES..." section),
     connecting happens next (the one point that can raise
     ConnectionRejectedError), and the welcome message can only be
     formatted AFTER a successful connect (it needs the real, server-
@@ -214,7 +244,7 @@ def run_shell_login_and_launch(
 
     output_fn(f"Connecting to {uri} ...")
     try:
-        runner = connect_fn(uri)
+        runner = connect_fn(uri, username)
     except ConnectionRejectedError:
         output_fn(SERVER_FULL_DISPLAY_MESSAGE)
         return

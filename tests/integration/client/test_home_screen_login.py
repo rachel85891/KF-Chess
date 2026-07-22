@@ -99,11 +99,15 @@ def test_shell_login_connects_to_a_real_server_and_shows_the_correct_assigned_co
     def fake_input(prompt: str) -> str:
         return "Alice"
 
-    def real_connect(uri: str) -> NetworkGameLoopRunner:
-        # The exact real connection path production code uses - see
-        # module docstring for why headless=True is the correct,
-        # established substitute for a real display here.
-        return NetworkGameLoopRunner(uri, headless=True)
+    def real_connect(uri: str, username: str | None) -> NetworkGameLoopRunner:
+        # The exact real connection path production code uses (mirrors
+        # home_screen.py's own _default_connect) - see module docstring
+        # for why headless=True is the correct, established substitute
+        # for a real display here. `username` is threaded through to
+        # NetworkGameLoopRunner's own constructor parameter (feature/
+        # display-username-and-local-player-label), proving it reaches
+        # a REAL runner via this real connect path, not just a fake one.
+        return NetworkGameLoopRunner(uri, headless=True, username=username)
 
     def spy_launch_gui(runner: NetworkGameLoopRunner) -> None:
         launched_runners.append(runner)
@@ -123,5 +127,6 @@ def test_shell_login_connects_to_a_real_server_and_shows_the_correct_assigned_co
     assert len(launched_runners) == 1
     real_runner = launched_runners[0]
     assert real_runner.assigned_color == Color.WHITE
+    assert real_runner.username == "Alice"
 
     assert format_welcome_message("Alice", Color.WHITE) in printed
