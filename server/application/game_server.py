@@ -102,15 +102,60 @@ network-agnostic per its own Stage B2 docstring) - this is exactly the
 kind of "knows about both" state only this coordinator is allowed to
 hold.
 
-WHY join-order assignment needs no lock, despite being a check-then-act
-sequence: `handle_connection` reads `self._connection_manager.
-connection_count` and later calls `.add(connection)` with no `await` in
-between - under asyncio's single-threaded cooperative scheduling, a
-coroutine only yields control at an `await` point, so nothing else can
-run between that read and that write. Two connections arriving
-"simultaneously" are still handled one after another by the event
-loop, never truly concurrently, so this check-then-act is naturally
-atomic without any explicit lock.
+WHY join-order assignment needed no lock BEFORE Stage D2, and WHY IT
+NOW DOES (feature/home-screen-d2-auth-protocol - a real bug found by
+running this stage's own two-simultaneous-clients test, not a
+hypothetical): the ORIGINAL reasoning - `handle_connection` reads
+`self._connection_manager.connection_count` and later calls
+`.add(connection)` with no `await` in between, so nothing else can run
+between that read and that write under asyncio's cooperative scheduling
+- stopped being true the moment this stage inserted TWO real `await`
+points (reading the client's own AUTH message, then `_authenticate`'s
+own `await loop.run_in_executor(...)` call, which can take real,
+measurable time - see "WHY UserRepository'S OWN SYNCHRONOUS CALLS ARE
+OFFLOADED..." below, ~0.3s per real PBKDF2 hash on ordinary hardware)
+BETWEEN a connection being accepted and its own color ever being
+decided. Two connections accepted back-to-back now genuinely interleave
+during that window - whichever one's authentication happens to finish
+first would, WITHOUT a lock, claim the FIRST color slot regardless of
+which one actually connected first, silently breaking the "first that
+joins is White, second is Black" guarantee (re-verified directly: this
+is exactly what the real, failing behavior looked like before this fix
+- the SECOND real connection sometimes became White). THE FIX -
+`self._join_lock` (a plain `asyncio.Lock`, constructed once in
+__init__): `handle_connection` now acquires it for the ENTIRE
+authenticate-then-assign-color sequence (from reading the AUTH message
+through `self._connection_manager.add(connection)`), releasing it
+before entering the per-connection message loop. asyncio.Lock queues
+waiters in the exact order they call `acquire()` - which, since
+`handle_connection` itself starts running as soon as websockets.serve
+accepts a connection, still matches real connection-ARRIVAL order -
+restoring the same ordering guarantee the original zero-await
+atomicity used to provide "for free", now provided by an explicit lock
+instead, because a real await gap between accept and color-assignment
+now genuinely exists. This does NOT reintroduce blocking: the event
+loop itself is never blocked (the lock only serializes the ORDER
+different connections' own join sequences proceed in, one at a time -
+an already-joined player's own move/jump handling, and the background
+tick loop, both keep running freely while one new connection holds this
+lock awaiting its own real authentication).
+
+RE-CHECKING "server_full" AFTER AUTHENTICATION, INSIDE THE LOCK (a
+second, related race the same fix above also closes): the original,
+OUTER `connection_count >= 2` check (still first, still lock-free,
+still exactly as before) can no longer be the ONLY such check once
+authentication takes real time - two connections could both observe
+"there is exactly one free slot" before either one's own (slow)
+authentication completes, and without a second check, BOTH would then
+proceed to claim it. A second `connection_count >= 2` check, immediately
+after a successful `_authenticate` call but still INSIDE `self.
+_join_lock` (so no third connection can slip in between this check and
+`self._connection_manager.add`), rejects the loser of that race with
+the exact same "server_full" message/close/never-tracked behavior the
+original, outer check already established - this connection's own,
+already-successful authentication is simply discarded in that case (no
+partial/inconsistent state is left anywhere: this connection was never
+added to `self._connection_manager`/`self._colors` in the first place).
 
 THIRD-PLUS CONNECTION POLICY (explicit product decision for this
 stage, per the task): rejected immediately - sent the literal text
@@ -593,6 +638,12 @@ class GameServer:
         # sqlite3's own check_same_thread constraint is never violated.
         self._user_repository_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._colors: Dict[ServerConnection, Color] = {}
+        # See module docstring's "WHY join-order assignment needed no
+        # lock BEFORE Stage D2, and WHY IT NOW DOES" section - restores
+        # the join-order (first=White, second=Black) guarantee now that
+        # real authentication introduces a genuine await gap between a
+        # connection being accepted and its own color being decided.
+        self._join_lock = asyncio.Lock()
 
         for event_type in _BROADCAST_EVENT_TYPES:
             self._session.event_bus.subscribe(event_type, self._on_game_event)
@@ -620,34 +671,52 @@ class GameServer:
             await connection.close()
             return
 
-        try:
-            raw_auth_message = await connection.recv()
-        except ConnectionClosed:
-            # The client disconnected before ever sending its own AUTH
-            # command - nothing was ever tracked for it, so there is
-            # nothing left to clean up.
-            return
+        # See module docstring's "WHY join-order assignment needed no
+        # lock BEFORE Stage D2, and WHY IT NOW DOES" section - real
+        # authentication introduces genuine await points below, so this
+        # whole sequence (through color assignment) must now be
+        # explicitly serialized to preserve join-order correctness.
+        async with self._join_lock:
+            try:
+                raw_auth_message = await connection.recv()
+            except ConnectionClosed:
+                # The client disconnected before ever sending its own
+                # AUTH command - nothing was ever tracked for it, so
+                # there is nothing left to clean up.
+                return
 
-        try:
-            parsed_auth = self._protocol.parse_incoming_auth_command(raw_auth_message)
-        except MalformedAuthCommandError as exc:
-            # See module docstring's "WRONG-PASSWORD REJECTION REUSES
-            # THE EXISTING..." section for why this reuses the same
-            # "rejected:malformed:<detail>" text move/jump commands
-            # already produce for their own malformed cases.
-            await self._protocol.send(connection, self._protocol.format_rejection(f"malformed:{exc}"))
-            await connection.close()
-            return
+            try:
+                parsed_auth = self._protocol.parse_incoming_auth_command(raw_auth_message)
+            except MalformedAuthCommandError as exc:
+                # See module docstring's "WRONG-PASSWORD REJECTION
+                # REUSES THE EXISTING..." section for why this reuses
+                # the same "rejected:malformed:<detail>" text move/jump
+                # commands already produce for their own malformed
+                # cases.
+                await self._protocol.send(connection, self._protocol.format_rejection(f"malformed:{exc}"))
+                await connection.close()
+                return
 
-        rating = await self._authenticate(parsed_auth.username, parsed_auth.password)
-        if rating is None:
-            await self._protocol.send(connection, self._protocol.format_rejection("wrong_password"))
-            await connection.close()
-            return
+            rating = await self._authenticate(parsed_auth.username, parsed_auth.password)
+            if rating is None:
+                await self._protocol.send(connection, self._protocol.format_rejection("wrong_password"))
+                await connection.close()
+                return
 
-        color = Color.WHITE if self._connection_manager.connection_count == 0 else Color.BLACK
-        self._colors[connection] = color
-        self._connection_manager.add(connection)
+            # See module docstring's "RE-CHECKING server_full AFTER
+            # AUTHENTICATION..." section - a second connection could
+            # have filled the last slot while THIS one was busy
+            # authenticating; still inside self._join_lock, so no THIRD
+            # connection can slip in between this check and .add below.
+            if self._connection_manager.connection_count >= 2:
+                await self._protocol.send(connection, SERVER_FULL_MESSAGE)
+                await connection.close()
+                return
+
+            color = Color.WHITE if self._connection_manager.connection_count == 0 else Color.BLACK
+            self._colors[connection] = color
+            self._connection_manager.add(connection)
+
         # Sent so a human tester (or any future client) actually knows
         # which command-color-prefix to use - there is no other way for
         # a connecting client to learn its own assigned color. Spelled

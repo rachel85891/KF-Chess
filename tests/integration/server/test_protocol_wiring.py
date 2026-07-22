@@ -46,6 +46,24 @@ MoveAccepted's or JumpAccepted's own resulting broadcasts now drains
 one more message per such event than before this stage - again a real,
 intentional behavior addition, not a scenario change; final assertions
 on the actual board-text/wire content are unchanged.
+
+UPDATED AGAIN for Stage D2's real auth handshake (feature/home-screen-
+d2-auth-protocol, see server/application/game_server.py's own "STAGE D2
+- REAL AUTH HANDSHAKE" docstring section): every client below must now
+send a real "AUTH:<username>:<password>" command
+(kungfu_chess.notation.auth_command_format.format_auth_command) as its
+OWN very first message, before it can ever receive assigned_color -
+every two-client scenario below now sends one such command per client
+immediately after connecting; the still-unauthenticated, still-rejected
+THIRD/server_full client (test_first_client_is_white_second_is_black_
+third_is_rejected_and_closed) needs no change at all, since that
+rejection happens before the server ever reads anything the third
+client sent (module docstring - a real, pre-existing, UNCHANGED
+ordering guarantee this stage's own task explicitly required stay
+intact). assigned_color's own wire text also gained a trailing rating
+field ("assigned_color:white:1200") - every assertion below that only
+ever checked `"white"/"black" in welcome.lower()` already tolerates
+this without any change.
 """
 
 from __future__ import annotations
@@ -58,10 +76,24 @@ import pytest
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from kungfu_chess.notation.auth_command_format import format_auth_command
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
 from server.application.game_server import GameServer
 
-_RECV_TIMEOUT_S = 5.0
+# Bumped from 5.0 for Stage D2's real auth handshake: every connecting
+# client now computes one real PBKDF2-HMAC-SHA256 hash
+# (server/persistence/user_repository.py's own 260_000-iteration,
+# NIST-recommended, deliberately-slow-by-design cost - re-verified
+# directly: ~0.3s per call on this machine) before ever receiving
+# assigned_color, and GameServer serializes every UserRepository call
+# through one persistent worker thread (that class's own "LAZY,
+# THREAD-PINNED CONSTRUCTION" docstring section - required by sqlite3's
+# own thread-affinity constraint), so two clients joining "at once"
+# queue behind each other rather than hashing in parallel. This is a
+# real, accepted cost of real security, not a flaky test - the timeout
+# is widened to comfortably absorb it (plus CI/contention headroom),
+# never to paper over a genuine hang.
+_RECV_TIMEOUT_S = 20.0
 
 
 @asynccontextmanager
@@ -83,7 +115,14 @@ async def _running_game_server(start_tick_loop: bool = False):
         (uri, game_server).
     """
 
-    game_server = GameServer()
+    # user_repository_db_path=":memory:" - Stage D2's own real auth
+    # handshake now requires a real UserRepository for every connection;
+    # ":memory:" keeps every test below isolated from every OTHER test
+    # (and from any real, persistent database file) - see
+    # server/application/game_server.py's own "LAZY, THREAD-PINNED
+    # CONSTRUCTION" docstring section for why this is a db_path, not an
+    # already-built UserRepository instance.
+    game_server = GameServer(user_repository_db_path=":memory:")
     server = await websockets.serve(game_server.handle_connection, "localhost", 0)
     tick_task = asyncio.create_task(game_server.run_tick_loop()) if start_tick_loop else None
     try:
@@ -104,6 +143,8 @@ def test_first_client_is_white_second_is_black_third_is_rejected_and_closed():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 welcome1 = await client1.recv()
                 welcome2 = await client2.recv()
                 assert "white" in welcome1.lower()
@@ -122,6 +163,8 @@ def test_legal_move_from_correct_color_client_is_accepted_and_broadcast_to_both_
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()  # assigned_color welcome message
                 await client2.recv()
                 await client1.recv()  # join-time board state (initial-board-state-on-join fix)
@@ -167,6 +210,8 @@ def test_move_command_with_wrong_color_prefix_for_the_connection_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()  # client1 is White
                 await client2.recv()  # client2 is Black
                 await client1.recv()  # join-time board state (initial-board-state-on-join fix)
@@ -198,6 +243,8 @@ def test_move_command_for_a_square_not_matching_the_claimed_piece_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()  # client1 is White
                 await client2.recv()  # client2 is Black
                 await client1.recv()  # join-time board state
@@ -235,6 +282,8 @@ def test_move_rejected_by_the_real_engine_broadcasts_board_text_to_both_clients_
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()  # assigned_color
                 await client2.recv()
                 await client1.recv()  # join-time board state
@@ -257,6 +306,8 @@ def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()
                 await client2.recv()
                 await client1.recv()  # join-time board state (initial-board-state-on-join fix)
@@ -296,6 +347,8 @@ def test_legal_jump_from_correct_color_client_is_accepted_and_a_later_jump_lande
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()  # assigned_color
                 await client2.recv()
                 await client1.recv()  # join-time board state
@@ -341,6 +394,8 @@ def test_jump_command_with_wrong_color_prefix_for_the_connection_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()  # client1 is White
                 await client2.recv()  # client2 is Black
                 await client1.recv()  # join-time board state
@@ -362,6 +417,8 @@ def test_jump_command_for_a_cell_not_matching_the_claimed_piece_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()
                 await client2.recv()
                 await client1.recv()
@@ -380,6 +437,8 @@ def test_malformed_jump_command_does_not_crash_the_server_which_keeps_accepting_
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()
                 await client2.recv()
                 await client1.recv()
@@ -409,6 +468,8 @@ def test_jump_rejected_by_the_real_engine_gets_a_direct_jump_rejected_response()
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()
                 await client2.recv()
                 await client1.recv()
@@ -447,6 +508,8 @@ def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
+                await client1.send(format_auth_command("client1", "password1"))
+                await client2.send(format_auth_command("client2", "password2"))
                 await client1.recv()
                 await client2.recv()
                 await client1.recv()  # join-time board state (initial-board-state-on-join fix)
