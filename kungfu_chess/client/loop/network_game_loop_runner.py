@@ -628,6 +628,36 @@ field), so `_handle_game_over` has no PROBLEM-1-style translation gap to
 account for and no self.board/self.piece_animator_registry guard to
 check either - there is nothing board-position-related in this event
 that could still be unresolved by the time it arrives.
+
+USERNAME REACHES THE GUI (feature/display-username-and-local-player-
+label): Stage C1's shell login (kungfu_chess/client/home_screen.py's
+prompt_username) collected a real username, but it was previously only
+ever shown once, in the terminal, at connect time - it never reached
+this class, and there was no visual way for a player to tell which of
+the two on-screen panels was their own versus the opponent's
+(SidePanelRenderer's own title box already labels each side "White"/
+"Black", but has no notion of "which one is ME"). THE FIX: a new,
+optional `username: Optional[str] = None` constructor parameter,
+stored verbatim as `self.username` - defaulting to None so every
+EXISTING construction (every already-passing headless test/caller that
+never passed one) keeps working completely unchanged, per this
+feature's own explicit backward-compatibility requirement. This class
+itself never inspects or validates `username` beyond storing it - it
+remains exactly the cosmetic-only value home_screen.py's own docstring
+already documents (never sent to the server, never used for anything
+but local display); the actual rendering decision (what text to show,
+for which of the two panels, in what color) is entirely
+PlayerLabelRenderer's job (kungfu_chess/client/ui/
+player_label_renderer.py, see that module's own docstring), called
+once per color inside `_run_one_frame` alongside the existing
+SidePanelRenderer/CapturedPiecesRenderer calls, with
+`is_local_player=(color is self.assigned_color)` - the one piece of
+information (which color THIS connection was assigned) only this class
+already holds, and PlayerLabelRenderer itself is never told the
+opponent's real username (there is none to tell it - see that module's
+own docstring for why it always shows a fixed "Opponent" label
+instead). SidePanelRenderer itself is not modified by this change, per
+this feature's own explicit requirement.
 """
 
 from __future__ import annotations
@@ -663,6 +693,7 @@ from kungfu_chess.client.ui.coordinate_label_renderer import LABEL_MARGIN, Coord
 from kungfu_chess.client.ui.cooldown_overlay_renderer import CooldownOverlayRenderer
 from kungfu_chess.client.ui.game_over_overlay_renderer import GameOverOverlayRenderer
 from kungfu_chess.client.ui.game_timer_renderer import TIMER_STRIP_HEIGHT, GameTimerRenderer
+from kungfu_chess.client.ui.player_label_renderer import PlayerLabelRenderer
 from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH, SidePanelRenderer
 from kungfu_chess.io.board_parser import BoardParser
 from kungfu_chess.model.board import Board
@@ -742,6 +773,7 @@ class NetworkGameLoopRunner:
         window_name: str = DEFAULT_WINDOW_NAME,
         headless: bool = False,
         clock: Callable[[], float] = time.perf_counter,
+        username: Optional[str] = None,
     ) -> None:
         """Connect to `uri`, learn this client's assigned color, and
         wire every reused rendering/input component around it - see
@@ -769,6 +801,15 @@ class NetworkGameLoopRunner:
                 minus an earlier one) - never compared against any
                 absolute/wall-clock meaning, so any monotonically
                 comparable float source works.
+            username: The LOCAL player's own cosmetic username
+                (kungfu_chess.client.home_screen.prompt_username's
+                return value), or None (the default) if none was ever
+                collected - see module docstring's "USERNAME REACHES
+                THE GUI" section. Defaults to None purely for backward
+                compatibility with any existing construction that never
+                passed one; never validated or transmitted anywhere by
+                this class itself, only stored and later read by
+                _run_one_frame's own PlayerLabelRenderer calls.
 
         Returns:
             None.
@@ -782,6 +823,7 @@ class NetworkGameLoopRunner:
         self._window_name = window_name
         self._quit_requested = False
         self._clock = clock
+        self.username = username
 
         self.network_client = NetworkGameClient()
         self.assigned_color = self.network_client.connect(uri)
@@ -1555,6 +1597,17 @@ class NetworkGameLoopRunner:
         )
         CapturedPiecesRenderer(main_canvas, self.asset_cache).render(
             x=right_panel_x, width=PANEL_WIDTH, color=Color.BLACK, log=self._latest_log
+        )
+
+        # See module docstring's "USERNAME REACHES THE GUI" section -
+        # one call per color, same (x, color) pair each panel already
+        # used above; is_local_player is the one fact only this class
+        # already holds (which color THIS connection was assigned).
+        PlayerLabelRenderer(main_canvas).render(
+            x=0, color=Color.WHITE, username=self.username, is_local_player=self.assigned_color is Color.WHITE
+        )
+        PlayerLabelRenderer(main_canvas).render(
+            x=right_panel_x, color=Color.BLACK, username=self.username, is_local_player=self.assigned_color is Color.BLACK
         )
 
         # Real, server-authoritative elapsed game time (interpolated
