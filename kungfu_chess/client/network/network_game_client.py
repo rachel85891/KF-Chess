@@ -95,6 +95,52 @@ that raw text into something Renderer/Observers can consume is
 explicitly Stage B6's job, not this one - this stage's contract is
 deliberately "dumb pipe in both directions," provable correct in
 isolation without needing any of that later machinery to exist yet.
+
+STAGE D2 - REAL AUTH HANDSHAKE (feature/home-screen-d2-auth-protocol):
+connect() now requires real `username`/`password` arguments, and sends
+them as the CONNECTION'S OWN VERY FIRST MESSAGE - a real
+"AUTH:<username>:<password>" command
+(kungfu_chess.notation.auth_command_format.format_auth_command), sent
+immediately after the WebSocket handshake completes, BEFORE this class
+ever reads anything back - replacing Stage C1's cosmetic-only username
+(which this class never even knew about) with a REAL, server-verified
+account. The server's own reply to THIS message is still the exact
+same one first message connect() already read before this stage
+(assigned_color/server_full) - only its own possible shapes grew (see
+below) and its assigned_color case now also carries a real rating.
+
+THE FIRST-MESSAGE RESPONSE NOW HAS THREE POSSIBLE SHAPES, NOT TWO:
+alongside the pre-existing "assigned_color:<color>:<rating>" (now with
+a trailing rating field - server/presentation/protocol_handler.py's own
+format_assigned_color docstring) and the pre-existing bare
+"server_full" literal, a THIRD shape is now possible - a
+"rejected:<reason>" message (e.g. "rejected:wrong_password" for a real
+login failure, or "rejected:malformed:<detail>" for a malformed AUTH
+command this class itself should never actually produce, but is
+defensively still recognized) - reusing GameServer's own existing
+"rejected:<reason>" rejection vocabulary rather than inventing a
+second, parallel one (see server/application/game_server.py's own
+"WRONG-PASSWORD REJECTION REUSES..." docstring section). A
+"rejected:..." message can ONLY ever mean an auth-time rejection when
+it arrives as THIS connection's very first message (an ordinary
+in-game "rejected:..." response - wrong_color/piece_mismatch/etc. -
+only ever arrives AFTER this join sequence has already completed, via
+poll_incoming(), never here).
+
+self.rating/self.rejection_reason - NEW, PLAIN ATTRIBUTES, NOT A
+CHANGE TO connect()'s OWN RETURN TYPE: connect() still returns
+Optional[Color] exactly as before (None still means "rejected, for
+whatever reason") - this keeps every existing caller's own "if
+assigned_color is None: handle rejection" control flow completely
+intact. The two new attributes carry the ADDITIONAL information this
+stage introduces: `self.rating` (the account's real rating, set only
+on success) and `self.rejection_reason` (one of "server_full",
+"wrong_password", or a "malformed:..." string, set only on rejection) -
+a caller that cares WHY it was rejected (kungfu_chess.client.loop.
+network_game_loop_runner.NetworkGameLoopRunner, this same stage) reads
+`self.rejection_reason` after seeing `self.assigned_color is None`,
+exactly the same "read a plain attribute after the fact" pattern this
+class's own pre-existing `self.assigned_color` already established.
 """
 
 from __future__ import annotations
@@ -102,6 +148,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+from dataclasses import dataclass
 from typing import List, Optional
 
 import websockets
@@ -111,11 +158,13 @@ from websockets.exceptions import ConnectionClosed
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
+from kungfu_chess.notation.auth_command_format import format_auth_command
 from kungfu_chess.notation.jump_command_format import format_jump_command
 from kungfu_chess.notation.move_command_format import format_move_command
 
 _ASSIGNED_COLOR_PREFIX = "assigned_color:"
 _SERVER_FULL_MESSAGE = "server_full"
+_REJECTION_PREFIX = "rejected:"
 
 _THREAD_START_TIMEOUT_S = 5.0
 _CLOSE_TIMEOUT_S = 5.0
@@ -127,40 +176,66 @@ class NetworkGameClientError(Exception):
 
 class UnexpectedJoinResponseError(NetworkGameClientError):
     """Raised by connect() if the server's very first message isn't one
-    of the two documented forms ("assigned_color:<color>" or
-    "server_full") - an invariant violation (the server's own protocol
-    changing out from under this class), not a normal, caller-
-    triggerable condition."""
+    of the three documented forms ("assigned_color:<color>:<rating>",
+    "server_full", or "rejected:<reason>" - see module docstring's
+    "STAGE D2 - REAL AUTH HANDSHAKE" section) - an invariant violation
+    (the server's own protocol changing out from under this class), not
+    a normal, caller-triggerable condition."""
 
 
-def _parse_join_response(message: str) -> Optional[Color]:
-    """Parse the server's very first message into an assigned Color,
-    or None if the server rejected this connection outright.
+@dataclass(frozen=True)
+class _JoinResponse:
+    """The fully-parsed result of the server's very first message - see
+    _parse_join_response's own docstring. Exactly one of
+    (color and rating) or rejection_reason is populated, never both -
+    color/rating are None on rejection, rejection_reason is None on
+    success."""
+
+    color: Optional[Color]
+    rating: Optional[int]
+    rejection_reason: Optional[str]
+
+
+def _parse_join_response(message: str) -> _JoinResponse:
+    """Parse the server's very first message into a _JoinResponse - see
+    module docstring's "THE FIRST-MESSAGE RESPONSE NOW HAS THREE
+    POSSIBLE SHAPES" section for the full reasoning behind each branch.
 
     Args:
         message: The raw first message from the server - expected to
-            be "assigned_color:white", "assigned_color:black", or
-            "server_full" (see server/game_server.py's own
-            handle_connection, re-checked directly for these exact
-            literal strings before writing this).
+            be "assigned_color:<color>:<rating>", "server_full", or
+            "rejected:<reason>" (see server/application/game_server.py's
+            own handle_connection, re-checked directly for these exact
+            literal shapes before writing this).
 
     Returns:
-        Color.WHITE or Color.BLACK if assigned a color; None if the
-        server sent "server_full" (this connection was rejected).
+        A _JoinResponse - success (color+rating) or rejection
+        (rejection_reason), never both.
 
     Raises:
-        UnexpectedJoinResponseError: If `message` matches neither
-        documented form.
+        UnexpectedJoinResponseError: If `message` matches none of the
+            three documented forms.
     """
 
     if message == _SERVER_FULL_MESSAGE:
-        return None
+        return _JoinResponse(color=None, rating=None, rejection_reason=_SERVER_FULL_MESSAGE)
+
+    if message.startswith(_REJECTION_PREFIX):
+        reason = message[len(_REJECTION_PREFIX) :]
+        return _JoinResponse(color=None, rating=None, rejection_reason=reason)
+
     if message.startswith(_ASSIGNED_COLOR_PREFIX):
-        color_name = message[len(_ASSIGNED_COLOR_PREFIX) :]
-        try:
-            return Color[color_name.upper()]
-        except KeyError:
-            pass
+        remainder = message[len(_ASSIGNED_COLOR_PREFIX) :]
+        parts = remainder.split(":", 1)
+        if len(parts) == 2:
+            color_name, rating_text = parts
+            try:
+                color = Color[color_name.upper()]
+                rating = int(rating_text)
+                return _JoinResponse(color=color, rating=rating, rejection_reason=None)
+            except (KeyError, ValueError):
+                pass
+
     raise UnexpectedJoinResponseError(f"unrecognized join response from server: {message!r}")
 
 
@@ -182,28 +257,45 @@ class NetworkGameClient:
         """
 
         self.assigned_color: Optional[Color] = None
+        # Stage D2 - see module docstring's "self.rating/
+        # self.rejection_reason" section: populated by connect(), read
+        # after the fact by callers that need the account's real rating
+        # (on success) or the real reason a connection was rejected.
+        self.rating: Optional[int] = None
+        self.rejection_reason: Optional[str] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._connection: Optional[ClientConnection] = None
         self._incoming: "queue.Queue[str]" = queue.Queue()
 
-    def connect(self, uri: str) -> Optional[Color]:
+    def connect(self, uri: str, username: str, password: str) -> Optional[Color]:
         """Start this client's background thread + event loop, open a
-        real WebSocket connection to `uri`, and receive the server's
-        one-time join response - see module docstring's "WHY THE FIRST
-        MESSAGE... IS HANDLED SEPARATELY" section for why this method
-        blocks the calling thread for exactly this much, and no more.
+        real WebSocket connection to `uri`, send the real AUTH command
+        (Stage D2 - see module docstring's "STAGE D2 - REAL AUTH
+        HANDSHAKE" section), and receive the server's one-time join
+        response - see module docstring's "WHY THE FIRST MESSAGE... IS
+        HANDLED SEPARATELY" section for why this method blocks the
+        calling thread for exactly this much, and no more.
 
         Args:
             uri: The WebSocket URI to connect to (e.g.
                 "ws://localhost:8765") - never hardcoded in this class.
+            username: The account's username - sent to the server as
+                part of the real AUTH command; also used server-side to
+                sign up (if new) or log in (if it already exists).
+            password: The account's plaintext password - sent to the
+                server as part of the same AUTH command; never stored
+                on this object beyond this one call.
 
         Returns:
             The Color this connection was assigned (also stored as
             self.assigned_color), or None if the server rejected this
-            connection ("server_full" - see
-            server/game_server.py's own third-plus-connection policy).
+            connection - either "server_full" (see
+            server/application/game_server.py's own third-plus-
+            connection policy) or a real login failure (self.
+            rejection_reason distinguishes the two - see module
+            docstring).
 
         Raises:
             UnexpectedJoinResponseError: See _parse_join_response.
@@ -211,7 +303,7 @@ class NetworkGameClient:
 
         self._start_background_loop()
 
-        future = asyncio.run_coroutine_threadsafe(self._do_connect(uri), self._loop)
+        future = asyncio.run_coroutine_threadsafe(self._do_connect(uri, username, password), self._loop)
         self.assigned_color = future.result()
         return self.assigned_color
 
@@ -239,10 +331,12 @@ class NetworkGameClient:
         if not loop_ready.wait(timeout=_THREAD_START_TIMEOUT_S):
             raise NetworkGameClientError("background event loop failed to start in time")
 
-    async def _do_connect(self, uri: str) -> Optional[Color]:
+    async def _do_connect(self, uri: str, username: str, password: str) -> Optional[Color]:
         """Runs ON the background loop's own thread (scheduled via
         run_coroutine_threadsafe by connect(), above): open the real
-        connection, receive the one-time join response, and start the
+        connection, send the real AUTH command (Stage D2 - this
+        connection's own very first message, before anything is ever
+        read back), receive the one-time join response, and start the
         long-running receive loop as a plain task on this SAME loop
         (safe here - unlike send_move, this runs already inside the
         loop's own thread, so a bare asyncio task is the correct,
@@ -251,15 +345,25 @@ class NetworkGameClient:
 
         Args:
             uri: The WebSocket URI to connect to.
+            username: See connect().
+            password: See connect().
 
         Returns:
-            The parsed join response (see _parse_join_response).
+            The parsed join response's own color (see
+            _parse_join_response) - self.rating/self.rejection_reason
+            are set as a side effect before returning, mirroring how
+            self.assigned_color is set by connect() itself, one level up.
         """
 
         self._connection = await websockets.connect(uri)
+        await self._connection.send(format_auth_command(username, password))
         first_message = await self._connection.recv()
         asyncio.get_running_loop().create_task(self._receive_loop())
-        return _parse_join_response(first_message)
+
+        parsed = _parse_join_response(first_message)
+        self.rating = parsed.rating
+        self.rejection_reason = parsed.rejection_reason
+        return parsed.color
 
     async def _receive_loop(self) -> None:
         """Runs for the whole lifetime of the connection: push every
