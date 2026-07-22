@@ -83,7 +83,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready, session))
 
     async def _serve(self, ready: threading.Event, session: Optional[GameSession]) -> None:
-        game_server = GameServer(session=session)
+        game_server = GameServer(session=session, user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -117,9 +117,9 @@ def _poll_until(runners, predicate, timeout_s: float) -> None:
 def test_a_real_jump_interception_removes_the_attacker_from_both_network_clients():
     session = _interception_ready_session()
     test_server = _BackgroundTestServer(session=session)
-    runner_white = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner_white = NetworkGameLoopRunner(test_server.uri, username="runner_white", password="runner_white_pw", headless=True)
     try:
-        runner_black = NetworkGameLoopRunner(test_server.uri, headless=True)
+        runner_black = NetworkGameLoopRunner(test_server.uri, username="runner_black", password="runner_black_pw", headless=True)
         try:
             assert runner_white.assigned_color == Color.WHITE
             assert runner_black.assigned_color == Color.BLACK

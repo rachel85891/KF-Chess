@@ -75,7 +75,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready))
 
     async def _serve(self, ready: threading.Event) -> None:
-        game_server = GameServer()
+        game_server = GameServer(user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -131,9 +131,9 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 
 def test_constructing_in_headless_mode_reads_the_correct_assigned_color():
     test_server = _BackgroundTestServer()
-    runner1 = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner1 = NetworkGameLoopRunner(test_server.uri, username="runner1", password="runner1_pw", headless=True)
     try:
-        runner2 = NetworkGameLoopRunner(test_server.uri, headless=True)
+        runner2 = NetworkGameLoopRunner(test_server.uri, username="runner2", password="runner2_pw", headless=True)
         try:
             assert runner1.assigned_color == Color.WHITE
             assert runner2.assigned_color == Color.BLACK
@@ -146,7 +146,7 @@ def test_constructing_in_headless_mode_reads_the_correct_assigned_color():
 
 def test_a_click_sequence_on_the_local_players_own_piece_sends_a_real_move_and_is_reflected_after_broadcast():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         assert runner.assigned_color == Color.WHITE
         # Seed the known starting position - see module docstring's
@@ -178,7 +178,7 @@ def test_a_click_sequence_on_the_local_players_own_piece_sends_a_real_move_and_i
 
 def test_click_on_a_cell_with_no_piece_selected_and_no_board_yet_does_not_crash():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         # No _apply_broadcast call at all - runner.board is still None.
         runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, 0, 0, 0, None)  # must not raise
@@ -191,7 +191,7 @@ def test_click_on_a_cell_with_no_piece_selected_and_no_board_yet_does_not_crash(
 
 def test_click_on_the_opponents_piece_does_not_send_a_move():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         assert runner.assigned_color == Color.WHITE
         runner._apply_broadcast(_STARTING_BOARD_TEXT)
@@ -212,9 +212,9 @@ def test_click_on_the_opponents_piece_does_not_send_a_move():
 
 def test_two_independent_runners_get_opposite_colors_and_each_see_the_others_move():
     test_server = _BackgroundTestServer()
-    runner_white = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner_white = NetworkGameLoopRunner(test_server.uri, username="runner_white", password="runner_white_pw", headless=True)
     try:
-        runner_black = NetworkGameLoopRunner(test_server.uri, headless=True)
+        runner_black = NetworkGameLoopRunner(test_server.uri, username="runner_black", password="runner_black_pw", headless=True)
         try:
             assert runner_white.assigned_color == Color.WHITE
             assert runner_black.assigned_color == Color.BLACK

@@ -63,7 +63,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready))
 
     async def _serve(self, ready: threading.Event) -> None:
-        game_server = GameServer()
+        game_server = GameServer(user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -104,7 +104,7 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 
 def test_real_network_move_transitions_piece_animator_through_move_and_back_to_idle():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         # Drain the join-time initial board-state broadcast - this is
         # what establishes runner.piece_animator_registry (Stage B7).
@@ -156,7 +156,7 @@ def test_real_network_move_transitions_piece_animator_through_move_and_back_to_i
 
 def test_malformed_wire_format_event_message_does_not_crash_the_client():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 
@@ -190,7 +190,7 @@ def test_parse_game_event_error_type_is_the_one_this_client_actually_catches():
 
 def test_a_later_board_text_resync_never_replaces_self_board_or_disrupts_an_in_flight_animator():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
         original_board = runner.board
@@ -221,7 +221,7 @@ def test_a_later_board_text_resync_never_replaces_self_board_or_disrupts_an_in_f
 
 def test_log_resync_mismatch_prints_a_diagnostic_on_a_genuine_disagreement(capsys):
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 

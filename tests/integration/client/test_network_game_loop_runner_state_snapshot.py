@@ -74,7 +74,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready, session))
 
     async def _serve(self, ready: threading.Event, session: Optional[GameSession]) -> None:
-        game_server = GameServer(session=session)
+        game_server = GameServer(session=session, user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -126,7 +126,7 @@ def _capture_ready_session() -> GameSession:
 
 def test_apply_state_snapshot_replaces_previously_held_score_log_and_clock():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         assert runner._latest_score.score_by_color == {Color.WHITE: 0, Color.BLACK: 0}
         assert runner._latest_log.entries == ()
@@ -165,7 +165,7 @@ def test_apply_state_snapshot_replaces_previously_held_score_log_and_clock():
 
 def test_apply_state_snapshot_ignores_malformed_text_without_crashing():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         runner._apply_state_snapshot("STATE:not_an_int:0:0:")  # must not raise
 
@@ -180,7 +180,7 @@ def test_apply_state_snapshot_ignores_malformed_text_without_crashing():
 def test_displayed_clock_ms_interpolates_forward_using_the_client_clock_between_broadcasts():
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True, clock=fake_clock)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
         score = ScoreSnapshot(score_by_color={Color.WHITE: 0, Color.BLACK: 0})
         log = MovesLogSnapshot(entries=())
@@ -208,7 +208,7 @@ def test_displayed_clock_ms_interpolates_forward_using_the_client_clock_between_
 def test_a_real_capture_updates_held_score_log_and_produces_the_correct_captured_pieces_grouping():
     session = _capture_ready_session()
     test_server = _BackgroundTestServer(session=session)
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         assert runner.assigned_color == Color.WHITE
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)

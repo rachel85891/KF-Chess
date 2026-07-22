@@ -74,7 +74,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready))
 
     async def _serve(self, ready: threading.Event) -> None:
-        game_server = GameServer()
+        game_server = GameServer(user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -110,7 +110,7 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 def test_progress_is_zero_right_when_a_motion_starts():
     fake_clock = _FakeClock(start=100.0)
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True, clock=fake_clock)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
         runner._active_motions[42] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=fake_clock.value
@@ -129,7 +129,7 @@ def test_progress_is_zero_right_when_a_motion_starts():
 def test_progress_is_approximately_half_partway_through_duration():
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True, clock=fake_clock)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
         runner._active_motions[7] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=0.0
@@ -148,7 +148,7 @@ def test_progress_is_approximately_half_partway_through_duration():
 def test_progress_is_one_at_exactly_full_duration():
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True, clock=fake_clock)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
         runner._active_motions[7] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=0.0
@@ -173,7 +173,7 @@ def test_progress_clamps_at_one_when_real_elapsed_time_overshoots_duration_befor
 
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True, clock=fake_clock)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
         runner._active_motions[7] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=0.0
@@ -191,7 +191,7 @@ def test_progress_clamps_at_one_when_real_elapsed_time_overshoots_duration_befor
 
 def test_a_piece_arrived_removes_its_own_active_motion_so_it_no_longer_slides():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 
@@ -220,7 +220,7 @@ def test_a_piece_arrived_removes_its_own_active_motion_so_it_no_longer_slides():
 
 def test_real_network_move_renders_a_genuinely_interpolated_mid_flight_pixel_position():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 

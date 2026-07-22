@@ -1,8 +1,23 @@
 """Real, end-to-end integration tests proving NetworkGameLoopRunner's
-own new, optional `username` constructor parameter is threaded through
-and stored correctly, and that omitting it entirely (the default,
-`None`) does not break construction - full backward compatibility with
-every existing headless test construction that never passed one.
+own `username` constructor parameter is threaded through and stored
+correctly, and (as of Stage D2 - feature/home-screen-d2-auth-protocol)
+that `username`/`password` are now REQUIRED, real credentials, not the
+optional/None-defaulting cosmetic value they were when this file was
+first written.
+
+SUPERSEDED BY STAGE D2 - WHY THIS FILE'S OWN ORIGINAL "backward
+compatibility with omitting username" TEST WAS REMOVED, NOT JUST
+PATCHED: `username` moved from an optional constructor parameter
+(defaulting to None) to a REQUIRED one, and a new REQUIRED `password`
+parameter was added (kungfu_chess/client/loop/network_game_loop_runner.py's
+own "STAGE D2" docstring section - both are now real login/signup
+credentials sent to the server, not a cosmetic-only display value).
+There is no longer any way to "omit" a required parameter to test the
+old backward-compatible default - that scenario is not just changed,
+it is no longer EXPRESSIBLE. Replaced below with a test proving the
+new, intentional requirement instead (omitting either now raises
+TypeError) - real regression coverage for this stage's own breaking
+change, not a silently-dropped test.
 
 Constructing a real NetworkGameLoopRunner inherently requires a real
 network connect() (see that class's own __init__) - there is no
@@ -22,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
+import pytest
 import websockets
 
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner
@@ -51,7 +67,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready))
 
     async def _serve(self, ready: threading.Event) -> None:
-        game_server = GameServer()
+        game_server = GameServer(user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -74,7 +90,7 @@ class _BackgroundTestServer:
 
 def test_a_provided_username_is_stored_on_the_runner():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True, username="Alice")
+    runner = NetworkGameLoopRunner(test_server.uri, username="Alice", password="correct horse battery staple", headless=True)
     try:
         assert runner.username == "Alice"
     finally:
@@ -82,32 +98,27 @@ def test_a_provided_username_is_stored_on_the_runner():
         test_server.stop()
 
 
-def test_omitting_username_defaults_to_none_and_does_not_break_construction():
-    # Backward compatibility - every existing headless test/caller that
-    # never passed a username must keep working unchanged.
+def test_omitting_username_or_password_raises_typeerror_since_both_are_now_required():
+    # Stage D2's own intentional breaking change - see module
+    # docstring's "SUPERSEDED BY STAGE D2" section: there is no longer
+    # a legitimate way to connect without real credentials, so a
+    # missing default is the correct signal, not an oversight.
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
     try:
-        assert runner.username is None
+        with pytest.raises(TypeError):
+            NetworkGameLoopRunner(test_server.uri, headless=True)  # type: ignore[call-arg]
     finally:
-        runner.close()
         test_server.stop()
 
 
-def test_a_frame_renders_without_raising_whether_or_not_a_username_was_provided():
-    # A real, end-to-end smoke test that the new PlayerLabelRenderer
-    # wiring inside _run_one_frame does not crash the per-frame render
-    # pipeline in either case.
+def test_a_frame_renders_without_raising_for_a_real_authenticated_runner():
+    # A real, end-to-end smoke test that the PlayerLabelRenderer wiring
+    # inside _run_one_frame does not crash the per-frame render
+    # pipeline for a real, authenticated runner.
     test_server = _BackgroundTestServer()
-    runner_with_username = NetworkGameLoopRunner(test_server.uri, headless=True, username="Alice")
+    runner = NetworkGameLoopRunner(test_server.uri, username="Bob", password="another real password", headless=True)
     try:
-        runner_with_username._run_one_frame()
-
-        runner_without_username = NetworkGameLoopRunner(test_server.uri, headless=True)
-        try:
-            runner_without_username._run_one_frame()
-        finally:
-            runner_without_username.close()
+        runner._run_one_frame()
     finally:
-        runner_with_username.close()
+        runner.close()
         test_server.stop()

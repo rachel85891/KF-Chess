@@ -53,7 +53,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready))
 
     async def _serve(self, ready: threading.Event) -> None:
-        game_server = GameServer()
+        game_server = GameServer(user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -95,7 +95,7 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 
 def test_a_right_click_on_the_local_players_own_piece_sends_a_real_jump_and_a_cooldown_bar_appears_after_landing():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         assert runner.assigned_color == Color.WHITE
         # Seed the known starting position - see
@@ -136,7 +136,7 @@ def test_a_right_click_on_the_local_players_own_piece_sends_a_real_jump_and_a_co
 
 def test_right_click_on_the_opponents_piece_does_not_send_a_jump():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         assert runner.assigned_color == Color.WHITE
         runner._apply_broadcast(_STARTING_BOARD_TEXT)
@@ -156,7 +156,7 @@ def test_right_click_on_the_opponents_piece_does_not_send_a_jump():
 
 def test_cooldown_ratio_decreases_over_real_time_after_a_real_jump_landing():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, headless=True)
+    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
         runner._apply_broadcast(_STARTING_BOARD_TEXT)
         a1 = Position(row=7, col=0)
