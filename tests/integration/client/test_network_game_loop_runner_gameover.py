@@ -17,6 +17,22 @@ docs/spec.md §2).
 NEW, SEPARATE test file (not an edit to any existing
 test_network_game_loop_runner*.py file), matching this codebase's own
 established "new behavior gets a new test file" convention.
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): GameServer's own old `session: Optional[GameSession]`
+constructor parameter was replaced by `session_factory: Callable[[],
+GameSession]` (see game_server.py's own "`session_factory` REPLACES
+THE OLD..." docstring section) - a fixed, pre-built session is now
+supplied via `session_factory=lambda: session` instead of `session=
+session`; this test only ever forms one match, so the factory being
+called exactly once and always returning the same object is
+equivalent to the old behavior. The two runners also now must be
+constructed on separate background threads instead of sequentially -
+see test_network_game_loop_runner.py's own "UPDATED for Stage E1"
+docstring section for the full reasoning - and which one ends up WHITE
+vs BLACK is queue-order-driven rather than construction-order-driven,
+so both are constructed concurrently and then identified via
+_white_and_black.
 """
 
 from __future__ import annotations
@@ -78,7 +94,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready, session))
 
     async def _serve(self, ready: threading.Event, session: Optional[GameSession]) -> None:
-        game_server = GameServer(session=session, user_repository_db_path=":memory:")
+        game_server = GameServer(session_factory=lambda: session, user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -99,6 +115,34 @@ class _BackgroundTestServer:
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
 
 
+def _construct_concurrently(uri: str, username: str, password: str) -> tuple[threading.Thread, list]:
+    """Constructs a NetworkGameLoopRunner on its own background thread -
+    see test_network_game_loop_runner.py's own identically-named helper
+    for the full reasoning."""
+
+    result: list[NetworkGameLoopRunner] = []
+
+    def _construct() -> None:
+        result.append(NetworkGameLoopRunner(uri, username=username, password=password, headless=True))
+
+    thread = threading.Thread(target=_construct, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _white_and_black(
+    runner1: NetworkGameLoopRunner, runner2: NetworkGameLoopRunner
+) -> tuple[NetworkGameLoopRunner, NetworkGameLoopRunner]:
+    """Returns (white_runner, black_runner) - color assignment is queue-
+    order-driven, not construction-order-driven, so which of two
+    concurrently-connecting runners is WHITE is genuinely racy."""
+
+    assert {runner1.assigned_color, runner2.assigned_color} == {Color.WHITE, Color.BLACK}
+    if runner1.assigned_color == Color.WHITE:
+        return runner1, runner2
+    return runner2, runner1
+
+
 def _poll_until(runners, predicate, timeout_s: float) -> None:
     deadline = time.perf_counter() + timeout_s
     while time.perf_counter() < deadline:
@@ -112,13 +156,13 @@ def _poll_until(runners, predicate, timeout_s: float) -> None:
 def test_a_real_king_interception_ends_the_game_for_both_network_clients():
     session = _king_interception_ready_session()
     test_server = _BackgroundTestServer(session=session)
-    runner_white = NetworkGameLoopRunner(test_server.uri, username="runner_white", password="runner_white_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
     try:
-        runner_black = NetworkGameLoopRunner(test_server.uri, username="runner_black", password="runner_black_pw", headless=True)
+        runner_white, runner_black = _white_and_black(result1[0], result2[0])
         try:
-            assert runner_white.assigned_color == Color.WHITE
-            assert runner_black.assigned_color == Color.BLACK
-
             _poll_until(
                 [runner_white, runner_black],
                 lambda: runner_white.board is not None and runner_black.board is not None,
