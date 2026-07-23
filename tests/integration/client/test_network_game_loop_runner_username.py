@@ -30,6 +30,13 @@ exactly (kept local/self-contained per this project's own established
 "each test file stays self-contained" precedent - see e.g.
 tests/integration/server/test_initial_board_state_on_join.py's own
 docstring for that same precedent).
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): see test_network_game_loop_runner.py's own "UPDATED for
+Stage E1" docstring section for the full reasoning. Neither test that
+constructs a real runner cares about its assigned color, so each gets
+a throwaway dummy opponent connected concurrently to unblock its real
+matchmaking wait.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ import pytest
 import websockets
 
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner
+from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from server.application.game_server import GameServer
 
 _JOIN_TIMEOUT_S = 5.0
@@ -88,13 +96,31 @@ class _BackgroundTestServer:
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
 
 
+def _start_dummy_opponent(uri: str, username: str) -> tuple[NetworkGameClient, threading.Thread]:
+    """Starts (but does not wait for) a throwaway, same-rated dummy
+    opponent connecting on a background thread - must be started BEFORE
+    constructing the real runner under test - see
+    test_network_game_loop_runner.py's own identically-named helper for
+    the full reasoning."""
+
+    dummy = NetworkGameClient()
+    dummy_thread = threading.Thread(
+        target=dummy.connect, args=(uri, f"{username}_dummy_opponent", "dummy password"), daemon=True
+    )
+    dummy_thread.start()
+    return dummy, dummy_thread
+
+
 def test_a_provided_username_is_stored_on_the_runner():
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "Alice")
     runner = NetworkGameLoopRunner(test_server.uri, username="Alice", password="correct horse battery staple", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         assert runner.username == "Alice"
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
@@ -116,9 +142,12 @@ def test_a_frame_renders_without_raising_for_a_real_authenticated_runner():
     # inside _run_one_frame does not crash the per-frame render
     # pipeline for a real, authenticated runner.
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "Bob")
     runner = NetworkGameLoopRunner(test_server.uri, username="Bob", password="another real password", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         runner._run_one_frame()
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
