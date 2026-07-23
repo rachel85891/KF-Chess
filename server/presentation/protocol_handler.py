@@ -120,6 +120,40 @@ these fit into.
     (its own default is 60, per this stage's own "one-minute timeout"
     requirement, but tests override it to a short duration).
 
+STAGE E2 - DISCONNECT-COUNTDOWN WIRE TEXT (feature/disconnect-
+countdown-autoresign-e2): two new, mid-match-only messages, sent by
+GameServer to a still-connected player when their opponent's own
+connection drops (or resolves) during an ACTIVE match - see that
+class's own module docstring for the full disconnect-countdown/
+auto-resign sequence these fit into.
+  - `format_opponent_disconnected(countdown_seconds)` - its own
+    "opponent_disconnected:<seconds>" prefix, mirroring
+    `format_matchmaking_timeout`'s own shape (a colon-delimited literal
+    carrying a numeric parameter) - sent ONCE, at the moment the
+    disconnect is first detected, never repeated on a periodic timer
+    (see GameServer's own docstring for why: the client renders its own
+    local countdown from this one authoritative value, using its own
+    wall clock, mirroring Stage B7.5/the game timer's own established
+    "client-local timing between authoritative updates" pattern - the
+    exact same reasoning that already justifies never re-sending the
+    elapsed-clock "STATE:" broadcast just to keep a running total
+    ticking visually). Takes `countdown_seconds` as a parameter (not a
+    fixed string) for the identical reason `format_matchmaking_timeout`
+    does - so the real, possibly test-overridden countdown duration is
+    always what actually gets reported, never a hardcoded 20.
+  - `format_opponent_reconnected()` - a bare, parameterless literal
+    ("opponent_reconnected"), mirroring `SEARCHING_FOR_OPPONENT_MESSAGE`'s
+    own shape exactly (a plain, self-contained status string, no
+    colon-delimited detail needed) - sent once, the moment the SAME
+    disconnected username successfully rejoins the same match within
+    the countdown window, telling the still-connected opponent the
+    countdown is cancelled and the game continues normally.
+Neither message reuses the "rejected:<reason>"/"matchmaking_timeout:"
+vocabulary - both are mid-game status updates about the OPPONENT's own
+connection, not anything about this recipient's own connection being
+rejected or timed out, so conflating them with either existing
+vocabulary would be actively misleading.
+
 SENDING (`send`/`broadcast`): the exact ConnectionClosed-swallowing
 policy GameServer's own (now retired) `_safe_send`/`_broadcast` already
 established, moved here unchanged - see server/main.py's own
@@ -167,6 +201,8 @@ SERVER_FULL_MESSAGE = "server_full"
 _REJECTION_PREFIX = "rejected:"
 SEARCHING_FOR_OPPONENT_MESSAGE = "searching_for_opponent"
 _MATCHMAKING_TIMEOUT_PREFIX = "matchmaking_timeout:"
+_OPPONENT_DISCONNECTED_PREFIX = "opponent_disconnected:"
+OPPONENT_RECONNECTED_MESSAGE = "opponent_reconnected"
 
 
 class ProtocolHandler:
@@ -244,6 +280,23 @@ class ProtocolHandler:
         message."""
 
         return f"{_MATCHMAKING_TIMEOUT_PREFIX} no opponent found within {timeout_seconds:g} seconds"
+
+    def format_opponent_disconnected(self, countdown_seconds: float) -> str:
+        """The "opponent_disconnected:<seconds>" message a still-
+        connected player receives the moment their opponent's own
+        connection drops during an ACTIVE match - see module docstring's
+        "STAGE E2 - DISCONNECT-COUNTDOWN WIRE TEXT" section for why this
+        is sent once, not repeated on a timer."""
+
+        return f"{_OPPONENT_DISCONNECTED_PREFIX}{countdown_seconds:g}"
+
+    def format_opponent_reconnected(self) -> str:
+        """The bare "opponent_reconnected" message a still-connected
+        player receives the moment their opponent's own disconnected
+        connection successfully resumes the same match within the
+        countdown window - see module docstring's "STAGE E2" section."""
+
+        return OPPONENT_RECONNECTED_MESSAGE
 
     def format_rejection(self, reason: str) -> str:
         """The single "rejected:<reason>" wire convention every direct,
