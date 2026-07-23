@@ -13,6 +13,15 @@ capture scenario can be used.
 NEW, SEPARATE test file (not an edit to any existing
 test_network_game_loop_runner*.py file), matching this codebase's own
 established "new behavior gets a new test file" convention.
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): see test_network_game_loop_runner_gameover.py's own
+"UPDATED for Stage E1" docstring section for the full reasoning
+(session_factory replaces session). The 3 fake-clock-driven/local
+parsing tests never send a real move, so a throwaway dummy opponent
+unblocks their matchmaking wait regardless of color; the one test that
+sends a real WHITE-specific capturing move constructs two real runners
+concurrently and picks whichever ended up WHITE.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ import websockets
 
 from kungfu_chess.client.events.observers import CaptureLogEntry, MoveLogEntry, MovesLogSnapshot, ScoreSnapshot
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner
+from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.client.ui.captured_pieces_renderer import group_captured_pieces_by_color
 from kungfu_chess.client.ui.score_table import PIECE_VALUES
 from kungfu_chess.model.board import Board
@@ -74,7 +84,16 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready, session))
 
     async def _serve(self, ready: threading.Event, session: Optional[GameSession]) -> None:
-        game_server = GameServer(session=session, user_repository_db_path=":memory:")
+        # session_factory replaces the old session= constructor param
+        # (see game_server.py's own "STAGE E1" docstring) - only
+        # override it when a specific session was actually requested;
+        # otherwise keep GameServer's own default (a fresh GameSession
+        # per match), since session_factory=lambda: None would break
+        # every match this server ever forms.
+        kwargs = {"user_repository_db_path": ":memory:"}
+        if session is not None:
+            kwargs["session_factory"] = lambda: session
+        game_server = GameServer(**kwargs)
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -93,6 +112,49 @@ class _BackgroundTestServer:
         if self._loop is not None and self._stop_event is not None:
             self._loop.call_soon_threadsafe(self._stop_event.set)
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
+
+
+def _start_dummy_opponent(uri: str, username: str) -> tuple[NetworkGameClient, threading.Thread]:
+    """Starts (but does not wait for) a throwaway, same-rated dummy
+    opponent connecting on a background thread - must be started BEFORE
+    constructing the real runner under test - see
+    test_network_game_loop_runner.py's own identically-named helper for
+    the full reasoning."""
+
+    dummy = NetworkGameClient()
+    dummy_thread = threading.Thread(
+        target=dummy.connect, args=(uri, f"{username}_dummy_opponent", "dummy password"), daemon=True
+    )
+    dummy_thread.start()
+    return dummy, dummy_thread
+
+
+def _construct_concurrently(uri: str, username: str, password: str) -> tuple[threading.Thread, list]:
+    """Constructs a NetworkGameLoopRunner on its own background thread -
+    see test_network_game_loop_runner.py's own identically-named helper
+    for the full reasoning."""
+
+    result: list[NetworkGameLoopRunner] = []
+
+    def _construct() -> None:
+        result.append(NetworkGameLoopRunner(uri, username=username, password=password, headless=True))
+
+    thread = threading.Thread(target=_construct, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _white_and_black(
+    runner1: NetworkGameLoopRunner, runner2: NetworkGameLoopRunner
+) -> tuple[NetworkGameLoopRunner, NetworkGameLoopRunner]:
+    """Returns (white_runner, black_runner) - color assignment is queue-
+    order-driven, not construction-order-driven, so which of two
+    concurrently-connecting runners is WHITE is genuinely racy."""
+
+    assert {runner1.assigned_color, runner2.assigned_color} == {Color.WHITE, Color.BLACK}
+    if runner1.assigned_color == Color.WHITE:
+        return runner1, runner2
+    return runner2, runner1
 
 
 def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> None:
@@ -126,8 +188,10 @@ def _capture_ready_session() -> GameSession:
 
 def test_apply_state_snapshot_replaces_previously_held_score_log_and_clock():
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         assert runner._latest_score.score_by_color == {Color.WHITE: 0, Color.BLACK: 0}
         assert runner._latest_log.entries == ()
         assert runner._latest_clock_ms == 0
@@ -160,13 +224,16 @@ def test_apply_state_snapshot_replaces_previously_held_score_log_and_clock():
         assert runner._latest_clock_ms == 2000
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
 def test_apply_state_snapshot_ignores_malformed_text_without_crashing():
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         runner._apply_state_snapshot("STATE:not_an_int:0:0:")  # must not raise
 
         assert runner._latest_score.score_by_color == {Color.WHITE: 0, Color.BLACK: 0}
@@ -174,14 +241,17 @@ def test_apply_state_snapshot_ignores_malformed_text_without_crashing():
         assert runner._latest_clock_ms == 0
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
 def test_displayed_clock_ms_interpolates_forward_using_the_client_clock_between_broadcasts():
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         score = ScoreSnapshot(score_by_color={Color.WHITE: 0, Color.BLACK: 0})
         log = MovesLogSnapshot(entries=())
 
@@ -199,6 +269,7 @@ def test_displayed_clock_ms_interpolates_forward_using_the_client_clock_between_
         assert runner._displayed_clock_ms() == 20_000
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
@@ -208,9 +279,13 @@ def test_displayed_clock_ms_interpolates_forward_using_the_client_clock_between_
 def test_a_real_capture_updates_held_score_log_and_produces_the_correct_captured_pieces_grouping():
     session = _capture_ready_session()
     test_server = _BackgroundTestServer(session=session)
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
-        assert runner.assigned_color == Color.WHITE
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 
         # a8 -> b8: a real, one-square, capturing rook move.
@@ -240,5 +315,7 @@ def test_a_real_capture_updates_held_score_log_and_produces_the_correct_captured
         assert grouped[Color.WHITE] == [PieceKind.PAWN]
         assert grouped[Color.BLACK] == []
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
