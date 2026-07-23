@@ -10,7 +10,7 @@ suite in this project does.
 from __future__ import annotations
 
 from kungfu_chess.bus.event_bus import EventBus
-from kungfu_chess.client.events.game_events import JumpAccepted, JumpLanded, MoveAccepted
+from kungfu_chess.client.events.game_events import GameOver, JumpAccepted, JumpLanded, MoveAccepted
 from kungfu_chess.client.events.observers import CaptureLogEntry
 from kungfu_chess.extra.jump import JUMP_DURATION_MS
 from kungfu_chess.model.board import Board
@@ -202,6 +202,58 @@ def test_moves_log_observer_receives_the_predicted_upcoming_clock_ms_before_each
     assert len(capture_entries) == 1
     assert capture_entries[0].recorded_at_clock_ms == 2 * MS_PER_SQUARE
     assert session.engine.state.clock_ms == 2 * MS_PER_SQUARE
+
+
+def test_resign_sets_game_over_and_publishes_a_real_game_over_event_favoring_the_opponent():
+    # Stage E2 (disconnect-countdown-autoresign) - resign() is the
+    # narrow, additive mechanism a disconnect-countdown auto-resignation
+    # reuses: it must set the SAME engine.state.game_over flag a real
+    # king-capture GameOver already sets (so GameEngine.request_move
+    # rejects any further move with reason="game_over", exactly like an
+    # ordinary game-over), and publish a real GameOver event through the
+    # SAME event_bus every other real game event already goes through -
+    # not a second, parallel "resignation" event type.
+    session = GameSession()
+    received: list = []
+    session.event_bus.subscribe(GameOver, received.append)
+
+    session.resign(loser_color=Color.WHITE)
+
+    assert session.engine.state.game_over is True
+    assert received == [GameOver(winner_color=Color.BLACK)]
+
+
+def test_resign_is_a_no_op_if_the_game_is_already_over():
+    # A real, narrow race this stage's own task anticipates: both
+    # players of a match could each independently disconnect and each
+    # have their own countdown expire - the second resign() call must
+    # never overwrite an already-decided winner with a second,
+    # contradictory GameOver.
+    session = GameSession()
+    received: list = []
+    session.event_bus.subscribe(GameOver, received.append)
+
+    session.resign(loser_color=Color.WHITE)
+    session.resign(loser_color=Color.BLACK)  # would (wrongly) name White the winner if not guarded
+
+    assert received == [GameOver(winner_color=Color.BLACK)]
+
+
+def test_resign_does_not_disturb_an_already_in_flight_motion():
+    # resign() must not reach into the board/arbiter at all - it only
+    # ever sets the game_over flag and publishes an event, exactly like
+    # a real king-capture GameOver's own side effects (see
+    # GameEngine.wait's own king_captured branch) - a piece mid-motion
+    # at the moment of resignation is simply left as-is.
+    session = GameSession()
+    from_cell = Position(row=6, col=4)
+    to_cell = Position(row=4, col=4)
+    session.request_move(from_cell, to_cell)
+
+    session.resign(loser_color=Color.BLACK)
+
+    assert session.engine.board.piece_at(from_cell) is not None
+    assert session.engine.board.piece_at(to_cell) is None
 
 
 def test_two_independent_game_sessions_do_not_share_state():

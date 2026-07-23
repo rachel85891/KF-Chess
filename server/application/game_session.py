@@ -156,6 +156,64 @@ STANDARD_STARTING_POSITION_LINES would fail the same validation
 (ERR_ROW_WIDTH_MISMATCH/ERR_UNKNOWN_TOKEN) any other malformed board
 text would, rather than silently producing a wrong board.
 
+STAGE E2 - resign() (feature/disconnect-countdown-autoresign-e2): a
+real, in-progress match's own auto-resignation-on-disconnect-timeout
+(server/application/game_server.py's own new disconnect-countdown
+mechanism - see that class's own docstring for the full server-side
+sequence) needs to end this session's game WITHOUT a real king capture
+ever happening - there is no "the other player simply disconnected"
+input anywhere in GameEngine/ExtraEngine/RealTimeArbiter/RuleEngine
+(all of them only ever know about board/piece/timing state, never
+about a network connection at all, by design - see this project's own
+layer-separation rules, docs/spec.md §3). `resign(loser_color)` is
+therefore added HERE, on GameSession, as the narrowest possible new
+surface: it does NOT call into GameEngine.wait/request_move at all (a
+disconnect is not a move, and forcing one through that path would mean
+inventing a fake arrival/king-capture that never really happened) -
+it directly reproduces the exact TWO real, already-established side
+effects a genuine king-capture GameOver already has (re-verified
+directly against GameEngine.wait's own `if event.king_captured:
+self.state.game_over = True` branch and GameEventPublisher.wait's own
+`pending.append(GameOver(winner_color=...))` calls): (1) set
+`self.engine.state.game_over = True` - the SAME flag
+GameEngine.request_move already checks before accepting any move, so a
+resigned game rejects further moves with reason="game_over" exactly
+like a real king-capture-ended one, with no separate guard needed
+anywhere else; (2) `self.event_bus.publish(GameOver(winner_color=...))`
+- the SAME event class, delivered through the SAME EventBus every
+other real game event already flows through, so GameServer's own
+existing per-match subscription/broadcast machinery
+(server/application/game_server.py's own `_on_game_event`/
+`_broadcast_event`, subscribed once per match in `_create_match`, never
+touched by this stage) picks it up and broadcasts it to both of this
+match's own connections with ZERO changes needed there - this is
+reusing the EXISTING GameOver mechanism verbatim, not building a
+second, parallel "resignation" event/wire-message/broadcast path.
+
+GUARDED AGAINST A DOUBLE-RESIGN RACE (`if self.engine.state.game_over:
+return`, a plain no-op): a real, anticipated scenario where BOTH
+players of a match disconnect independently, each with their own
+20-second countdown running - if the first one's countdown expires and
+calls resign(loser_color=A), the second one's own, later-expiring
+countdown must never subsequently overwrite that already-decided
+winner with a second, contradictory GameOver(winner_color=B). This
+mirrors the exact same "already ended, do nothing more" invariant a
+real king capture already has implicitly (GameEngine.request_move's own
+`if self.state.game_over: return MoveResult(...)` guard already means a
+SECOND king capture can never happen after the first, since no further
+move would ever be accepted at all) - resign() makes that same
+invariant explicit for its own, structurally different trigger (no
+engine call to naturally block a second call), rather than leaving two
+independent countdowns able to race each other.
+
+NO CLOCK/BOARD/ARBITER SIDE EFFECT: unlike a real, wait()-driven
+GameOver (which always fires alongside a genuine PieceArrived/
+AttackerIntercepted for whatever motion actually completed), resign()
+touches nothing about a piece's position, an in-flight motion, or the
+elapsed clock - a disconnect is not a move, so there is nothing
+board-related to reflect; whatever the board's last real state was
+remains exactly as it was.
+
 NO SINGLETON: GameSession is a plain, independently-instantiable class
 - no module-level instance, no class-level shared state anywhere in
 this file (mirrors kungfu_chess.bus.EventBus's and
@@ -177,12 +235,14 @@ from typing import List, Optional
 
 from kungfu_chess.bus.event_bus import EventBus
 from kungfu_chess.client.events.event_publisher import GameEventPublisher
+from kungfu_chess.client.events.game_events import GameOver
 from kungfu_chess.client.events.observers import MovesLogObserver, ScoreObserver
 from kungfu_chess.client.events.piece_registry import PieceRegistry
 from kungfu_chess.engine.game_engine import GameEngine, MoveResult
 from kungfu_chess.extra.extra_engine import ExtraEngine
 from kungfu_chess.io.board_parser import BoardParser
 from kungfu_chess.model.board import Board
+from kungfu_chess.model.color import Color
 from kungfu_chess.model.position import Position
 from kungfu_chess.realtime.motion import ArrivalEvent
 
@@ -326,3 +386,30 @@ class GameSession:
 
         self.moves_log_observer.set_current_clock_ms(self.engine.state.clock_ms + ms)
         return self.publisher.wait(ms)
+
+    def resign(self, loser_color: Color) -> None:
+        """End this game as if `loser_color` resigned - see module
+        docstring's "STAGE E2 - resign()" section for the full
+        reasoning behind every decision below.
+
+        Args:
+            loser_color: The color that is resigning (e.g. the player
+                whose connection failed to reconnect within a real
+                disconnect countdown - server/application/game_server.py's
+                own new mechanism). The other color is reported as the
+                winner.
+
+        Returns:
+            None.
+
+        A no-op if the game is already over (see module docstring's
+        "GUARDED AGAINST A DOUBLE-RESIGN RACE" section) - never
+        overwrites an already-decided winner with a second,
+        contradictory GameOver.
+        """
+
+        if self.engine.state.game_over:
+            return
+
+        self.engine.state.game_over = True
+        self.event_bus.publish(GameOver(winner_color=loser_color.opposite))
