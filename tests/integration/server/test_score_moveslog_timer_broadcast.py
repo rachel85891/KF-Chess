@@ -33,6 +33,17 @@ message before receiving assigned_color. _RECV_TIMEOUT_S is widened
 from 5.0 to accommodate real, accepted PBKDF2 authentication latency
 (see test_protocol_wiring.py's own identical note for the full
 reasoning).
+
+UPDATED AGAIN for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): GameServer's old session= constructor param was replaced by
+session_factory (see game_server.py's own "STAGE E1" docstring
+section) - now supplied via session_factory=lambda: session. Both
+clients now connect CONCURRENTLY via asyncio.gather (sequential
+connects would deadlock waiting for a matchmaking opponent), draining
+the extra searching_for_opponent message. Color assignment is queue-
+order-driven, not connection-order-driven, so the WHITE-specific rook
+move below is sent from whichever of client1/client2 actually ended up
+WHITE, identified from the real welcome messages rather than assumed.
 """
 
 from __future__ import annotations
@@ -76,7 +87,7 @@ def _capture_ready_session() -> GameSession:
 
 @asynccontextmanager
 async def _running_game_server(session: GameSession):
-    game_server = GameServer(session=session, user_repository_db_path=":memory:")
+    game_server = GameServer(session_factory=lambda: session, user_repository_db_path=":memory:")
     server = await websockets.serve(game_server.handle_connection, "localhost", 0)
     tick_task = asyncio.create_task(game_server.run_tick_loop())
     try:
@@ -92,27 +103,44 @@ async def _running_game_server(session: GameSession):
         await server.wait_closed()
 
 
+async def _authenticate_and_drain_join(client, username: str, password: str) -> tuple[str, str]:
+    """Sends AUTH, drains the real searching_for_opponent message, and
+    returns (welcome, board_state) - mirrors test_protocol_wiring.py's
+    own identically-named helper. Caller is responsible for running
+    this CONCURRENTLY (asyncio.gather) with a rating-compatible
+    opponent's own call - awaiting it alone would block forever with no
+    opponent."""
+
+    await client.send(format_auth_command(username, password))
+    searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+    assert searching == "searching_for_opponent"
+    welcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+    board_state = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+    return welcome, board_state
+
+
 def test_a_real_capture_broadcasts_the_correct_score_move_log_and_advancing_elapsed_clock():
     async def scenario():
         session = _capture_ready_session()
         async with _running_game_server(session) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()  # assigned_color
-                await client2.recv()
-                await client1.recv()  # join-time board state
-                await client2.recv()
+                (welcome1, _board1), (_welcome2, _board2) = await asyncio.gather(
+                    _authenticate_and_drain_join(client1, "client1", "password1"),
+                    _authenticate_and_drain_join(client2, "client2", "password2"),
+                )
+                white_client, black_client = (
+                    (client1, client2) if "white" in welcome1.lower() else (client2, client1)
+                )
 
                 # a8 -> b8: a real, one-square, capturing rook move.
-                await client1.send("WRa8b8")
+                await white_client.send("WRa8b8")
 
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                move_state_text = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                move_state_text = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
                 assert move_state_text.startswith(STATE_SNAPSHOT_MESSAGE_PREFIX)
                 move_score, move_log, move_clock_ms = parse_game_state_snapshot(move_state_text)
@@ -124,12 +152,12 @@ def test_a_real_capture_broadcasts_the_correct_score_move_log_and_advancing_elap
                 assert move_log.entries[0].piece_kind is PieceKind.ROOK
                 assert move_log.entries[0].piece_color is Color.WHITE
 
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived board text
-                arrival_state_text = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived state snapshot
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                arrival_state_text_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived board text
+                arrival_state_text = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                arrival_state_text_2 = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
         assert arrival_state_text == arrival_state_text_2  # both clients see the exact same broadcast state
 
