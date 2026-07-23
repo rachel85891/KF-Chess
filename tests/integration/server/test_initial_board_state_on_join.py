@@ -44,6 +44,23 @@ the server ever reads anything it sent). _RECV_TIMEOUT_S is widened
 from 5.0 to accommodate real, accepted PBKDF2 authentication latency
 (see test_protocol_wiring.py's own identical note for the full
 reasoning).
+
+UPDATED AGAIN for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1, see game_server.py's own "STAGE E1" docstring section): after
+AUTH succeeds, a connection now receives searching_for_opponent FIRST,
+then only later (once a rating-compatible opponent also joins) does it
+receive assigned_color+board-state - an extra message to drain per
+client, and every scenario that needs two clients to match EACH OTHER
+must now connect them CONCURRENTLY (sequential connects would deadlock
+- the first one's own recv() would block forever waiting for an
+opponent that hasn't connected yet). `test_third_connection_is_still_
+rejected_with_server_full_and_receives_no_board_state` is REMOVED, not
+rewritten: the fixed-two-connection "server_full" cap this test proved
+no longer exists at all under real matchmaking (see game_server.py's
+own "WHY 'server_full' IS REMOVED ENTIRELY" docstring section) - there
+is no replacement behavior to test in its place, only its own absence
+(a third, fourth, etc. connection now simply joins the matchmaking
+queue like any other).
 """
 
 from __future__ import annotations
@@ -51,9 +68,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
-import pytest
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.notation.auth_command_format import format_auth_command
@@ -83,15 +98,31 @@ async def _running_game_server(start_tick_loop: bool = False):
         await server.wait_closed()
 
 
+async def _authenticate_and_await_welcome(client, username: str, password: str) -> str:
+    """Sends AUTH, drains the real searching_for_opponent message, and
+    returns the eventual assigned_color welcome - see module docstring's
+    "UPDATED AGAIN for Stage E1" section. Caller is responsible for
+    running this concurrently (asyncio.gather) with a rating-compatible
+    opponent's own call - awaiting it alone would block forever with no
+    opponent."""
+
+    await client.send(format_auth_command(username, password))
+    searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+    assert searching == "searching_for_opponent"
+    return await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+
+
 def test_first_client_receives_the_starting_board_state_right_after_assigned_color():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
-            async with websockets.connect(uri) as client:
-                await client.send(format_auth_command("alice", "password"))
-                welcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+            async with websockets.connect(uri) as client, websockets.connect(uri) as dummy:
+                welcome, _dummy_welcome = await asyncio.gather(
+                    _authenticate_and_await_welcome(client, "alice", "password"),
+                    _authenticate_and_await_welcome(dummy, "alice_dummy_opponent", "dummy password"),
+                )
                 board_state = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert "white" in welcome.lower()
+        assert welcome.split(":")[1] in ("white", "black")
         assert board_state == _STARTING_BOARD_TEXT
 
     asyncio.run(scenario())
@@ -100,41 +131,16 @@ def test_first_client_receives_the_starting_board_state_right_after_assigned_col
 def test_second_client_also_receives_its_own_correct_starting_board_independently():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
-            async with websockets.connect(uri) as client1:
-                await client1.send(format_auth_command("client1", "password1"))
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # assigned_color:white
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board state
-
-                async with websockets.connect(uri) as client2:
-                    await client2.send(format_auth_command("client2", "password2"))
-                    welcome2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                    board_state2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-
-        assert "black" in welcome2.lower()
-        assert board_state2 == _STARTING_BOARD_TEXT
-
-    asyncio.run(scenario())
-
-
-def test_third_connection_is_still_rejected_with_server_full_and_receives_no_board_state():
-    async def scenario():
-        async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                _welcome1, welcome2 = await asyncio.gather(
+                    _authenticate_and_await_welcome(client1, "client1", "password1"),
+                    _authenticate_and_await_welcome(client2, "client2", "password2"),
+                )
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board state
+                board_state2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
 
-                async with websockets.connect(uri) as client3:
-                    rejection = await asyncio.wait_for(client3.recv(), timeout=_RECV_TIMEOUT_S)
-                    assert rejection == "server_full"
-                    # Must NOT also receive a board-state message before
-                    # the connection closes - the rejection path is
-                    # completely unaffected by this fix.
-                    with pytest.raises(ConnectionClosed):
-                        await asyncio.wait_for(client3.recv(), timeout=_RECV_TIMEOUT_S)
+        assert welcome2.split(":")[1] in ("white", "black")
+        assert board_state2 == _STARTING_BOARD_TEXT
 
     asyncio.run(scenario())
 
@@ -143,14 +149,19 @@ def test_existing_event_driven_broadcasts_still_work_after_the_join_time_board_s
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # assigned_color:white
+                welcome1, welcome2 = await asyncio.gather(
+                    _authenticate_and_await_welcome(client1, "client1", "password1"),
+                    _authenticate_and_await_welcome(client2, "client2", "password2"),
+                )
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # join-time board state
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # assigned_color:black
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # join-time board state
 
-                await client1.send("WPe2e4")
+                # Color assignment is queue-order-driven, not connection-
+                # order-driven (Stage E1), so the WHITE pawn move below
+                # must be sent from whichever of client1/client2 actually
+                # ended up WHITE - not assumed to be client1.
+                white_client = client1 if welcome1.split(":")[1] == "white" else client2
+                await white_client.send("WPe2e4")
 
                 # Same six-broadcast-per-client pattern already
                 # established by tests/integration/server/
