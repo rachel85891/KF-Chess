@@ -9,6 +9,14 @@ stays self-contained, per established precedent).
 NEW, SEPARATE test file (not an edit to any existing
 test_network_game_loop_runner*.py file), matching this codebase's own
 established "new behavior gets a new test file" convention.
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): see test_network_game_loop_runner.py's own "UPDATED for
+Stage E1" docstring section for the full reasoning. Every test below
+needs runner to be WHITE specifically (a1's rook belongs to White, and
+the "opponent's piece" test needs a genuine opponent), so each
+constructs two real runners concurrently and picks whichever ended up
+WHITE via _white_and_black, closing the other as a bystander.
 """
 
 from __future__ import annotations
@@ -84,6 +92,34 @@ def _window_pixel(runner: NetworkGameLoopRunner, cell: Position) -> tuple[int, i
     return window_x, window_y
 
 
+def _construct_concurrently(uri: str, username: str, password: str) -> tuple[threading.Thread, list]:
+    """Constructs a NetworkGameLoopRunner on its own background thread -
+    see test_network_game_loop_runner.py's own identically-named helper
+    for the full reasoning."""
+
+    result: list[NetworkGameLoopRunner] = []
+
+    def _construct() -> None:
+        result.append(NetworkGameLoopRunner(uri, username=username, password=password, headless=True))
+
+    thread = threading.Thread(target=_construct, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _white_and_black(
+    runner1: NetworkGameLoopRunner, runner2: NetworkGameLoopRunner
+) -> tuple[NetworkGameLoopRunner, NetworkGameLoopRunner]:
+    """Returns (white_runner, black_runner) - color assignment is queue-
+    order-driven, not construction-order-driven, so which of two
+    concurrently-connecting runners is WHITE is genuinely racy."""
+
+    assert {runner1.assigned_color, runner2.assigned_color} == {Color.WHITE, Color.BLACK}
+    if runner1.assigned_color == Color.WHITE:
+        return runner1, runner2
+    return runner2, runner1
+
+
 def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> None:
     deadline = time.perf_counter() + timeout_s
     while time.perf_counter() < deadline:
@@ -95,9 +131,13 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 
 def test_a_right_click_on_the_local_players_own_piece_sends_a_real_jump_and_a_cooldown_bar_appears_after_landing():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
-        assert runner.assigned_color == Color.WHITE
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         # Seed the known starting position - see
         # test_network_game_loop_runner.py's own module docstring for
         # why this stand-in for the real "no initial broadcast on join"
@@ -130,15 +170,21 @@ def test_a_right_click_on_the_local_players_own_piece_sends_a_real_jump_and_a_co
         # cell, unlike an ordinary move.
         assert runner.board.piece_at(a1) is rook
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
 
 
 def test_right_click_on_the_opponents_piece_does_not_send_a_jump():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
-        assert runner.assigned_color == Color.WHITE
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         runner._apply_broadcast(_STARTING_BOARD_TEXT)
 
         sent: list = []
@@ -150,14 +196,21 @@ def test_right_click_on_the_opponents_piece_does_not_send_a_jump():
 
         assert sent == []
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
 
 
 def test_cooldown_ratio_decreases_over_real_time_after_a_real_jump_landing():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         runner._apply_broadcast(_STARTING_BOARD_TEXT)
         a1 = Position(row=7, col=0)
         rook = runner.board.piece_at(a1)
@@ -183,5 +236,7 @@ def test_cooldown_ratio_decreases_over_real_time_after_a_real_jump_landing():
 
         assert ratio_later < ratio_soon_after_landing
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
