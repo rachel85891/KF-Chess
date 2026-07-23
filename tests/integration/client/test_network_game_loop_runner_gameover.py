@@ -173,11 +173,28 @@ def test_a_real_king_interception_ends_the_game_for_both_network_clients():
             attacker_cell = Position(row=0, col=1)
 
             # White (defender's owner) jumps its own pawn; Black
-            # (attacker's owner, a KING) immediately sends its own king
-            # toward the airborne cell - the King is destroyed instead of
+            # (attacker's owner, a KING) sends its own king toward the
+            # airborne cell - the King is destroyed instead of
             # capturing, and MUST end the game (fix/network-gameover-
             # and-king-interception's own Part A).
+            #
+            # UPDATED for Stage E1: waiting for white's own real,
+            # server-confirmed JumpAccepted broadcast before sending
+            # black's move removes a genuine race introduced by
+            # concurrent matchmaking connects - see
+            # test_network_game_loop_runner_interception.py's own
+            # identical comment for the full reasoning.
+            defender_before_white = runner_white.board.piece_at(defender_cell)
+            assert defender_before_white is not None
+
             runner_white.network_client.send_jump(Color.WHITE, PieceKind.PAWN, defender_cell)
+            _poll_until(
+                [runner_white],
+                lambda: defender_before_white.id in runner_white._active_motions,
+                timeout_s=5.0,
+            )
+            assert defender_before_white.id in runner_white._active_motions
+
             runner_black.network_client.send_move(Color.BLACK, PieceKind.KING, attacker_cell, defender_cell)
 
             def both_see_game_over() -> bool:

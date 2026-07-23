@@ -19,6 +19,13 @@ inventing a new one, per this fix's own requirement.
 NEW, SEPARATE test file (not an edit to any existing
 test_network_game_loop_runner*.py file), matching this codebase's own
 established "new behavior gets a new test file" convention.
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): see test_network_game_loop_runner_gameover.py's own
+"UPDATED for Stage E1" docstring section for the full reasoning
+(session_factory replaces session, concurrent runner construction
+replaces sequential, colors identified via _white_and_black rather
+than assumed from construction order).
 """
 
 from __future__ import annotations
@@ -83,7 +90,7 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready, session))
 
     async def _serve(self, ready: threading.Event, session: Optional[GameSession]) -> None:
-        game_server = GameServer(session=session, user_repository_db_path=":memory:")
+        game_server = GameServer(session_factory=lambda: session, user_repository_db_path=":memory:")
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -104,6 +111,34 @@ class _BackgroundTestServer:
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
 
 
+def _construct_concurrently(uri: str, username: str, password: str) -> tuple[threading.Thread, list]:
+    """Constructs a NetworkGameLoopRunner on its own background thread -
+    see test_network_game_loop_runner.py's own identically-named helper
+    for the full reasoning."""
+
+    result: list[NetworkGameLoopRunner] = []
+
+    def _construct() -> None:
+        result.append(NetworkGameLoopRunner(uri, username=username, password=password, headless=True))
+
+    thread = threading.Thread(target=_construct, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _white_and_black(
+    runner1: NetworkGameLoopRunner, runner2: NetworkGameLoopRunner
+) -> tuple[NetworkGameLoopRunner, NetworkGameLoopRunner]:
+    """Returns (white_runner, black_runner) - color assignment is queue-
+    order-driven, not construction-order-driven, so which of two
+    concurrently-connecting runners is WHITE is genuinely racy."""
+
+    assert {runner1.assigned_color, runner2.assigned_color} == {Color.WHITE, Color.BLACK}
+    if runner1.assigned_color == Color.WHITE:
+        return runner1, runner2
+    return runner2, runner1
+
+
 def _poll_until(runners, predicate, timeout_s: float) -> None:
     deadline = time.perf_counter() + timeout_s
     while time.perf_counter() < deadline:
@@ -117,13 +152,13 @@ def _poll_until(runners, predicate, timeout_s: float) -> None:
 def test_a_real_jump_interception_removes_the_attacker_from_both_network_clients():
     session = _interception_ready_session()
     test_server = _BackgroundTestServer(session=session)
-    runner_white = NetworkGameLoopRunner(test_server.uri, username="runner_white", password="runner_white_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
     try:
-        runner_black = NetworkGameLoopRunner(test_server.uri, username="runner_black", password="runner_black_pw", headless=True)
+        runner_white, runner_black = _white_and_black(result1[0], result2[0])
         try:
-            assert runner_white.assigned_color == Color.WHITE
-            assert runner_black.assigned_color == Color.BLACK
-
             _poll_until(
                 [runner_white, runner_black],
                 lambda: runner_white.board is not None and runner_black.board is not None,
@@ -146,12 +181,40 @@ def test_a_real_jump_interception_removes_the_attacker_from_both_network_clients
             assert runner_black.board.piece_at(defender_cell) is not None
 
             # White (defender's owner) jumps its own pawn; Black
-            # (attacker's owner) immediately sends its own rook toward
-            # the airborne cell - the exact scenario
-            # tests/unit/test_jump.py's own established interception
-            # test already exercises, reproduced here over the real
-            # network.
+            # (attacker's owner) sends its own rook toward the airborne
+            # cell - the exact scenario tests/unit/test_jump.py's own
+            # established interception test already exercises,
+            # reproduced here over the real network.
+            #
+            # UPDATED for Stage E1: under sequential (pre-matchmaking)
+            # connects, both connections' own server-side tasks were
+            # already symmetrically parked in their receive loop before
+            # any command was ever sent, by construction. Real
+            # matchmaking's own concurrent-arrival pairing (see
+            # server/application/game_server.py's own "STAGE E1"
+            # docstring section) no longer guarantees that symmetry -
+            # which of the two connections' own server-side task
+            # resumes its receive loop first is now genuinely racy, so
+            # firing the interception move immediately after the jump
+            # (with no synchronization) occasionally raced ahead of the
+            # jump actually being registered as airborne server-side.
+            # Waiting for white's own real, server-confirmed
+            # JumpAccepted broadcast (visible here as the defender's own
+            # id appearing in runner_white._active_motions) before
+            # sending black's move removes that race: only a real,
+            # already-processed jump can prove the server-side engine
+            # already considers the defender airborne.
+            defender_before_white = runner_white.board.piece_at(defender_cell)
+            assert defender_before_white is not None
+
             runner_white.network_client.send_jump(Color.WHITE, PieceKind.PAWN, defender_cell)
+            _poll_until(
+                [runner_white],
+                lambda: defender_before_white.id in runner_white._active_motions,
+                timeout_s=5.0,
+            )
+            assert defender_before_white.id in runner_white._active_motions
+
             runner_black.network_client.send_move(Color.BLACK, PieceKind.ROOK, attacker_cell, defender_cell)
 
             # First, prove the ORIGINALLY REPORTED symptom's own
