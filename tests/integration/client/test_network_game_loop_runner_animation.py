@@ -15,6 +15,15 @@ test_network_game_loop_runner.py), matching this codebase's own
 established "new behavior gets a new test file" convention (see
 tests/unit/client/test_piece_animator_arrival_transition.py's own
 docstring for the identical precedent).
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): see test_network_game_loop_runner.py's own "UPDATED for
+Stage E1" docstring section for the full reasoning - every single-
+runner test below now needs a concurrently-connected dummy/real
+opponent to unblock its own real matchmaking wait, and the one test
+that sends a move as a specific color (WHITE) uses two concurrently-
+constructed real runners, picking whichever ended up WHITE, since
+color assignment is no longer determined by construction order.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import websockets
 from kungfu_chess.client.animation.animation_state import AnimationState
 from kungfu_chess.client.events.game_events import MoveAccepted
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner
+from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
@@ -84,6 +94,51 @@ class _BackgroundTestServer:
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
 
 
+def _start_dummy_opponent(uri: str, username: str) -> tuple[NetworkGameClient, threading.Thread]:
+    """Starts (but does not wait for) a throwaway, same-rated dummy
+    opponent connecting on a background thread - purely to unblock a
+    single real runner's own real matchmaking wait. Must be started
+    BEFORE constructing the real runner under test, since
+    NetworkGameLoopRunner's own constructor blocks synchronously on the
+    calling thread until matched - see test_network_game_loop_runner.py's
+    own identically-named helper for the full reasoning."""
+
+    dummy = NetworkGameClient()
+    dummy_thread = threading.Thread(
+        target=dummy.connect, args=(uri, f"{username}_dummy_opponent", "dummy password"), daemon=True
+    )
+    dummy_thread.start()
+    return dummy, dummy_thread
+
+
+def _construct_concurrently(uri: str, username: str, password: str) -> tuple[threading.Thread, list]:
+    """Constructs a NetworkGameLoopRunner on its own background thread -
+    see test_network_game_loop_runner.py's own identically-named helper
+    for the full reasoning."""
+
+    result: list[NetworkGameLoopRunner] = []
+
+    def _construct() -> None:
+        result.append(NetworkGameLoopRunner(uri, username=username, password=password, headless=True))
+
+    thread = threading.Thread(target=_construct, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _white_and_black(
+    runner1: NetworkGameLoopRunner, runner2: NetworkGameLoopRunner
+) -> tuple[NetworkGameLoopRunner, NetworkGameLoopRunner]:
+    """Returns (white_runner, black_runner) - color assignment is queue-
+    order-driven, not construction-order-driven, so which of two
+    concurrently-connecting runners is WHITE is genuinely racy."""
+
+    assert {runner1.assigned_color, runner2.assigned_color} == {Color.WHITE, Color.BLACK}
+    if runner1.assigned_color == Color.WHITE:
+        return runner1, runner2
+    return runner2, runner1
+
+
 def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> None:
     """Repeatedly call runner.poll_and_process() (real sleeps, real
     time) until predicate(runner) is True or timeout_s elapses - only
@@ -104,8 +159,17 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 
 def test_real_network_move_transitions_piece_animator_through_move_and_back_to_idle():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
+        # The move sent below is a WHITE pawn move - run it against
+        # whichever of the two concurrently-connected runners actually
+        # ended up WHITE (see module docstring for why that can't be
+        # assumed from construction order).
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         # Drain the join-time initial board-state broadcast - this is
         # what establishes runner.piece_animator_registry (Stage B7).
         _poll_until(runner, lambda r: r.piece_animator_registry is not None, _JOIN_TIMEOUT_S)
@@ -150,14 +214,18 @@ def test_real_network_move_transitions_piece_animator_through_move_and_back_to_i
         assert moved is not None and moved.id == piece_before.id
         assert runner.piece_animator_registry.animator_for(piece_before.id).current_state == AnimationState.IDLE
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
 
 
 def test_malformed_wire_format_event_message_does_not_crash_the_client():
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 
         # Every one of these must be silently ignored, not raise -
@@ -174,6 +242,7 @@ def test_malformed_wire_format_event_message_does_not_crash_the_client():
         assert runner.board is not None
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
@@ -190,8 +259,10 @@ def test_parse_game_event_error_type_is_the_one_this_client_actually_catches():
 
 def test_a_later_board_text_resync_never_replaces_self_board_or_disrupts_an_in_flight_animator():
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
         original_board = runner.board
         piece = runner.board.piece_at(Position(row=6, col=4))
@@ -216,13 +287,16 @@ def test_a_later_board_text_resync_never_replaces_self_board_or_disrupts_an_in_f
         assert runner.piece_animator_registry.animator_for(piece.id).current_state == AnimationState.MOVE
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
 def test_log_resync_mismatch_prints_a_diagnostic_on_a_genuine_disagreement(capsys):
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 
         # A synthetic resync that deliberately disagrees at e2 (says
@@ -247,4 +321,5 @@ def test_log_resync_mismatch_prints_a_diagnostic_on_a_genuine_disagreement(capsy
         assert runner.board.piece_at(Position(row=6, col=4)) is not None
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
