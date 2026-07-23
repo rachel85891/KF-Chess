@@ -15,6 +15,15 @@ mocked" testing convention throughout the server track.
 NEW, SEPARATE test file (not an edit to test_network_game_loop_runner_
 animation.py), matching this codebase's own established "new behavior
 gets a new test file" convention.
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): see test_network_game_loop_runner.py's own "UPDATED for
+Stage E1" docstring section for the full reasoning. The 4 fake-clock-
+driven progress tests below never send a real move (they manipulate
+_active_motions directly), so a throwaway dummy opponent unblocks
+their real matchmaking wait regardless of which color it results in;
+the 2 tests that send a real WHITE-specific move construct two real
+runners concurrently and pick whichever ended up WHITE.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ import time
 import websockets
 
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner, _ClientMotion
+from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
@@ -95,6 +105,49 @@ class _BackgroundTestServer:
         self._thread.join(timeout=_JOIN_TIMEOUT_S)
 
 
+def _start_dummy_opponent(uri: str, username: str) -> tuple[NetworkGameClient, threading.Thread]:
+    """Starts (but does not wait for) a throwaway, same-rated dummy
+    opponent connecting on a background thread - must be started BEFORE
+    constructing the real runner under test - see
+    test_network_game_loop_runner.py's own identically-named helper for
+    the full reasoning."""
+
+    dummy = NetworkGameClient()
+    dummy_thread = threading.Thread(
+        target=dummy.connect, args=(uri, f"{username}_dummy_opponent", "dummy password"), daemon=True
+    )
+    dummy_thread.start()
+    return dummy, dummy_thread
+
+
+def _construct_concurrently(uri: str, username: str, password: str) -> tuple[threading.Thread, list]:
+    """Constructs a NetworkGameLoopRunner on its own background thread -
+    see test_network_game_loop_runner.py's own identically-named helper
+    for the full reasoning."""
+
+    result: list[NetworkGameLoopRunner] = []
+
+    def _construct() -> None:
+        result.append(NetworkGameLoopRunner(uri, username=username, password=password, headless=True))
+
+    thread = threading.Thread(target=_construct, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _white_and_black(
+    runner1: NetworkGameLoopRunner, runner2: NetworkGameLoopRunner
+) -> tuple[NetworkGameLoopRunner, NetworkGameLoopRunner]:
+    """Returns (white_runner, black_runner) - color assignment is queue-
+    order-driven, not construction-order-driven, so which of two
+    concurrently-connecting runners is WHITE is genuinely racy."""
+
+    assert {runner1.assigned_color, runner2.assigned_color} == {Color.WHITE, Color.BLACK}
+    if runner1.assigned_color == Color.WHITE:
+        return runner1, runner2
+    return runner2, runner1
+
+
 def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> None:
     deadline = time.perf_counter() + timeout_s
     while time.perf_counter() < deadline:
@@ -110,8 +163,10 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 def test_progress_is_zero_right_when_a_motion_starts():
     fake_clock = _FakeClock(start=100.0)
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         runner._active_motions[42] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=fake_clock.value
         )
@@ -123,14 +178,17 @@ def test_progress_is_zero_right_when_a_motion_starts():
         assert motions[42].to_cell == Position(row=0, col=4)
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
 def test_progress_is_approximately_half_partway_through_duration():
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         runner._active_motions[7] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=0.0
         )
@@ -142,14 +200,17 @@ def test_progress_is_approximately_half_partway_through_duration():
         assert motions[7].progress == 0.5
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
 def test_progress_is_one_at_exactly_full_duration():
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         runner._active_motions[7] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=0.0
         )
@@ -161,6 +222,7 @@ def test_progress_is_one_at_exactly_full_duration():
         assert motions[7].progress == 1.0
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
@@ -173,8 +235,10 @@ def test_progress_clamps_at_one_when_real_elapsed_time_overshoots_duration_befor
 
     fake_clock = _FakeClock(start=0.0)
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True, clock=fake_clock)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         runner._active_motions[7] = _ClientMotion(
             from_cell=Position(row=0, col=0), to_cell=Position(row=0, col=4), duration_ms=2000, started_at=0.0
         )
@@ -186,13 +250,19 @@ def test_progress_clamps_at_one_when_real_elapsed_time_overshoots_duration_befor
         assert motions[7].progress == 1.0
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
 def test_a_piece_arrived_removes_its_own_active_motion_so_it_no_longer_slides():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 
         e2 = Position(row=6, col=4)
@@ -210,6 +280,8 @@ def test_a_piece_arrived_removes_its_own_active_motion_so_it_no_longer_slides():
 
         assert piece_before.id not in runner._active_motions
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
 
@@ -220,8 +292,13 @@ def test_a_piece_arrived_removes_its_own_active_motion_so_it_no_longer_slides():
 
 def test_real_network_move_renders_a_genuinely_interpolated_mid_flight_pixel_position():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         _poll_until(runner, lambda r: r.board is not None, _JOIN_TIMEOUT_S)
 
         e2 = Position(row=6, col=4)
@@ -261,5 +338,7 @@ def test_real_network_move_renders_a_genuinely_interpolated_mid_flight_pixel_pos
         moved = runner.board.piece_at(e4)
         assert moved is not None and moved.id == piece_before.id
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
