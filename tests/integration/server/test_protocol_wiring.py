@@ -41,7 +41,7 @@ docstring section): _broadcast_event now sends ONE MORE message - the
 score/move-log/elapsed-clock snapshot - immediately after the existing
 wire-event + board-text pair, but ONLY for MoveAccepted/JumpAccepted/
 PieceArrived (JumpLanded/MoveRejected/GameOver are unaffected - they
-never change score/move-log state). Any test below that drains a
+never change score/log state). Any test below that drains a
 MoveAccepted's or JumpAccepted's own resulting broadcasts now drains
 one more message per such event than before this stage - again a real,
 intentional behavior addition, not a scenario change; final assertions
@@ -64,6 +64,27 @@ intact). assigned_color's own wire text also gained a trailing rating
 field ("assigned_color:white:1200") - every assertion below that only
 ever checked `"white"/"black" in welcome.lower()` already tolerates
 this without any change.
+
+UPDATED AGAIN for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1, see game_server.py's own "STAGE E1" docstring section): after
+AUTH succeeds, a connection now receives searching_for_opponent FIRST,
+then only later (once a rating-compatible opponent also joins) does it
+receive assigned_color+board-state. Every two-client scenario below now
+connects BOTH clients CONCURRENTLY via asyncio.gather (sequential
+connects would deadlock - the first client's own recv() would block
+forever waiting for an opponent that hasn't connected yet) using the
+new `_authenticate_and_drain_join` helper, which also drains the extra
+searching_for_opponent message. Color assignment is now queue-order-
+driven, not connection-order-driven, so which of client1/client2 ends
+up WHITE vs BLACK is genuinely racy - every test below identifies
+`white_client`/`black_client` from the real welcome messages instead of
+assuming client1 is always WHITE.
+`test_first_client_is_white_second_is_black_third_is_rejected_and_
+closed` is REMOVED, not rewritten: the fixed-two-connection
+"server_full" cap it proved no longer exists at all under real
+matchmaking (see game_server.py's own "WHY 'server_full' IS REMOVED
+ENTIRELY" docstring section) - there is no replacement behavior to
+test in its place, only its own absence.
 """
 
 from __future__ import annotations
@@ -74,7 +95,6 @@ from contextlib import asynccontextmanager
 
 import pytest
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.notation.auth_command_format import format_auth_command
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
@@ -108,8 +128,8 @@ async def _running_game_server(start_tick_loop: bool = False):
             as a background asyncio task - only needed by tests that
             actually exercise real-time motion; tests that only check
             immediate rejection paths (wrong color, malformed command,
-            join-order/server-full) don't need real time to advance at
-            all, so they leave this off to stay fast and simple.
+            join-order) don't need real time to advance at all, so they
+            leave this off to stay fast and simple.
 
     Yields:
         (uri, game_server).
@@ -139,39 +159,45 @@ async def _running_game_server(start_tick_loop: bool = False):
         await server.wait_closed()
 
 
-def test_first_client_is_white_second_is_black_third_is_rejected_and_closed():
-    async def scenario():
-        async with _running_game_server() as (uri, _game_server):
-            async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                welcome1 = await client1.recv()
-                welcome2 = await client2.recv()
-                assert "white" in welcome1.lower()
-                assert "black" in welcome2.lower()
+async def _authenticate_and_drain_join(client, username: str, password: str) -> tuple[str, str]:
+    """Sends AUTH, drains the real searching_for_opponent message, and
+    returns (welcome, board_state) - see module docstring's "UPDATED
+    AGAIN for Stage E1" section. Caller is responsible for running this
+    CONCURRENTLY (asyncio.gather) with a rating-compatible opponent's
+    own call - awaiting it alone would block forever with no opponent."""
 
-                async with websockets.connect(uri) as client3:
-                    rejection = await client3.recv()
-                    assert rejection == "server_full"
-                    with pytest.raises(ConnectionClosed):
-                        await client3.recv()
+    await client.send(format_auth_command(username, password))
+    searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+    assert searching == "searching_for_opponent"
+    welcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+    board_state = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+    return welcome, board_state
 
-    asyncio.run(scenario())
+
+async def _connect_and_match(client1, client2) -> tuple[object, object]:
+    """Authenticates both clients concurrently and returns
+    (white_client, black_client) - color assignment is queue-order-
+    driven, not connection-order-driven (Stage E1), so which of
+    client1/client2 ends up WHITE is genuinely racy and must be
+    identified from the real welcome messages, never assumed."""
+
+    (welcome1, _board1), (welcome2, _board2) = await asyncio.gather(
+        _authenticate_and_drain_join(client1, "client1", "password1"),
+        _authenticate_and_drain_join(client2, "client2", "password2"),
+    )
+    if "white" in welcome1.lower():
+        return client1, client2
+    return client2, client1
 
 
 def test_legal_move_from_correct_color_client_is_accepted_and_broadcast_to_both_clients():
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()  # assigned_color welcome message
-                await client2.recv()
-                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
                 # White's e-pawn double-step opening move - 2 squares.
-                await client1.send("WPe2e4")
+                await white_client.send("WPe2e4")
 
                 # Two GAME EVENTS fire per accepted move (MoveAccepted,
                 # instantly - board still pre-move, since the board only
@@ -187,19 +213,19 @@ def test_legal_move_from_correct_color_client_is_accepted_and_broadcast_to_both_
                 # and discarded here (wire+board+state for MoveAccepted,
                 # wire for PieceArrived); the fifth is the one that
                 # reflects the actual, final post-move board state.
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_after_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_after_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert board_after_1 == board_after_2  # both clients see the exact same broadcast state
-        lines = board_after_1.splitlines()
+        assert board_after_white == board_after_black  # both clients see the exact same broadcast state
+        lines = board_after_white.splitlines()
         assert lines[6].split()[4] == "."  # e2 (row 6, col 4) is now empty
         assert lines[4].split()[4] == "wP"  # e4 (row 4, col 4) now holds the white pawn
 
@@ -210,24 +236,19 @@ def test_move_command_with_wrong_color_prefix_for_the_connection_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()  # client1 is White
-                await client2.recv()  # client2 is Black
-                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
-                # client1 IS White, but claims to move as Black here.
-                await client1.send("BPe7e5")
-                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                # white_client IS White, but claims to move as Black here.
+                await white_client.send("BPe7e5")
+                rejection = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
 
                 assert "wrong_color" in rejection
 
-                # client2 must not have received anything at all - the
-                # bad command never reached the engine, so no game
+                # black_client must not have received anything at all -
+                # the bad command never reached the engine, so no game
                 # event/broadcast was ever produced.
                 with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(client2.recv(), timeout=0.3)
+                    await asyncio.wait_for(black_client.recv(), timeout=0.3)
 
     asyncio.run(scenario())
 
@@ -243,24 +264,19 @@ def test_move_command_for_a_square_not_matching_the_claimed_piece_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()  # client1 is White
-                await client2.recv()  # client2 is Black
-                await client1.recv()  # join-time board state
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
                 # e2 really holds a Pawn, not a Queen - piece_mismatch.
-                await client1.send("WQe2e4")
-                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await white_client.send("WQe2e4")
+                rejection = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
 
                 assert "piece_mismatch" in rejection
 
-                # client2 must not have received anything - the bad
+                # black_client must not have received anything - the bad
                 # command never reached the engine, so no game
                 # event/broadcast was ever produced.
                 with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(client2.recv(), timeout=0.3)
+                    await asyncio.wait_for(black_client.recv(), timeout=0.3)
 
     asyncio.run(scenario())
 
@@ -282,20 +298,15 @@ def test_move_rejected_by_the_real_engine_broadcasts_board_text_to_both_clients_
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()  # assigned_color
-                await client2.recv()
-                await client1.recv()  # join-time board state
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
-                await client1.send("WPe2e5")  # 3 squares - illegal pawn shape
+                await white_client.send("WPe2e5")  # 3 squares - illegal pawn shape
 
-                board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                board_after_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_after_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert board_after_1 == board_after_2
-        lines = board_after_1.splitlines()
+        assert board_after_white == board_after_black
+        lines = board_after_white.splitlines()
         assert lines[6].split()[4] == "wP"  # e2 - the pawn never moved
         assert lines[3].split()[4] == "."  # e5 - still empty
 
@@ -306,39 +317,34 @@ def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()
-                await client2.recv()
-                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
-                await client1.send("not a real command")
-                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await white_client.send("not a real command")
+                rejection = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
                 assert "rejected" in rejection
 
                 # The server process itself must still be healthy
                 # afterward - proven by a real, subsequent legal move
                 # still working normally.
-                await client1.send("WPe2e4")
+                await white_client.send("WPe2e4")
                 # Drain the immediate MoveAccepted broadcasts (wire
                 # event + pre-move board text + state snapshot) and
                 # PieceArrived's own wire event, before the later, final
                 # PieceArrived board text (see the sibling test above
                 # for the full reasoning).
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_after_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_after_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert board_after_1 == board_after_2
-        assert board_after_1.splitlines()[4].split()[4] == "wP"
+        assert board_after_white == board_after_black
+        assert board_after_white.splitlines()[4].split()[4] == "wP"
 
     asyncio.run(scenario())
 
@@ -347,15 +353,10 @@ def test_legal_jump_from_correct_color_client_is_accepted_and_a_later_jump_lande
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()  # assigned_color
-                await client2.recv()
-                await client1.recv()  # join-time board state
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
                 # White's own a-file rook, its own starting square.
-                await client1.send("JWRa1")
+                await white_client.send("JWRa1")
 
                 # JumpAccepted's own wire event, board text, and (this
                 # later stage's own addition) score/move-log/clock
@@ -365,12 +366,12 @@ def test_legal_jump_from_correct_color_client_is_accepted_and_a_later_jump_lande
                 # consistent (an unaffected-content but still-broadcast
                 # snapshot, exactly like a real move accepted with
                 # nothing captured yet).
-                jump_accepted_wire = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                jump_accepted_wire = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
 
                 assert "JUMP" in jump_accepted_wire
 
@@ -380,10 +381,10 @@ def test_legal_jump_from_correct_color_client_is_accepted_and_a_later_jump_lande
                 # JumpLanded is NOT one of the three state-snapshot-
                 # triggering event types (it never changes score/log),
                 # so this stays at exactly two messages, unchanged.
-                jump_landed_wire = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # JumpLanded wire
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                jump_landed_wire = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # JumpLanded wire
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
 
         assert "LANDED" in jump_landed_wire
 
@@ -394,21 +395,16 @@ def test_jump_command_with_wrong_color_prefix_for_the_connection_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()  # client1 is White
-                await client2.recv()  # client2 is Black
-                await client1.recv()  # join-time board state
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
-                # client1 IS White, but claims to jump as Black here.
-                await client1.send("JBRa8")
-                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                # white_client IS White, but claims to jump as Black here.
+                await white_client.send("JBRa8")
+                rejection = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
 
                 assert "wrong_color" in rejection
 
                 with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(client2.recv(), timeout=0.3)
+                    await asyncio.wait_for(black_client.recv(), timeout=0.3)
 
     asyncio.run(scenario())
 
@@ -417,16 +413,11 @@ def test_jump_command_for_a_cell_not_matching_the_claimed_piece_is_rejected():
     async def scenario():
         async with _running_game_server() as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()
-                await client2.recv()
-                await client1.recv()
-                await client2.recv()
+                white_client, _black_client = await _connect_and_match(client1, client2)
 
                 # a1 is really a Rook, not a Queen - piece_mismatch.
-                await client1.send("JWQa1")
-                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await white_client.send("JWQa1")
+                rejection = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
 
                 assert "piece_mismatch" in rejection
 
@@ -437,27 +428,22 @@ def test_malformed_jump_command_does_not_crash_the_server_which_keeps_accepting_
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()
-                await client2.recv()
-                await client1.recv()
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
-                await client1.send("J")  # far too short to be a real jump command
-                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await white_client.send("J")  # far too short to be a real jump command
+                rejection = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
                 assert "rejected" in rejection
 
                 # The server process itself must still be healthy
                 # afterward - proven by a real, subsequent legal jump
                 # still working normally.
-                await client1.send("JWRa1")
-                jump_accepted_wire = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await white_client.send("JWRa1")
+                jump_accepted_wire = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
 
         assert "JUMP" in jump_accepted_wire
 
@@ -468,28 +454,23 @@ def test_jump_rejected_by_the_real_engine_gets_a_direct_jump_rejected_response()
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()
-                await client2.recv()
-                await client1.recv()
-                await client2.recv()
+                white_client, black_client = await _connect_and_match(client1, client2)
 
-                await client1.send("JWRa1")
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await white_client.send("JWRa1")
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
 
                 # The SAME rook is still airborne - a second jump request
                 # for it right now must be rejected by the real engine
                 # (ExtraEngine.request_jump's own is_airborne guard) -
                 # this specific outcome has no game event of its own (see
                 # module docstring), so it needs this direct response.
-                await client1.send("JWRa1")
-                rejection = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                await white_client.send("JWRa1")
+                rejection = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
 
                 assert rejection == "rejected:jump_rejected"
 
@@ -508,15 +489,10 @@ def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
-                await client1.send(format_auth_command("client1", "password1"))
-                await client2.send(format_auth_command("client2", "password2"))
-                await client1.recv()
-                await client2.recv()
-                await client1.recv()  # join-time board state (initial-board-state-on-join fix)
-                await client2.recv()
+                white_client, _black_client = await _connect_and_match(client1, client2)
 
                 started_at = time.perf_counter()
-                await client1.send("WPe2e4")  # 2 squares = 2 * MS_PER_SQUARE of real motion time
+                await white_client.send("WPe2e4")  # 2 squares = 2 * MS_PER_SQUARE of real motion time
                 # MoveAccepted's own wire event + board text + state
                 # snapshot arrive near-instantly (pre-move board) - all
                 # drained, not timed. PieceArrived's own wire event
@@ -527,11 +503,11 @@ def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_
                 # stage that added one more broadcast message per event
                 # updated this drain count in turn; the thing actually
                 # being timed is unchanged).
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived board text
                 elapsed_s = time.perf_counter() - started_at
 
         expected_s = (2 * MS_PER_SQUARE) / 1000
