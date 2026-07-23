@@ -22,10 +22,29 @@ in-memory SQLite database is private to the one connection that
 created it). Every scenario below therefore verifies behavior
 EXCLUSIVELY through the real wire protocol (a second real login proves
 persistence; GameServer's own plain-Python `_connection_manager`/
-`_colors` - never sqlite-backed - proves "no session state created"),
-and scenario 2 pre-seeds a rating via a real, separate, tmp_path FILE
-(genuinely shared through the filesystem, unlike ":memory:") rather
-than a shared connection object.
+`_matchmaking_queue` - never sqlite-backed - proves "no session state
+created"), and scenario 2 pre-seeds a rating via a real, separate,
+tmp_path FILE (genuinely shared through the filesystem, unlike
+":memory:") rather than a shared connection object.
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1, see game_server.py's own "STAGE E1" docstring section):
+after AUTH succeeds, a connection now receives SEARCHING_FOR_OPPONENT_
+MESSAGE first, then only later (once a rating-compatible opponent also
+joins) does it receive its own assigned_color+rating welcome - there is
+no longer a fixed, always-available "just join the one game" outcome.
+Every scenario below that needs a genuine welcome message therefore
+needs a REAL, concurrently-connecting, rating-compatible second party
+(the two same-username logins in scenario 1 are naturally rating-
+compatible with each other, being the SAME account; scenario 2 seeds a
+second, same-rated dummy account in its own tmp_path file; scenario 4's
+final health-check login gets a plain dummy opponent) - connected via
+asyncio.gather so both sides are genuinely in flight concurrently (see
+game_server.py's own "STAGE E1" docstring for why sequential connects
+would deadlock). `_colors` (the old fixed-connection-order color map)
+no longer exists on GameServer - scenario 3's own "no session state
+created" proof now reads `game_server._matchmaking_queue` instead (see
+that scenario's own comment).
 """
 
 from __future__ import annotations
@@ -40,6 +59,7 @@ from websockets.exceptions import ConnectionClosed
 from kungfu_chess.notation.auth_command_format import format_auth_command
 from server.application.game_server import GameServer
 from server.persistence.user_repository import DEFAULT_STARTING_RATING, UserRepository
+from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE
 
 _RECV_TIMEOUT_S = 5.0
 
@@ -64,48 +84,55 @@ def _parse_assigned_color_and_rating(message: str) -> tuple[str, int]:
 
 
 @asynccontextmanager
-async def _connected_and_authenticated(uri: str, username: str, password: str):
-    """Open a real connection, send the real AUTH command, and yield
-    (connection, welcome_message) - the connection stays OPEN for the
-    caller's own `async with` block (unlike a plain function that
-    would close it immediately on return), so scenarios that need a
-    connection to still be tracked (e.g. to prove a SECOND, concurrent
-    connection sees the correct next color, or that a rejected sibling
-    attempt left no trace) can keep it alive for exactly as long as
-    they need to."""
+async def _connected_and_waiting(uri: str, username: str, password: str):
+    """Open a real connection, send the real AUTH command, drain the
+    real SEARCHING_FOR_OPPONENT_MESSAGE, and yield the connection -
+    still WAITING for a matchmaking opponent, not yet holding a welcome
+    (Stage E1 - see module docstring). The connection stays OPEN for
+    the caller's own `async with` block, so a scenario can keep it
+    alive for exactly as long as it needs."""
 
     async with websockets.connect(uri) as client:
         await client.send(format_auth_command(username, password))
-        welcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
-        yield client, welcome
+        searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
+        assert searching == SEARCHING_FOR_OPPONENT_MESSAGE
+        yield client
+
+
+async def _await_welcome(client) -> str:
+    """Waits for the real, server-confirmed assigned_color+rating
+    welcome that only arrives once a compatible opponent has also
+    joined - see module docstring's "UPDATED for Stage E1" section."""
+
+    return await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
 
 
 def test_a_new_username_creates_an_account_with_the_default_starting_rating_and_the_account_really_persists():
     async def scenario():
         async with _running_game_server(":memory:") as (uri, _game_server):
-            async with _connected_and_authenticated(uri, "alice", "correct horse battery staple") as (
-                _client1,
-                first_welcome,
-            ):
-                color_name, rating = _parse_assigned_color_and_rating(first_welcome)
-                assert color_name == "white"
-                assert rating == DEFAULT_STARTING_RATING
+            # Real persistence, proven through the wire protocol itself
+            # (never a direct reference to GameServer's own internal
+            # UserRepository - see module docstring): a SECOND real
+            # connection with the SAME credentials logs in (as the
+            # second real connection this server has ever accepted)
+            # rather than silently creating a second account, and still
+            # reports the same, real rating. Both connections use the
+            # SAME username/rating, so they are always compatible with
+            # EACH OTHER - connected concurrently via asyncio.gather
+            # (sequential connects would deadlock - see module
+            # docstring).
+            async with _connected_and_waiting(uri, "alice", "correct horse battery staple") as client1:
+                async with _connected_and_waiting(uri, "alice", "correct horse battery staple") as client2:
+                    first_welcome, second_welcome = await asyncio.gather(
+                        _await_welcome(client1), _await_welcome(client2)
+                    )
 
-                # Real persistence, proven through the wire protocol
-                # itself (never a direct reference to GameServer's own
-                # internal UserRepository - see module docstring): a
-                # SECOND real connection with the SAME credentials, made
-                # while the first is still open, logs in (as the second
-                # real connection this server has ever accepted) rather
-                # than silently creating a second account, and still
-                # reports the same, real rating.
-                async with _connected_and_authenticated(uri, "alice", "correct horse battery staple") as (
-                    _client2,
-                    second_welcome,
-                ):
-                    color_name_2, rating_2 = _parse_assigned_color_and_rating(second_welcome)
-                    assert color_name_2 == "black"
-                    assert rating_2 == DEFAULT_STARTING_RATING
+        color_name_1, rating_1 = _parse_assigned_color_and_rating(first_welcome)
+        color_name_2, rating_2 = _parse_assigned_color_and_rating(second_welcome)
+
+        assert {color_name_1, color_name_2} == {"white", "black"}
+        assert rating_1 == DEFAULT_STARTING_RATING
+        assert rating_2 == DEFAULT_STARTING_RATING
 
     asyncio.run(scenario())
 
@@ -116,17 +143,26 @@ def test_existing_username_with_correct_password_logs_in_and_returns_the_real_st
         # filesystem between this pre-seeding UserRepository and
         # GameServer's own, separately-constructed one (see module
         # docstring for why ":memory:" could not be used to pre-seed
-        # data for a SEPARATE connection this way).
+        # data for a SEPARATE connection this way). A second account is
+        # pre-seeded at the SAME distinguishable rating purely to serve
+        # as a rating-compatible matchmaking opponent for "alice" - a
+        # fresh, default-rated dummy would NOT be within 100 points of
+        # 1450 and would never match.
         db_path = str(tmp_path / "auth_protocol_test.db")
         seed_repo = UserRepository(db_path=db_path)
         seed_repo.create_account("alice", "correct horse battery staple")
         seed_repo.update_rating("alice", 1450)  # a distinguishable, non-default rating
+        seed_repo.create_account("alice_opponent", "opponent password")
+        seed_repo.update_rating("alice_opponent", 1450)
 
         async with _running_game_server(db_path) as (uri, _game_server):
-            async with _connected_and_authenticated(uri, "alice", "correct horse battery staple") as (_client, welcome):
-                color_name, rating = _parse_assigned_color_and_rating(welcome)
+            async with _connected_and_waiting(uri, "alice", "correct horse battery staple") as client:
+                async with _connected_and_waiting(uri, "alice_opponent", "opponent password") as opponent:
+                    welcome, _opponent_welcome = await asyncio.gather(_await_welcome(client), _await_welcome(opponent))
 
-        assert color_name == "white"
+        color_name, rating = _parse_assigned_color_and_rating(welcome)
+
+        assert color_name in ("white", "black")
         assert rating == 1450  # the REAL stored rating, not the default
 
     asyncio.run(scenario())
@@ -136,12 +172,14 @@ def test_existing_username_with_wrong_password_is_rejected_and_the_connection_cl
     async def scenario():
         async with _running_game_server(":memory:") as (uri, game_server):
             # Create the real account first, through the real wire
-            # protocol, on this same running server - kept OPEN for the
-            # rest of this scenario, so the assertion below can prove
-            # the rejected sibling attempt (right below) added no
-            # session state of its own, without this first, legitimate
-            # connection's own tracked state confusingly vanishing first.
-            async with _connected_and_authenticated(uri, "alice", "correct horse battery staple") as (_client1, _welcome1):
+            # protocol, on this same running server - kept OPEN (still
+            # waiting in the matchmaking queue, no opponent needed for
+            # this scenario) for the rest of this scenario, so the
+            # assertion below can prove the rejected sibling attempt
+            # (right below) added no session state of its own, without
+            # this first, legitimate connection's own tracked state
+            # confusingly vanishing first.
+            async with _connected_and_waiting(uri, "alice", "correct horse battery staple") as _client1:
                 async with websockets.connect(uri) as client2:
                     await client2.send(format_auth_command("alice", "totally wrong password"))
                     rejection = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
@@ -153,15 +191,16 @@ def test_existing_username_with_wrong_password_is_rejected_and_the_connection_cl
                 # Exactly the first (successful) connection is tracked -
                 # the rejected wrong-password attempt was never tracked
                 # at all, the exact same "no partial/viewer capacity
-                # granted" guarantee server_full's own rejection path
-                # already established (server/application/game_server.py's
-                # own "THIRD-PLUS CONNECTION POLICY" docstring section),
-                # now proven for a rejected LOGIN attempt too. Both
-                # `_connection_manager`/`_colors` are plain Python
-                # state, not sqlite-backed, so reading them directly
-                # here has no thread-affinity concern at all.
+                # granted" guarantee this project has always upheld, now
+                # proven for a rejected LOGIN attempt too. Both
+                # `_connection_manager` and `_matchmaking_queue` are
+                # plain Python state, not sqlite-backed, so reading them
+                # directly here has no thread-affinity concern at all
+                # (see module docstring's "UPDATED for Stage E1" section
+                # for why this replaces the old, now-removed `_colors`
+                # check).
                 assert game_server._connection_manager.connection_count == 1
-                assert len(game_server._colors) == 1
+                assert len(game_server._matchmaking_queue._waiting) == 1
 
     asyncio.run(scenario())
 
@@ -176,12 +215,16 @@ def test_a_malformed_auth_command_is_rejected_and_does_not_crash_the_server_whic
                 with pytest.raises(ConnectionClosed):
                     await asyncio.wait_for(bad_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-            # The server process itself must still be healthy
-            # afterward - proven by a real, subsequent valid login
-            # still working normally.
-            async with _connected_and_authenticated(uri, "bob", "a real password") as (_client, welcome):
-                color_name, rating = _parse_assigned_color_and_rating(welcome)
-            assert color_name == "white"
+            # The server process itself must still be healthy afterward
+            # - proven by a real, subsequent valid login still working
+            # normally. Needs a real, concurrently-connecting, rating-
+            # compatible dummy opponent to actually receive a welcome
+            # (Stage E1 - see module docstring).
+            async with _connected_and_waiting(uri, "bob", "a real password") as client:
+                async with _connected_and_waiting(uri, "bob_dummy_opponent", "dummy password") as dummy:
+                    welcome, _dummy_welcome = await asyncio.gather(_await_welcome(client), _await_welcome(dummy))
+            color_name, rating = _parse_assigned_color_and_rating(welcome)
+            assert color_name in ("white", "black")
             assert rating == DEFAULT_STARTING_RATING
 
     asyncio.run(scenario())
