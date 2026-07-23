@@ -27,6 +27,30 @@ BoardPrinter against a real GameSession's own board - not an invented
 fixture) - simulating "as if the very first broadcast had already
 delivered the true starting position," which is a reasonable stand-in
 for the real gap, not a mock of anything this class itself does.
+
+UPDATED for Stage E1's real matchmaking (feature/matchmaking-elo-
+queue-e1): NetworkGameLoopRunner's own constructor now blocks until a
+rating-compatible opponent has ALSO joined the matchmaking queue (see
+server/application/game_server.py's own "STAGE E1" docstring section).
+Two runners that need to match each other can therefore no longer be
+constructed sequentially on the same test thread (the first
+constructor call would block forever waiting for a compatible second
+party whose own constructor call hasn't even started yet) -
+`_construct_concurrently`, below, constructs each one on its OWN
+background thread instead. A test that only needs ONE real runner
+still needs a real, compatible second party concurrently connected to
+unblock it - `_connect_dummy_opponent` connects a throwaway, same-
+rated (fresh accounts, always rating-compatible) raw NetworkGameClient
+on a background thread purely for this purpose, mirroring
+tests/integration/client/test_network_game_client.py's own
+`_connect_with_dummy_opponent` helper (a raw NetworkGameClient is used
+here rather than a second full NetworkGameLoopRunner since the dummy
+never needs any of the runner's own rendering/click machinery). Color
+assignment is now driven by matchmaking queue order, not connection
+order, so which of two concurrently-connecting runners ends up WHITE
+vs BLACK is genuinely racy from a test's point of view - see
+`_white_and_black`, below, mirroring test_network_game_client.py's own
+helper of the same name.
 """
 
 from __future__ import annotations
@@ -39,6 +63,7 @@ import cv2
 import websockets
 
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner
+from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
@@ -115,6 +140,55 @@ def _window_pixel(runner: NetworkGameLoopRunner, cell: Position) -> tuple[int, i
     return window_x, window_y
 
 
+def _construct_concurrently(uri: str, username: str, password: str) -> tuple[threading.Thread, list]:
+    """Constructs a NetworkGameLoopRunner on its own background thread
+    - see module docstring for why two runners that need to match each
+    other can no longer be constructed sequentially. Returns the thread
+    (caller must .join() it) and a one-element list the constructed
+    runner is appended to once ready (a list rather than a plain return
+    value since a thread target has no return channel of its own)."""
+
+    result: list[NetworkGameLoopRunner] = []
+
+    def _construct() -> None:
+        result.append(NetworkGameLoopRunner(uri, username=username, password=password, headless=True))
+
+    thread = threading.Thread(target=_construct, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _start_dummy_opponent(uri: str, username: str) -> tuple[NetworkGameClient, threading.Thread]:
+    """Starts (but does not wait for) a throwaway, same-rated dummy
+    opponent connecting on a background thread - purely to unblock a
+    single real runner's own real matchmaking wait. MUST be started
+    BEFORE constructing the real runner under test (NetworkGameLoop
+    Runner's own constructor blocks synchronously on the calling
+    thread until matched), not after - see module docstring for the
+    full reasoning. Caller is responsible for joining the returned
+    thread once the real runner's own construction has returned."""
+
+    dummy = NetworkGameClient()
+    dummy_thread = threading.Thread(
+        target=dummy.connect, args=(uri, f"{username}_dummy_opponent", "dummy password"), daemon=True
+    )
+    dummy_thread.start()
+    return dummy, dummy_thread
+
+
+def _white_and_black(
+    runner1: NetworkGameLoopRunner, runner2: NetworkGameLoopRunner
+) -> tuple[NetworkGameLoopRunner, NetworkGameLoopRunner]:
+    """Returns (white_runner, black_runner) - see module docstring for
+    why color assignment can no longer be assumed from construction
+    order."""
+
+    assert {runner1.assigned_color, runner2.assigned_color} == {Color.WHITE, Color.BLACK}
+    if runner1.assigned_color == Color.WHITE:
+        return runner1, runner2
+    return runner2, runner1
+
+
 def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> None:
     """Repeatedly call runner.poll_and_process() (real sleeps, real
     time) until predicate(runner) is True or timeout_s elapses -
@@ -131,24 +205,33 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 
 def test_constructing_in_headless_mode_reads_the_correct_assigned_color():
     test_server = _BackgroundTestServer()
-    runner1 = NetworkGameLoopRunner(test_server.uri, username="runner1", password="runner1_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    runner1, runner2 = result1[0], result2[0]
     try:
-        runner2 = NetworkGameLoopRunner(test_server.uri, username="runner2", password="runner2_pw", headless=True)
-        try:
-            assert runner1.assigned_color == Color.WHITE
-            assert runner2.assigned_color == Color.BLACK
-        finally:
-            runner2.close()
+        _white_and_black(runner1, runner2)
     finally:
+        runner2.close()
         runner1.close()
         test_server.stop()
 
 
 def test_a_click_sequence_on_the_local_players_own_piece_sends_a_real_move_and_is_reflected_after_broadcast():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
-        assert runner.assigned_color == Color.WHITE
+        # e2->e4 is a WHITE pawn move - run the click sequence against
+        # whichever of the two concurrently-connected runners actually
+        # ended up WHITE (see module docstring for why that can't be
+        # assumed from construction order), and close the other one as
+        # a bystander that plays no further part.
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         # Seed the known starting position - see module docstring's
         # "DOCUMENTED, ACCEPTED GAP" section for why this is necessary
         # and how it's justified.
@@ -172,28 +255,41 @@ def test_a_click_sequence_on_the_local_players_own_piece_sends_a_real_move_and_i
         moved = runner.board.piece_at(e4)
         assert moved is not None and moved.kind is PieceKind.PAWN and moved.color is Color.WHITE
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
 
 
 def test_click_on_a_cell_with_no_piece_selected_and_no_board_yet_does_not_crash():
     test_server = _BackgroundTestServer()
+    dummy, dummy_thread = _start_dummy_opponent(test_server.uri, "runner")
     runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
     try:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
         # No _apply_broadcast call at all - runner.board is still None.
         runner.mouse_adapter.on_mouse_event(cv2.EVENT_LBUTTONDOWN, 0, 0, 0, None)  # must not raise
 
         assert runner.click_controller.selected is None
     finally:
         runner.close()
+        dummy.close()
         test_server.stop()
 
 
 def test_click_on_the_opponents_piece_does_not_send_a_move():
     test_server = _BackgroundTestServer()
-    runner = NetworkGameLoopRunner(test_server.uri, username="runner", password="runner_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
+    other_runner = None
     try:
-        assert runner.assigned_color == Color.WHITE
+        # Need "runner" to be WHITE specifically, so the black pawn at
+        # row 1 genuinely belongs to the OTHER side - see module
+        # docstring for why this can't be assumed from construction
+        # order.
+        runner, other_runner = _white_and_black(result1[0], result2[0])
         runner._apply_broadcast(_STARTING_BOARD_TEXT)
 
         sent: list = []
@@ -206,19 +302,21 @@ def test_click_on_the_opponents_piece_does_not_send_a_move():
         assert sent == []
         assert runner.click_controller.selected is None
     finally:
+        if other_runner is not None:
+            other_runner.close()
         runner.close()
         test_server.stop()
 
 
 def test_two_independent_runners_get_opposite_colors_and_each_see_the_others_move():
     test_server = _BackgroundTestServer()
-    runner_white = NetworkGameLoopRunner(test_server.uri, username="runner_white", password="runner_white_pw", headless=True)
+    thread1, result1 = _construct_concurrently(test_server.uri, "runner1", "runner1_pw")
+    thread2, result2 = _construct_concurrently(test_server.uri, "runner2", "runner2_pw")
+    thread1.join(timeout=_JOIN_TIMEOUT_S)
+    thread2.join(timeout=_JOIN_TIMEOUT_S)
     try:
-        runner_black = NetworkGameLoopRunner(test_server.uri, username="runner_black", password="runner_black_pw", headless=True)
+        runner_white, runner_black = _white_and_black(result1[0], result2[0])
         try:
-            assert runner_white.assigned_color == Color.WHITE
-            assert runner_black.assigned_color == Color.BLACK
-
             e2 = Position(row=6, col=4)
             e4 = Position(row=4, col=4)
             runner_white.network_client.send_move(Color.WHITE, PieceKind.PAWN, e2, e4)

@@ -40,6 +40,22 @@ now-required `password` parameter; GameServer is constructed with
 user_repository_db_path=":memory:" so this test never touches a real
 database file; the final assertion now also checks the real, returned
 rating.
+
+UPDATED AGAIN for Stage E1's real matchmaking
+(feature/matchmaking-elo-queue-e1): NetworkGameLoopRunner's own
+constructor now blocks until a rating-compatible opponent has ALSO
+joined the matchmaking queue (see server/application/game_server.py's
+own "STAGE E1" docstring section) - a single real connection with no
+opponent would otherwise wait out the server's own real matchmaking
+timeout. A throwaway, same-rated dummy NetworkGameClient is connected
+concurrently on a background thread purely to unblock the real
+runner's own connect - it plays no further part in this test, mirroring
+tests/integration/client/test_network_game_client.py's own
+`_connect_with_dummy_opponent` helper. `real_connect` is also handed a
+4th `on_searching_for_opponent` parameter now (mirrors home_screen.py's
+own `_default_connect` signature) - unused here since this test does
+not assert anything about the searching-for-opponent UX, which is
+already covered by tests/unit/client/test_home_screen.py.
 """
 
 from __future__ import annotations
@@ -52,6 +68,7 @@ import websockets
 from kungfu_chess.client.home_screen import format_welcome_message
 from kungfu_chess.client.home_screen import run_shell_login_and_launch
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner
+from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.model.color import Color
 from server.application.game_server import GameServer
 from server.persistence.user_repository import DEFAULT_STARTING_RATING
@@ -112,7 +129,7 @@ def test_shell_login_connects_to_a_real_server_and_shows_the_correct_assigned_co
     def fake_password_input(prompt: str) -> str:
         return "correct horse battery staple"
 
-    def real_connect(uri: str, username: str, password: str) -> NetworkGameLoopRunner:
+    def real_connect(uri: str, username: str, password: str, on_searching_for_opponent) -> NetworkGameLoopRunner:
         # The exact real connection path production code uses (mirrors
         # home_screen.py's own _default_connect) - see module docstring
         # for why headless=True is the correct, established substitute
@@ -127,6 +144,11 @@ def test_shell_login_connects_to_a_real_server_and_shows_the_correct_assigned_co
         launched_runners.append(runner)
         runner.close()
 
+    dummy_opponent = NetworkGameClient()
+    dummy_thread = threading.Thread(
+        target=dummy_opponent.connect, args=(test_server.uri, "Alice_dummy_opponent", "dummy password"), daemon=True
+    )
+    dummy_thread.start()
     try:
         run_shell_login_and_launch(
             test_server.uri,
@@ -137,12 +159,18 @@ def test_shell_login_connects_to_a_real_server_and_shows_the_correct_assigned_co
             launch_gui_fn=spy_launch_gui,
         )
     finally:
+        dummy_thread.join(timeout=_JOIN_TIMEOUT_S)
+        dummy_opponent.close()
         test_server.stop()
 
     assert len(launched_runners) == 1
     real_runner = launched_runners[0]
-    assert real_runner.assigned_color == Color.WHITE
+    # Real matchmaking assigns color by queue arrival order, not
+    # connection identity - the dummy opponent connects concurrently, so
+    # which of the two gets WHITE is genuinely racy here (see
+    # test_network_game_client.py's own `_white_and_black` docstring).
+    assert real_runner.assigned_color in (Color.WHITE, Color.BLACK)
     assert real_runner.username == "Alice"
     assert real_runner.rating == DEFAULT_STARTING_RATING
 
-    assert format_welcome_message("Alice", Color.WHITE, DEFAULT_STARTING_RATING) in printed
+    assert format_welcome_message("Alice", real_runner.assigned_color, DEFAULT_STARTING_RATING) in printed
