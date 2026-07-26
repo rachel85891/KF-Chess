@@ -683,6 +683,84 @@ carries a `reason` attribute (`self.network_client.rejection_reason`) -
 so a caller can distinguish the two instead of assuming every rejection
 is a full server, matching this same stage's own new REAL second
 rejection cause.
+
+STAGE E2 - DISCONNECT-COUNTDOWN / RECONNECT UX (feature/disconnect-
+countdown-autoresign-e2): server/application/game_server.py's own new
+disconnect-countdown mechanism (see that class's own module docstring
+for the full server-side sequence) sends this client two new,
+mid-match-only wire messages when the OPPONENT's own connection drops
+or resumes - "opponent_disconnected:<seconds>" and
+"opponent_reconnected" (server/presentation/protocol_handler.py's own
+new docstring section). `poll_and_process` now recognizes both by their
+own distinct prefixes, dispatching to `_apply_opponent_disconnected`/
+`_apply_opponent_reconnected` respectively - mirroring the exact same
+prefix-dispatch shape EVENT_MESSAGE_PREFIX/STATE_SNAPSHOT_MESSAGE_PREFIX
+already use.
+
+CLIENT-SIDE COUNTDOWN INTERPOLATION, NOT A SERVER-SIDE TICKING TIMER
+(mirrors Stage B7.5's own established "client-local timing between
+authoritative updates" pattern verbatim - the identical reasoning
+already applied to pixel-sliding progress and the elapsed-game-clock
+display, see this docstring's own "STAGE B7.5"/"ELAPSED-TIME DISPLAY"
+sections): the server sends "opponent_disconnected:<seconds>" exactly
+ONCE, at the moment the disconnect is first detected (see GameServer's
+own docstring for why) - `_apply_opponent_disconnected` records that
+one authoritative value (`self._opponent_disconnected_countdown_
+seconds`) alongside this client's OWN `self._clock()` reading at the
+moment it arrived (`self._opponent_disconnected_started_at`), and
+`_opponent_disconnected_remaining_seconds()` computes, every frame,
+"how much of that countdown is left" purely from THIS client's own
+elapsed real time since receipt - no server re-ticking needed, for the
+identical reason a pixel slide's own progress or the running game clock
+need none: both processes advance at real wall-clock speed, so the two
+stay closely in sync, and a real, later authoritative message
+(opponent_reconnected, clearing it; or a real GameOver, superseding it
+entirely) is itself the correction for anything that may have drifted.
+
+`_apply_opponent_reconnected` simply clears both fields back to None -
+the same "correct, honest absence of state" convention this class
+already uses for `self.board = None`/`self._game_over = False` before
+their own first real signal ever arrives, applied here to CLEARING a
+signal that is no longer true rather than to one that was never true
+yet.
+
+OpponentDisconnectedRenderer (kungfu_chess/client/ui/
+opponent_disconnect_renderer.py, new this stage) is drawn in
+`_run_one_frame`, conditioned on `self._opponent_disconnected_countdown_
+seconds is not None` - mirrors GameTimerRenderer's/GameOverOverlayRenderer's
+own "small, focused, independently-testable renderer, drawn onto
+main_canvas" shape exactly (see that module's own docstring for the full
+SRP/DIP reasoning), not a new rendering pattern invented for this stage.
+Drawn BEFORE the GameOver overlay check below, so a real, later GameOver
+(auto-resign on countdown expiry, or an ordinary king-capture that
+happens to occur around the same time) still visually takes over the
+screen exactly as it already does today - `_apply_opponent_reconnected`
+(clearing the countdown) or a real GameOver (see `_handle_game_over`,
+unchanged by this stage) are the only two ways this overlay ever stops
+being drawn, both already-existing signals, not a THIRD new "cancel"
+mechanism invented for this stage.
+
+ON THE DISCONNECTED PLAYER'S OWN SIDE - CONFIRMED, NO CHANGE NEEDED
+(this stage's own explicit "decide what happens on the DISCONNECTED
+player's OWN side" requirement): when THIS client's own connection
+drops, `NetworkGameClient._receive_loop` already ends quietly on
+ConnectionClosed (that class's own pre-existing, unchanged behavior),
+and this class's own `run()` loop simply keeps calling
+`poll_and_process()`/rendering every frame exactly as before - nothing
+new arrives, ever, and nothing here reacts to the disconnection at all
+on the disconnected side specifically. The window stays open, frozen on
+whatever board state was last known, until the human closes it or
+presses 'q' (this class's own pre-existing, unchanged `_should_exit`
+exit paths) - the EXACT SAME "no special handling" behavior any other
+disconnect (before this stage existed at all) already produced on the
+disconnecting side. If that same human relaunches the client and logs
+back in with the SAME username before the server's own countdown
+expires, GameServer's own new `_resume_if_pending_disconnect` resumes
+them into the SAME match/color via the perfectly ordinary, completely
+unmodified join sequence this class already handles (assigned_color +
+rating, then the current board text) - no NEW client-side code path is
+needed for the RECONNECTING player's own experience either, only for
+displaying the countdown to their STILL-CONNECTED opponent (see above).
 """
 
 from __future__ import annotations
@@ -718,6 +796,7 @@ from kungfu_chess.client.ui.coordinate_label_renderer import LABEL_MARGIN, Coord
 from kungfu_chess.client.ui.cooldown_overlay_renderer import CooldownOverlayRenderer
 from kungfu_chess.client.ui.game_over_overlay_renderer import GameOverOverlayRenderer
 from kungfu_chess.client.ui.game_timer_renderer import TIMER_STRIP_HEIGHT, GameTimerRenderer
+from kungfu_chess.client.ui.opponent_disconnect_renderer import OpponentDisconnectedRenderer
 from kungfu_chess.client.ui.player_label_renderer import PlayerLabelRenderer
 from kungfu_chess.client.ui.side_panel_renderer import PANEL_WIDTH, SidePanelRenderer
 from kungfu_chess.io.board_parser import BoardParser
@@ -741,6 +820,13 @@ from kungfu_chess.view.renderer import InFlightMotion, Renderer, build_snapshot_
 DEFAULT_WINDOW_NAME = "Kung Fu Chess (network)"
 QUIT_KEY = "q"
 CANVAS_BACKGROUND_COLOR = (0, 0, 0)
+
+# Stage E2 - duplicated here (not imported from server/), matching this
+# project's own established "a client must never import from server/"
+# convention (see NetworkGameClient's own identical duplication of
+# SEARCHING_FOR_OPPONENT_MESSAGE/matchmaking_timeout's own prefix).
+_OPPONENT_DISCONNECTED_PREFIX = "opponent_disconnected:"
+_OPPONENT_RECONNECTED_MESSAGE = "opponent_reconnected"
 
 # TEMPORARY debug instrumentation - see game_loop.py's own identical
 # flag/docstring note; applied identically here per this fix's own
@@ -933,6 +1019,14 @@ class NetworkGameLoopRunner:
         # own None-until-first-broadcast convention).
         self._game_over = False
         self._game_over_winner_color: Optional[Color] = None
+
+        # Stage E2 - see module docstring's "STAGE E2" section. Both
+        # None means no countdown is currently active - the correct,
+        # honest default before any real "opponent_disconnected:..."
+        # message ever arrives, mirroring self.board's own identical
+        # None-until-first-signal convention.
+        self._opponent_disconnected_countdown_seconds: Optional[float] = None
+        self._opponent_disconnected_started_at: Optional[float] = None
 
         self.asset_cache = AssetCache()
 
@@ -1473,6 +1567,68 @@ class NetworkGameLoopRunner:
         self._game_over_winner_color = event.winner_color
         self.click_controller.game_over = True
 
+    def _apply_opponent_disconnected(self, text: str) -> None:
+        """Parse one raw "opponent_disconnected:<seconds>" broadcast and
+        start a real, client-local countdown - see module docstring's
+        "STAGE E2" section for the full reasoning behind why this
+        records the value ONCE rather than expecting further updates.
+
+        Args:
+            text: The raw message text - already confirmed by the
+                caller (poll_and_process) to start with
+                _OPPONENT_DISCONNECTED_PREFIX.
+
+        Returns:
+            None.
+
+        A malformed (non-numeric) value is silently ignored, matching
+        this project's "malformed input never crashes the process"
+        convention (see _apply_broadcast's/_apply_wire_event's own
+        identical policy) - a real, running server never actually
+        produces one.
+        """
+
+        try:
+            countdown_seconds = float(text[len(_OPPONENT_DISCONNECTED_PREFIX) :])
+        except ValueError:
+            return
+
+        self._opponent_disconnected_countdown_seconds = countdown_seconds
+        self._opponent_disconnected_started_at = self._clock()
+
+    def _apply_opponent_reconnected(self) -> None:
+        """Clear a real, in-progress disconnect-countdown display - see
+        module docstring's "STAGE E2" section: the disconnected
+        opponent resumed the same match within the countdown window,
+        so there is nothing left to show a countdown for."""
+
+        self._opponent_disconnected_countdown_seconds = None
+        self._opponent_disconnected_started_at = None
+
+    def _opponent_disconnected_remaining_seconds(self) -> Optional[float]:
+        """How much of a real, in-progress disconnect countdown is left
+        RIGHT NOW, computed purely from this client's own elapsed real
+        time since the one authoritative message arrived - see module
+        docstring's "CLIENT-SIDE COUNTDOWN INTERPOLATION" section for
+        the full reasoning (mirrors Stage B7.5's own established
+        client-local-interpolation pattern verbatim).
+
+        Returns:
+            None if no countdown is currently active; otherwise the
+            real remaining seconds (may be negative if this client's
+            own clock has advanced past the server's original countdown
+            value without a follow-up message yet arriving - the
+            caller/renderer clamps this at 0 for display, see
+            OpponentDisconnectedRenderer's own docstring).
+        """
+
+        if self._opponent_disconnected_countdown_seconds is None:
+            return None
+
+        assert self._opponent_disconnected_started_at is not None
+        elapsed_seconds = self._clock() - self._opponent_disconnected_started_at
+        return self._opponent_disconnected_countdown_seconds - elapsed_seconds
+
     def poll_and_process(self) -> None:
         """Drain every new broadcast since the last call and apply each
         one, in arrival order - the per-frame network-polling step (see
@@ -1501,6 +1657,10 @@ class NetworkGameLoopRunner:
                 self._apply_wire_event(text)
             elif text.startswith(STATE_SNAPSHOT_MESSAGE_PREFIX):
                 self._apply_state_snapshot(text)
+            elif text.startswith(_OPPONENT_DISCONNECTED_PREFIX):
+                self._apply_opponent_disconnected(text)
+            elif text == _OPPONENT_RECONNECTED_MESSAGE:
+                self._apply_opponent_reconnected()
             else:
                 self._apply_broadcast(text)
 
@@ -1665,6 +1825,15 @@ class NetworkGameLoopRunner:
         # DISPLAY" section), centered above the board region.
         timer_x = self._board_origin_x + self._board_pixel_width // 2 - 40
         GameTimerRenderer(main_canvas).render(self._displayed_clock_ms(), x=timer_x)
+
+        # See module docstring's "STAGE E2" section - drawn BEFORE the
+        # GameOver overlay check below, so a real, later GameOver (auto-
+        # resign on countdown expiry, or an ordinary king-capture that
+        # happens to occur around the same time) still visually takes
+        # over the screen exactly as it already does today.
+        remaining_seconds = self._opponent_disconnected_remaining_seconds()
+        if remaining_seconds is not None:
+            OpponentDisconnectedRenderer(main_canvas).render(remaining_seconds, x=timer_x)
 
         # See module docstring's "GAME OVER OVER THE NETWORK" section -
         # drawn onto main_canvas (not board_canvas), so the message is
