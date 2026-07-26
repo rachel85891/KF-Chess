@@ -36,6 +36,19 @@ from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE
 _RECV_TIMEOUT_S = 20.0
 _SHORT_COUNTDOWN_S = 1.0
 _REACTION_DELAY_S = 0.3  # a real moment for the server's own coroutine to react to a disconnect
+# The reconnect scenario needs real headroom beyond the bare countdown
+# window: a real reconnect goes through a real, second AUTH round trip
+# (real PBKDF2-hashed login, server/persistence/user_repository.py's own
+# deliberately-slow-by-design cost) PLUS opening a brand new TCP/WS
+# connection - a bare 1-second window (fine for the pure-expiry
+# scenario below, which involves no second connection attempt at all)
+# was found to occasionally race the real auto-resign under real
+# system load (re-verified directly: this same flakiness reproduces
+# identically with or without feature/elo-rating-update-d3's own
+# changes present - a pre-existing timing margin issue, not a
+# regression that stage introduced, flagged and fixed here since it was
+# discovered while validating that stage's own tests).
+_RECONNECT_COUNTDOWN_S = 6.0
 
 
 @asynccontextmanager
@@ -165,7 +178,7 @@ def test_the_countdown_expiring_with_no_reconnect_produces_a_real_gameover_favor
 
 def test_the_same_username_reconnecting_within_the_countdown_resumes_the_same_match_and_cancels_the_countdown():
     async def scenario():
-        async with _running_game_server(disconnect_countdown_s=_SHORT_COUNTDOWN_S) as (uri, _game_server):
+        async with _running_game_server(disconnect_countdown_s=_RECONNECT_COUNTDOWN_S) as (uri, _game_server):
             (client_a, color_a, rating_a, board_a), (client_b, color_b, _rating_b, _board_b) = await asyncio.gather(
                 _join_and_await_match(uri, "alice", "correct horse battery staple"),
                 _join_and_await_match(uri, "bob", "another real password"),
@@ -199,7 +212,7 @@ def test_the_same_username_reconnecting_within_the_countdown_resumes_the_same_ma
 
             # The countdown must be genuinely cancelled - waiting past
             # what would have been its own expiry produces no GameOver.
-            await asyncio.sleep(_SHORT_COUNTDOWN_S + _REACTION_DELAY_S)
+            await asyncio.sleep(_RECONNECT_COUNTDOWN_S + _REACTION_DELAY_S)
 
             # A further real move still works correctly, broadcast to
             # BOTH the resumed connection and Bob.
