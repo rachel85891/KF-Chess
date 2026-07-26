@@ -761,6 +761,27 @@ unmodified join sequence this class already handles (assigned_color +
 rating, then the current board text) - no NEW client-side code path is
 needed for the RECONNECTING player's own experience either, only for
 displaying the countdown to their STILL-CONNECTED opponent (see above).
+
+STAGE D3 - ELO RATING-UPDATE DISPLAY (feature/elo-rating-update-d3):
+server/application/game_server.py's own new ELO-update-on-GameOver
+mechanism (see that class's own "STAGE D3" docstring section) sends
+THIS client its own real "rating_update:<old>:<new>" message,
+point-to-point, right after a real GameOver. `poll_and_process` now
+recognizes it by its own distinct prefix (mirroring the exact same
+prefix-dispatch shape EVENT_MESSAGE_PREFIX/STATE_SNAPSHOT_MESSAGE_
+PREFIX/_OPPONENT_DISCONNECTED_PREFIX already use), `_apply_rating_
+update` parses the two ints and stores them as `self._rating_update`
+(also live-updating `self.rating` to the new value, keeping that
+attribute correct for any future reader, even though this class's own
+GUI stops needing anything further from a game that has already ended).
+`self._rating_update` defaults to None (the correct, honest "no update
+has arrived yet" default, mirroring every other "None until the real
+signal arrives" field this class already has - `self.board`, `self.
+_game_over_winner_color`, etc.) and is passed straight through to
+GameOverOverlayRenderer's own new, identically-optional
+`own_rating_change` parameter in `_run_one_frame` - reusing the EXACT
+SAME existing GameOver overlay/freeze-and-display UX (this stage's own
+explicit requirement), not a second, separate rating display.
 """
 
 from __future__ import annotations
@@ -768,7 +789,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import cv2
 
@@ -827,6 +848,9 @@ CANVAS_BACKGROUND_COLOR = (0, 0, 0)
 # SEARCHING_FOR_OPPONENT_MESSAGE/matchmaking_timeout's own prefix).
 _OPPONENT_DISCONNECTED_PREFIX = "opponent_disconnected:"
 _OPPONENT_RECONNECTED_MESSAGE = "opponent_reconnected"
+# Stage D3 - duplicated here (not imported from server/), matching the
+# identical established convention above.
+_RATING_UPDATE_PREFIX = "rating_update:"
 
 # TEMPORARY debug instrumentation - see game_loop.py's own identical
 # flag/docstring note; applied identically here per this fix's own
@@ -1019,6 +1043,13 @@ class NetworkGameLoopRunner:
         # own None-until-first-broadcast convention).
         self._game_over = False
         self._game_over_winner_color: Optional[Color] = None
+
+        # Stage D3 - see module docstring's "STAGE D3" section. None
+        # means no real "rating_update:..." message has arrived yet -
+        # the correct, honest default, mirroring self._game_over_
+        # winner_color's own identical None-until-first-signal
+        # convention.
+        self._rating_update: Optional[Tuple[int, int]] = None
 
         # Stage E2 - see module docstring's "STAGE E2" section. Both
         # None means no countdown is currently active - the correct,
@@ -1629,6 +1660,35 @@ class NetworkGameLoopRunner:
         elapsed_seconds = self._clock() - self._opponent_disconnected_started_at
         return self._opponent_disconnected_countdown_seconds - elapsed_seconds
 
+    def _apply_rating_update(self, text: str) -> None:
+        """Parse one raw "rating_update:<old>:<new>" broadcast and
+        record it for display - see module docstring's "STAGE D3"
+        section for the full reasoning.
+
+        Args:
+            text: The raw message text - already confirmed by the
+                caller (poll_and_process) to start with
+                _RATING_UPDATE_PREFIX.
+
+        Returns:
+            None.
+
+        A malformed (non-integer) value is silently ignored, matching
+        this project's "malformed input never crashes the process"
+        convention (see _apply_broadcast's/_apply_wire_event's own
+        identical policy) - a real, running server never actually
+        produces one.
+        """
+
+        try:
+            old_text, new_text = text[len(_RATING_UPDATE_PREFIX) :].split(":", 1)
+            old_rating, new_rating = int(old_text), int(new_text)
+        except ValueError:
+            return
+
+        self._rating_update = (old_rating, new_rating)
+        self.rating = new_rating
+
     def poll_and_process(self) -> None:
         """Drain every new broadcast since the last call and apply each
         one, in arrival order - the per-frame network-polling step (see
@@ -1661,6 +1721,8 @@ class NetworkGameLoopRunner:
                 self._apply_opponent_disconnected(text)
             elif text == _OPPONENT_RECONNECTED_MESSAGE:
                 self._apply_opponent_reconnected()
+            elif text.startswith(_RATING_UPDATE_PREFIX):
+                self._apply_rating_update(text)
             else:
                 self._apply_broadcast(text)
 
@@ -1841,7 +1903,9 @@ class NetworkGameLoopRunner:
         # spans the same full-window canvas ImgSurface.
         # draw_game_over_message centers itself on for local play.
         if self._game_over:
-            GameOverOverlayRenderer(main_canvas).render(winner_color=self._game_over_winner_color)
+            GameOverOverlayRenderer(main_canvas).render(
+                winner_color=self._game_over_winner_color, own_rating_change=self._rating_update
+            )
 
         if self._headless:
             return
