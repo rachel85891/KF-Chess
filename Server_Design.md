@@ -10,6 +10,13 @@ boundaries, and layering as a recursive, parallel, interchangeable process.
 
 Continuation of, and consistent with, `docs/spec.md` and `docs/client_spec.md`.
 
+> **This is the decisions/rationale document — what was chosen and why.**
+> **For the actual work plan** — ordered, buildable stages with concrete
+> files, tasks, and acceptance criteria to start development from — see
+> **`Implementation_Plan.md`**, in the same directory. Every stage there
+> cites the section of this document it implements; read this document for
+> the "why," read `Implementation_Plan.md` for the "what/when/how."
+
 ## Table of Contents
 
 - **Part 1 — Registered-User Database (100M users)**
