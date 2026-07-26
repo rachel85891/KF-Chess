@@ -154,6 +154,52 @@ connection, not anything about this recipient's own connection being
 rejected or timed out, so conflating them with either existing
 vocabulary would be actively misleading.
 
+STAGE D3 - RATING-UPDATE WIRE TEXT (feature/elo-rating-update-d3):
+`format_rating_update(old_rating, new_rating)` - a NEW, POINT-TO-POINT-
+ONLY message ("rating_update:<old>:<new>"), sent by GameServer to EACH
+of a just-ended match's own two connections individually after a real
+GameOver, once its own real ELO update has been computed and persisted
+(see that class's own "STAGE D3" docstring section for the full
+sequence). DELIBERATELY NOT a THIRD field appended onto the EXISTING
+"EVT:GAMEOVER:<color>" broadcast (kungfu_chess/notation/
+game_event_wire_format.py's own format_game_event/parse_game_event,
+neither touched by this stage at all): that wire format's own decoded
+GameOver object is the SAME kungfu_chess.client.events.game_events.
+GameOver dataclass local, non-networked play also constructs (via a
+real king capture/interception) - GameOver.winner_color is its only
+field, by design (see that class's own docstring), and this stage's own
+task explicitly forbids modifying any of the three GameOver-triggering
+mechanisms; growing the SHARED event class (or the wire format that
+serializes it 1:1) with network-only rating fields would mean local
+play's own GameOver either grows unused fields or the two callers
+diverge in shape, neither of which this project's own established
+"one shared event type" precedent (game_events.py) tolerates elsewhere.
+A SEPARATE, additional wire message mirrors this class's own existing
+"the STATE: snapshot is a second message alongside, not instead of, the
+EVT: broadcast" convention (server/application/game_server.py's own
+`_broadcast_event`, unchanged in shape by this stage) - exactly the
+same "additive, never mutate an existing shared shape" pattern this
+protocol already uses.
+
+WHY POINT-TO-POINT (`send`), NOT `broadcast`, UNLIKE THE BOARD-TEXT/
+STATE-SNAPSHOT MESSAGES THAT ACCOMPANY EVERY OTHER GAME EVENT: a rating
+update is PER-PLAYER, not shared - the two connections of a just-ended
+match almost always have two DIFFERENT old/new ratings (matched
+opponents are close, per Stage E1's own ±100 pairing rule, but "close"
+is never "identical" in general), so broadcasting the SAME text to both
+would be actively wrong, unlike board text/state snapshots, which are
+already identical for both sides by construction.
+
+WHY BOTH OLD AND NEW RATING, NOT JUST THE DELTA (this stage's own
+"decide and document" requirement): old+new is a strict superset of a
+bare delta (a client can trivially derive `new - old` for a "+16"/"-16"
+display, but cannot recover the starting rating from a delta alone) -
+sending the more informative shape costs nothing extra (still one
+short colon-delimited literal, mirroring `format_assigned_color`'s own
+"<label>:<value>:<value>" shape) and lets a client show BOTH "1200 ->
+1216" and "(+16)" from the same one message, matching this stage's own
+requirement 3 UX example verbatim.
+
 SENDING (`send`/`broadcast`): the exact ConnectionClosed-swallowing
 policy GameServer's own (now retired) `_safe_send`/`_broadcast` already
 established, moved here unchanged - see server/main.py's own
@@ -203,6 +249,7 @@ SEARCHING_FOR_OPPONENT_MESSAGE = "searching_for_opponent"
 _MATCHMAKING_TIMEOUT_PREFIX = "matchmaking_timeout:"
 _OPPONENT_DISCONNECTED_PREFIX = "opponent_disconnected:"
 OPPONENT_RECONNECTED_MESSAGE = "opponent_reconnected"
+_RATING_UPDATE_PREFIX = "rating_update:"
 
 
 class ProtocolHandler:
@@ -297,6 +344,16 @@ class ProtocolHandler:
         countdown window - see module docstring's "STAGE E2" section."""
 
         return OPPONENT_RECONNECTED_MESSAGE
+
+    def format_rating_update(self, old_rating: int, new_rating: int) -> str:
+        """The "rating_update:<old>:<new>" message sent point-to-point
+        to EACH of a just-ended match's own two connections individually
+        - see module docstring's "STAGE D3 - RATING-UPDATE WIRE TEXT"
+        section for why this is its own, separate, per-player message
+        rather than a field appended onto the shared "EVT:GAMEOVER:..."
+        broadcast."""
+
+        return f"{_RATING_UPDATE_PREFIX}{old_rating}:{new_rating}"
 
     def format_rejection(self, reason: str) -> str:
         """The single "rejected:<reason>" wire convention every direct,
