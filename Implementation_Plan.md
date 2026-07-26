@@ -17,7 +17,7 @@ Rooms, is already planned separately) — this plan uses **G onward**.
 |---|---|---|---|
 | 0 | G1–G3 | Immediate, zero-dependency wins — no infra needed | Nothing — start today |
 | 1 | H1–H2 | Foundational `Protocol` abstractions, in-memory only | Nothing — pure refactor |
-| 2 | *(F1–F7)* | Rooms + Viewers feature (already planned separately) | H2 (`SessionCoordinator`) |
+| 2 | F1–F7 | Rooms + Viewers feature, fully detailed below | H2 (`SessionCoordinator`) for F2 onward; F1 itself has no dependency |
 | 3 | I1–I3 | Real distributed backends stood up | H1, H2, K3s/Docker learning |
 | 4 | J1–J4 | Gateway/Match-Host topology split, on K8s | I1–I3 |
 | 5 | K1–K4 | Resilience hardening | J1–J4 |
@@ -157,14 +157,140 @@ production topology (Phase 3) build on.
 
 ## Phase 2 — Rooms + Viewers (Stage F1–F7)
 
-**Already planned in detail separately** (the F-stage brief and F1 design
-document already produced) — listed here only to show where it sits in the
-overall dependency graph: **F1 has no dependency on this plan at all**
-(pure, headless — can start immediately, in parallel with Phase 0/1). **F2
-onward depends on H2's `SessionCoordinator` `Protocol` existing** — F2's
-own `RoomRegistry`/coordinator work should target the *same* `Protocol`
-defined in H2, not a second, parallel one. Cross-reference: keep F2 and H2
-as one coordinated implementation effort, not two.
+**F1 has no dependency on this plan at all** (pure, headless — can start
+immediately, in parallel with Phase 0/1). **F2 IS H2** — not a second,
+parallel effort — the `SessionCoordinator` `Protocol` and its in-memory
+implementation are one piece of work, shared by both this feature and the
+production topology in Phase 3/4. F3 onward proceeds only after F2/H2 is
+in place.
+
+### F1 — `RoomCode` + `Room` (pure, headless — no networking, no `GameServer`)
+
+- **Files:**
+  - `server/application/room_code.py` — `RoomCode` value object; named
+    constants `ROOM_CODE_LENGTH`, `ROOM_CODE_ALPHABET` (no magic
+    numbers/strings); validates length/alphabet in `__post_init__`; does
+    **not** check uniqueness (that's F2's job).
+  - `server/application/room_code_generator.py` — `RoomCodeGenerator`,
+    single job: produce one candidate `RoomCode`. Constructor injects a
+    `random_source` callable (default backed by `secrets`, matching the
+    convention `UserRepository` already established) — same
+    inject-the-callable pattern this project already uses for `clock` in
+    `MatchmakingQueue`, so tests can supply a deterministic stub.
+  - `server/application/room.py` — `RoomOccupantRole` enum
+    (`WHITE`/`BLACK`/`VIEWER`, all three defined now even though enforcing
+    `VIEWER`'s rejection is F5's job) and `Room[TOccupant]` — generic over
+    an opaque occupant type so it never imports `ServerConnection`;
+    `add_occupant()` assigns White → Black → Viewer in join order;
+    `is_ready_to_start` property.
+  - `tests/unit/server/application/test_room_code.py`,
+    `test_room_code_generator.py`, `test_room.py`.
+- **Acceptance criteria:**
+  - `RoomCode`: equal values compare equal; wrong length/alphabet rejected;
+    readable `repr`.
+  - `RoomCodeGenerator`: real default produces a code of the configured
+    length from the configured alphabet; a stubbed `random_source` produces
+    a deterministic, exactly-assertable code.
+  - `Room`: 1st occupant → White, 2nd → Black, 3rd+ → Viewer;
+    `is_ready_to_start` false until both colors filled, true after; a
+    negative test confirming `Room` never references any external registry
+    or other `Room` instance.
+- **Open decision blocking this stage's completion (not its start):**
+  exact `ROOM_CODE_LENGTH` and whether to exclude visually-ambiguous
+  characters (O/0, I/1, L) — flagged, not decided unilaterally; assume 6
+  characters, ambiguous-excluded, until confirmed.
+
+### F2 — `SessionCoordinator` (identical work item to Phase 1's H2 — see there for full detail)
+
+This is the stage where `MatchmakingQueue` (existing, Stage E1) and F1's
+`Room` get unified behind one `Protocol`
+(`find_match`/`create_room`/`join_room`). **Do this once, in H2, not
+twice.** The one F-specific addition on top of H2's own content: the
+in-memory `create_room`/`join_room` implementation must use F1's
+`RoomCodeGenerator` for new codes and retry on collision — this is
+precisely the uniqueness check F1 §deliberately left out, and the reason
+it belongs at the coordinator level, not inside `Room` or
+`RoomCodeGenerator` themselves.
+
+- **Acceptance criteria (in addition to H2's own):** a test that forces a
+  collision (stub `RoomCodeGenerator` to return the same code twice) and
+  asserts the coordinator retries and produces a second, distinct code
+  rather than silently overwriting the first room.
+
+### F3 — Wire protocol messages (Create/Join) — presentation layer only
+
+- **File:** `server/presentation/protocol_handler.py`.
+- **Task:** add parsing for the post-AUTH choice
+  (`PLAY` / `CREATE_ROOM` / `JOIN_ROOM:<code>`), and formatting for the
+  server's responses (`room_created:<code>`, `room_joined:<role>`,
+  `room_not_found`, etc.), following the exact same
+  `"prefix:<detail>"` colon-delimited convention every other message in
+  this project already uses. **No `SessionCoordinator`/`GameServer` logic
+  touched here** — this stage is parsing/formatting only, exactly like the
+  existing split between `ProtocolHandler` and `GameServer`.
+- **Acceptance criteria:** unit tests for `ProtocolHandler` alone (no
+  networking, no `GameServer`) — round-trip parse/format for each new
+  message, malformed-input handling (e.g. a `JOIN_ROOM:` with no code,
+  or a code that fails F1's own alphabet/length validation).
+
+### F4 — Real wiring into `GameServer`
+
+- **File:** `server/application/game_server.py`.
+- **Task:** after AUTH, branch on the client's F3 choice; `PLAY` calls
+  `SessionCoordinator.find_match` (existing E1 behavior, unchanged);
+  `CREATE_ROOM`/`JOIN_ROOM` call the corresponding F2/H2 methods. When a
+  room's `is_ready_to_start` becomes true, create the actual `GameSession`
+  exactly the same way today's matchmaking path already does — reusing
+  that construction logic, not duplicating it.
+- **Acceptance criteria:** integration test with real local WebSocket
+  connections: two clients, one creates a room and receives a code, the
+  second joins with that code, both end up in the same live `GameSession`
+  with correct colors; a third, independent client using `PLAY` still
+  matchmakes exactly as today (non-regression check against the Phase 1
+  H2 safety-net suite).
+
+### F5 — Viewer role enforcement
+
+- **Files:** `server/application/game_server.py` (move/jump handling),
+  reusing the existing rejection path already used for `wrong_color`.
+- **Task:** when a `move`/`jump` command arrives from an occupant whose
+  `RoomOccupantRole` is `VIEWER` (F1), reject it via the same rejection
+  mechanism `wrong_color` already uses — a third value on an existing
+  mechanism, not a new one.
+- **Acceptance criteria:** a room with 2 players + 1 viewer; the viewer's
+  move/jump attempts are rejected with the same rejection-reason shape as
+  an existing `wrong_color` test; the viewer still receives all normal
+  broadcasts (board, events).
+
+### F6 — Broadcast correctness for a variable number of viewers
+
+- **File:** `server/application/game_server.py` (`_broadcast_event` and
+  any other iteration over "connections in this match").
+- **Task:** audit every broadcast loop to confirm it iterates over
+  *all* connections currently in the room (both players plus however many
+  viewers), never a hardcoded assumption of exactly 2. This is a
+  correctness audit more than new logic — Part 2 §2.4 of `Server_Design.md`
+  already flagged this exact fan-out concern for the cloud topology; get
+  it right here, once, rather than fixing it twice later.
+- **Acceptance criteria:** a test with 2 players + 3 viewers (5
+  connections) in one room; assert all 5 receive every broadcast
+  identically; a second test with 0 viewers confirms no regression for the
+  common case.
+
+### F7 — Client: room menu + viewer mode
+
+- **Files:**
+  - `kungfu_chess/client/.../home_screen.py` — add a Play / Create Room /
+    Join Room menu, sending the corresponding F3 wire message.
+  - `kungfu_chess/client/loop/network_game_loop_runner.py` — a viewer
+    mode: when the server assigns `VIEWER` (F5), skip constructing
+    `MouseAdapter`/`NetworkClickController` entirely — there's nothing for
+    a viewer to click, so the input layer simply isn't built for this
+    session, rather than being built and then blocked.
+- **Acceptance criteria:** a client-side test confirming no
+  `MouseAdapter`/`NetworkClickController` instance exists when running in
+  viewer mode; a `home_screen.py` test confirming each menu choice sends
+  the correct F3 wire message.
 
 ---
 
@@ -388,7 +514,9 @@ G1, G2, G3 ───────────────────────
 H1 ───────────────────────┐              │
 H2 ─────────┬─────────────┼──────────────┤
             │             │              │
-   (F1..F7) │             │              │
+   F1 (no dep) │             │              │
+   F2=H2 ──────┘             │              │
+   F3 ─ F4 ─ F5 ─ F6 ─ F7 ───┘              │
             │             ▼              ▼
             │            I1 ── I2 ── I3   (Phase 3: real backends)
             │                   │
