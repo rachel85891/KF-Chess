@@ -458,6 +458,90 @@ see that method's own "GUARDED AGAINST A DOUBLE-RESIGN RACE" docstring
 section - `_check_disconnect_countdowns` does not need its own separate
 guard for this, since resign() itself already refuses to overwrite an
 already-decided winner.
+
+STAGE D3 - ELO RATING UPDATE ON REAL GAMEOVER (feature/elo-rating-
+update-d3): server/persistence/user_repository.py's own `update_rating`
+was built (Stage D1) but never called by anything - this stage finally
+calls it, computing a real ELO update (server/application/
+elo_rating.py, Stage D3's own new, pure computation module) for BOTH
+players the moment a real GameOver actually happens, regardless of
+which of this project's THREE real causes produced it (an ordinary
+arrival-based king capture, a jump-interception king capture, or Stage
+E2's own auto-resign-on-disconnect-timeout).
+
+THE SINGLE RIGHT CHOKE POINT - `_broadcast_event`, NOT EACH OF THE
+THREE TRIGGER SITES (this stage's own explicit "find the single right
+choke point" requirement): all three causes already converge on
+EXACTLY ONE piece of code before this stage ever existed - a real
+`GameOver` instance published onto a match's own `session.event_bus`
+(king capture/interception via `GameEventPublisher.wait`'s own
+`pending.append(GameOver(...))` calls; resignation via
+`GameSession.resign`'s own direct `self.event_bus.publish(GameOver(...))`
+- see that method's own "STAGE E2" docstring section) - which this
+class already subscribes to, once per match, in `_create_match`, and
+already reacts to in `_broadcast_event` via `_on_game_event`. Adding
+`if isinstance(event, GameOver): await self._apply_and_notify_rating_
+update(match, event)` to that ONE existing method (rather than
+separately calling something equivalent inside GameEngine.wait/
+ExtraEngine.wait/GameSession.resign, all three of which requirement 4
+explicitly forbids modifying anyway) is therefore not merely
+convenient but the ONLY place this can be added exactly once - by
+construction, `_broadcast_event` already runs EXACTLY once per real
+GameOver (the SAME `engine.state.game_over` guard that prevents a
+second king capture or a second resign() from ever publishing a SECOND
+GameOver at all - see GameSession.resign's own "GUARDED AGAINST A
+DOUBLE-RESIGN RACE" section - means this class can never be asked to
+apply a rating update twice for the same match either).
+
+`_Match` GAINS `usernames: Dict[Color, str]` (a real, necessary,
+narrowly-scoped addition - NOT a change to any of the three GameOver-
+triggering mechanisms): computing an ELO update needs BOTH players'
+CURRENT ratings, looked up via `UserRepository.get_rating(username)` -
+but `_Match.colors` only ever mapped `ServerConnection -> Color`, never
+username at all (a connection object carries no username of its own).
+Keyed by `Color`, not by `ServerConnection`, deliberately: a color's
+own identity is stable for a match's whole real lifetime, but its
+CONNECTION OBJECT is not (Stage E2's own reconnect-resume can swap in a
+brand new connection object for the SAME color mid-match) - `usernames`
+therefore survives a reconnect with zero additional bookkeeping,
+populated exactly once, in `_create_match`, straight from the two real
+`WaitingPlayer.username` fields `_create_match` already receives (no
+new lookup of any kind - the data was already sitting right there,
+simply never threaded through to `_Match` before this stage needed it).
+
+`_apply_and_notify_rating_update`: resolves `winner_username`/
+`loser_username` from `match.usernames` via `event.winner_color`/its
+own `.opposite`, then does the real UserRepository work (get both old
+ratings, compute both new ones via `elo_rating.compute_new_ratings`,
+persist both) via `loop.run_in_executor(self._user_repository_executor,
+...)` - the EXACT SAME persistent, single worker thread `_authenticate`
+already uses (see this class's own "WHY UserRepository'S OWN
+SYNCHRONOUS CALLS ARE OFFLOADED..." section above - sqlite3's own
+thread-affinity constraint applies identically here, and reusing the
+SAME already-built executor, rather than a second one, is what
+guarantees every UserRepository call this whole class ever makes still
+runs on the literal same OS thread). `self._user_repository` is
+guaranteed already constructed by the time any match exists (every
+player must have authenticated - and therefore already called
+`_authenticate_sync`, which lazily builds it - before ever being
+matched at all), so no additional lazy-construction guard is needed
+here beyond what `_authenticate_sync` already provides.
+
+WIRE MESSAGE SENT POINT-TO-POINT, PER CONNECTION CURRENTLY IN
+`match.colors` (see server/presentation/protocol_handler.py's own
+"STAGE D3" docstring section for why this is its own separate message,
+never a field merged into the shared "EVT:GAMEOVER:..." broadcast):
+`format_rating_update(old_rating, new_rating)` is sent individually to
+each `(connection, color)` still present in `match.colors` at the
+moment the update is applied, using THAT color's own old/new pair -
+correctly reaches a Stage-E2-resumed connection automatically (it's
+just whatever connection object currently occupies that color's own
+slot, read fresh via `match.colors.items()`), and correctly, safely
+no-ops for a color whose connection already disconnected (e.g. the
+auto-resigned loser's own dead connection, still present in
+`match.colors` at this exact moment - see Stage E2's own "MATCH CLEANUP
+ON DISCONNECT" section for why - `ProtocolHandler.send`'s own existing
+ConnectionClosed-swallowing policy already covers this, unchanged).
 """
 
 from __future__ import annotations
@@ -486,6 +570,7 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.notation.jump_command import MalformedJumpCommandError, ParsedJumpCommand
+from server.application.elo_rating import compute_new_ratings
 from server.application.game_session import GameSession
 from server.application.matchmaking_queue import MatchmakingQueue, WaitingPlayer
 from server.persistence.user_repository import UserRepository
@@ -518,6 +603,11 @@ class _Match:
     match_id: int
     session: GameSession
     colors: Dict[ServerConnection, Color] = field(default_factory=dict)
+    # Stage D3 - see module docstring's "STAGE D3" section for why this
+    # is keyed by Color (survives a Stage-E2 reconnect unchanged),
+    # populated once, in _create_match, from the two WaitingPlayer.
+    # username fields already available there.
+    usernames: Dict[Color, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -795,7 +885,8 @@ class GameServer:
         self._next_match_id += 1
         session = self._session_factory()
         colors: Dict[ServerConnection, Color] = {first.connection_id: Color.WHITE, second.connection_id: Color.BLACK}
-        match = _Match(match_id=match_id, session=session, colors=colors)
+        usernames: Dict[Color, str] = {Color.WHITE: first.username, Color.BLACK: second.username}
+        match = _Match(match_id=match_id, session=session, colors=colors, usernames=usernames)
         self._matches[match_id] = match
 
         for event_type in _BROADCAST_EVENT_TYPES:
@@ -1102,6 +1193,70 @@ class GameServer:
         await self._protocol.broadcast(connections, self._current_board_text(match))
         if isinstance(event, (MoveAccepted, JumpAccepted, PieceArrived)):
             await self._protocol.broadcast(connections, self._current_state_snapshot_text(match))
+        if isinstance(event, GameOver):
+            # See module docstring's "STAGE D3" section - the single
+            # right choke point every real GameOver (king capture,
+            # interception, or Stage E2's own auto-resign) already
+            # converges on.
+            await self._apply_and_notify_rating_update(match, event)
+
+    async def _apply_and_notify_rating_update(self, match: _Match, event: GameOver) -> None:
+        """Compute and persist a real ELO update for both of `match`'s
+        own players, then notify each of them individually - see module
+        docstring's "STAGE D3" section for the full reasoning.
+
+        Args:
+            match: The real _Match that just ended.
+            event: The real GameOver - `event.winner_color` names the
+                winner; the other color is the loser.
+
+        Returns:
+            None.
+        """
+
+        winner_color = event.winner_color
+        loser_color = winner_color.opposite
+        winner_username = match.usernames.get(winner_color)
+        loser_username = match.usernames.get(loser_color)
+        if winner_username is None or loser_username is None:
+            # Defensive only - every real match already has both colors
+            # populated in `usernames` at construction time (_create_
+            # match); this should be unreachable in practice.
+            return
+
+        loop = asyncio.get_running_loop()
+        winner_old, winner_new, loser_old, loser_new = await loop.run_in_executor(
+            self._user_repository_executor, self._apply_elo_update_sync, winner_username, loser_username
+        )
+
+        ratings_by_color = {winner_color: (winner_old, winner_new), loser_color: (loser_old, loser_new)}
+        for connection, color in match.colors.items():
+            old_rating, new_rating = ratings_by_color[color]
+            await self._protocol.send(connection, self._protocol.format_rating_update(old_rating, new_rating))
+
+    def _apply_elo_update_sync(self, winner_username: str, loser_username: str) -> Tuple[int, int, int, int]:
+        """The real, synchronous body of _apply_and_notify_rating_update
+        - runs EXCLUSIVELY on self._user_repository_executor's one
+        worker thread, the same one _authenticate_sync already uses
+        (see module docstring's "STAGE D3" section for why this is
+        required, not merely convenient).
+
+        Args:
+            winner_username: The winning player's own username.
+            loser_username: The losing player's own username.
+
+        Returns:
+            (winner_old_rating, winner_new_rating, loser_old_rating,
+            loser_new_rating) - both new ratings already persisted via
+            UserRepository.update_rating before this returns.
+        """
+
+        winner_old = self._user_repository.get_rating(winner_username)
+        loser_old = self._user_repository.get_rating(loser_username)
+        winner_new, loser_new = compute_new_ratings(winner_old, loser_old)
+        self._user_repository.update_rating(winner_username, winner_new)
+        self._user_repository.update_rating(loser_username, loser_new)
+        return winner_old, winner_new, loser_old, loser_new
 
     def _current_state_snapshot_text(self, match: _Match) -> str:
         """The score/move-log/elapsed-clock snapshot for THIS match."""
