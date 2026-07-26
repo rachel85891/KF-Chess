@@ -66,3 +66,51 @@ def test_render_positions_the_message_relative_to_canvas_size():
     _text, x, y, _color, _font_scale, _thickness = canvas.text_calls[0]
     assert x == max(10, canvas.width // 4)
     assert y == canvas.height // 2
+
+
+def test_render_with_no_rating_change_draws_only_the_one_game_over_line():
+    # Stage D3's own new, OPTIONAL parameter - omitting it must behave
+    # byte-for-byte like before this stage (this class is shared by
+    # every pre-existing caller that never knew about ratings at all).
+    canvas = SpyImg()
+    renderer = GameOverOverlayRenderer(canvas)
+
+    renderer.render(winner_color=Color.WHITE)
+
+    assert len(canvas.text_calls) == 1
+
+
+def test_render_with_a_rating_gain_draws_a_second_line_with_old_arrow_new_and_a_signed_plus_delta():
+    canvas = SpyImg()
+    renderer = GameOverOverlayRenderer(canvas)
+
+    renderer.render(winner_color=Color.WHITE, own_rating_change=(1200, 1216))
+
+    assert len(canvas.text_calls) == 2
+    rating_text = canvas.text_calls[1][0]
+    assert "1200" in rating_text
+    assert "1216" in rating_text
+    assert "+16" in rating_text
+
+
+def test_render_with_a_rating_loss_shows_a_signed_minus_delta():
+    canvas = SpyImg()
+    renderer = GameOverOverlayRenderer(canvas)
+
+    renderer.render(winner_color=Color.BLACK, own_rating_change=(1280, 1260))
+
+    rating_text = canvas.text_calls[1][0]
+    assert "1280" in rating_text
+    assert "1260" in rating_text
+    assert "-20" in rating_text
+
+
+def test_render_with_a_rating_change_draws_the_second_line_below_the_first():
+    canvas = SpyImg()
+    renderer = GameOverOverlayRenderer(canvas)
+
+    renderer.render(winner_color=Color.WHITE, own_rating_change=(1200, 1216))
+
+    first_y = canvas.text_calls[0][2]
+    second_y = canvas.text_calls[1][2]
+    assert second_y > first_y
