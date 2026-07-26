@@ -68,12 +68,21 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
+import pytest
 import websockets
 
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.notation.auth_command_format import format_auth_command
 from server.application.game_server import GameServer
 from server.application.game_session import GameSession
+
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
 
 _STARTING_BOARD_TEXT = BoardPrinter().print(GameSession().engine.board)
 _RECV_TIMEOUT_S = 20.0

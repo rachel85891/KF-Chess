@@ -20,10 +20,18 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
+import pytest
 import websockets
 
 from server.main import build_handler, echo_message
 from server.presentation.connection_manager import ConnectionManager
+
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
 
 
 @asynccontextmanager

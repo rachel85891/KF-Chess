@@ -63,6 +63,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
+import pytest
 import websockets
 
 from kungfu_chess.client.home_screen import format_welcome_message
@@ -72,6 +73,14 @@ from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from kungfu_chess.model.color import Color
 from server.application.game_server import GameServer
 from server.persistence.user_repository import DEFAULT_STARTING_RATING
+
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
 
 _JOIN_TIMEOUT_S = 5.0
 

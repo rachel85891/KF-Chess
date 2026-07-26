@@ -37,6 +37,14 @@ from server.application.game_server import GameServer
 from server.persistence.user_repository import DEFAULT_STARTING_RATING, UserRepository
 from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE
 
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
+
 _RECV_TIMEOUT_S = 20.0
 _SHORT_TIMEOUT_S = 1.0
 

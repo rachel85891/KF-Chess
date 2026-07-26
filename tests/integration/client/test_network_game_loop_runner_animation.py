@@ -48,6 +48,14 @@ from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
 from server.application.game_server import GameServer
 from server.application.game_session import GameSession
 
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
+
 _JOIN_TIMEOUT_S = 5.0
 _POLL_INTERVAL_S = 0.05
 

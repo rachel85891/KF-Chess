@@ -26,12 +26,21 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
+import pytest
 import websockets
 
 from kungfu_chess.notation.auth_command_format import format_auth_command
 from kungfu_chess.notation.game_event_wire_format import EVENT_MESSAGE_PREFIX, parse_game_event
 from server.application.game_server import GameServer
 from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE
+
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
 
 _RECV_TIMEOUT_S = 20.0
 _SHORT_COUNTDOWN_S = 1.0

@@ -100,6 +100,14 @@ from kungfu_chess.notation.auth_command_format import format_auth_command
 from kungfu_chess.realtime.real_time_arbiter import MS_PER_SQUARE
 from server.application.game_server import GameServer
 
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
+
 # Bumped from 5.0 for Stage D2's real auth handshake: every connecting
 # client now computes one real PBKDF2-HMAC-SHA256 hash
 # (server/persistence/user_repository.py's own 260_000-iteration,

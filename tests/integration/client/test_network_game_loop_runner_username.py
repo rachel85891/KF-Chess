@@ -51,6 +51,14 @@ from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRun
 from kungfu_chess.client.network.network_game_client import NetworkGameClient
 from server.application.game_server import GameServer
 
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
+
 _JOIN_TIMEOUT_S = 5.0
 
 

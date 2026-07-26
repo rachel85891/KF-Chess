@@ -42,6 +42,7 @@ import threading
 import time
 from typing import Optional
 
+import pytest
 import websockets
 
 from kungfu_chess.client.loop.network_game_loop_runner import NetworkGameLoopRunner
@@ -51,6 +52,14 @@ from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
 from server.application.game_server import GameServer
 from server.application.game_session import GameSession
+
+# Marked slow: this file constructs a real, background-threaded/tasked
+# server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
+# real tick-loop cadence, or real network round trips) - excluded from
+# `pytest -m "not slow"` for fast, deterministic day-to-day runs; still
+# run in full via the dedicated slow/real-time pass.
+pytestmark = pytest.mark.slow
+
 
 _JOIN_TIMEOUT_S = 5.0
 _POLL_INTERVAL_S = 0.05
