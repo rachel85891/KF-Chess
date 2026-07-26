@@ -284,6 +284,180 @@ a freshly-matched connection receives the current board state as a
 direct, point-to-point send immediately after its own assigned_color
 message - the same fix from an earlier stage, now naturally happening
 once matchmaking (rather than raw connection) completes.
+
+STAGE E2 - DISCONNECT COUNTDOWN / AUTO-RESIGN (feature/disconnect-
+countdown-autoresign-e2, CTD26 slides' own "auto-resign after 20
+seconds of disconnection, with a visible countdown" framing): before
+this stage, a real ConnectionClosed during an ACTIVE match's own
+`async for message in connection` loop (the try/except this class has
+always had) simply popped that connection out of `match.colors` and
+moved on - the opponent was never told anything, and the game itself
+never actually ended even though one side was gone forever. This stage
+gives a disconnecting player a real, visible 20-second grace window
+before the match is auto-resigned in their opponent's favor, with
+narrow, scoped support for the SAME username reconnecting during that
+window to resume play.
+
+SCOPE BOUNDARY, RESTATED EXPLICITLY (per this stage's own task): this
+is NOT general reconnect/resume support - it is narrowly "the exact
+same username, re-authenticating while a countdown for a match they
+were just disconnected from is still running, gets put back into that
+SAME GameSession/color." A username that never had a countdown running
+(or whose countdown already expired) goes through the ordinary
+matchmaking queue exactly as before, unaffected. Full reconnect/resume
+(e.g. rejoining a match after a server restart, resuming after the
+countdown expired, spectating) remains an explicitly out-of-scope,
+accepted gap - GameSession itself never stopped running during a
+countdown (only the WebSocket needed swapping back in), which is the
+one narrow property this whole mechanism depends on and the reason a
+countdown-window reconnect is tractable at all while general resume
+still is not.
+
+WHY DISCONNECT-COUNTDOWN STATE IS TRACKED BY USERNAME, NOT BY
+CONNECTION OBJECT (a real, necessary design decision this stage's own
+task explicitly calls out): `match.colors` itself is still keyed by
+`ServerConnection` (unchanged - see "REGISTRY OF ACTIVE MATCHES" above)
+because that mapping only ever needs to answer "which color does THIS
+socket, right now, speak for" - which is exactly connection-object-
+shaped. A disconnect countdown's whole POINT, however, is that the
+original connection OBJECT is gone forever the instant its socket
+closes (websockets never hands back a closed ClientConnection/
+ServerConnection to reconnect on top of) - there is nothing left to key
+new state on except the one thing that outlives the dead socket and
+uniquely identifies "the same player": their authenticated username. A
+brand new `self._pending_disconnects: Dict[str, _PendingDisconnect]`
+(new, this stage) therefore tracks "this username's own match/color
+slot is currently up for grabs" independently of any connection object
+- `_PendingDisconnect` (new dataclass, below) bundles the real `_Match`,
+the disconnected `Color`, the username (for symmetry/logging - also the
+dict key itself), `disconnected_at` (this instance's own `self._clock()`
+value at detection time, mirroring `WaitingPlayer.joined_at`'s own
+injectable-clock convention from Stage E1), and a real
+`asyncio.Future[bool]` (`resolution`) that gets resolved exactly once,
+by whichever of two independent code paths gets there first: a
+reconnecting connection (`True`) or the tick loop's own expiry check
+(`False`) - mirroring `_waiting_futures`'s own identical "resolved by
+whichever of two independent paths reaches it first" shape from Stage
+E1's own matchmaking wait, reused here for a structurally analogous
+problem rather than inventing a different synchronization primitive.
+
+THE DISCONNECTING CONNECTION'S OWN COROUTINE LINGERS UNTIL THE
+COUNTDOWN RESOLVES (`_handle_active_match_disconnect`, new): once
+`ConnectionClosed` ends the `async for message in connection` loop,
+`handle_connection` no longer falls straight to cleanup - it registers
+a `_PendingDisconnect`, notifies the opponent (see "WIRE MESSAGE" below),
+and `await`s that same `resolution` future with NO timeout of its own.
+This exactly mirrors Stage E1's own `_wait_for_match`'s shape (wait on a
+future that some OTHER code path resolves) rather than inventing a
+second synchronization idiom, and it is what makes this stage's own
+20-second wait reuse the EXISTING tick loop rather than a dedicated
+timer task (see "TIMEOUT MECHANISM REUSES THE TICK LOOP" below): the
+future is only ever resolved externally, never by this coroutine
+itself polling anything.
+
+WIRE MESSAGE - SENT ONCE, NOT ON A PERIODIC TIMER (this stage's own
+"decide and justify" requirement): `format_opponent_disconnected(
+disconnect_countdown_s)` ("opponent_disconnected:20" -
+server/presentation/protocol_handler.py's own new docstring section)
+is sent to the still-connected opponent exactly once, at the moment
+the disconnect is first detected - never repeated on a countdown-
+ticking timer. The client renders its own local countdown from that
+one authoritative value, using its own wall clock, exactly mirroring
+Stage B7.5's own established "client-local timing between authoritative
+updates" pattern (a pixel slide's progress, and the elapsed-game-clock
+display, are both already computed this way - see
+kungfu_chess/client/loop/network_game_loop_runner.py's own docstring
+for both) - the same principle applies here without modification: two
+real-time clocks (this server's own tick loop, and the client's own
+render loop) both advance at real wall-clock speed, so a client-side
+countdown computed from "seconds since I received this one message"
+stays visually correct with no server-side ticking needed, and a real,
+later "opponent_reconnected"/GameOver message is itself the correction
+if anything ever drifted. Sending a message every tick instead would
+mean 30 messages/second of pure countdown-ticking noise for no
+observable benefit over one message plus client-side interpolation.
+
+TIMEOUT MECHANISM REUSES THE TICK LOOP, NOT A SEPARATE TIMER TASK
+(mirrors Stage E1's own identical "decide and justify" reasoning
+verbatim - see that stage's own "TIMEOUT MECHANISM" docstring section
+above): `_check_disconnect_countdowns`, new, is called once per tick
+alongside the pre-existing `_check_matchmaking_timeouts` - a dedicated,
+separate timer task for this 20-second window would be a SECOND
+periodic-background-work mechanism for the same category of work the
+tick loop already exists to do, for the exact same reasoning Stage E1
+already rejected that approach for its own 60-second window.
+
+RESIGN REUSES THE EXISTING GameOver MECHANISM VERBATIM, NOT A SECOND,
+PARALLEL GAME-ENDING PATH (this stage's own explicit requirement):
+`_check_disconnect_countdowns`, on a real expiry with no reconnect,
+calls `pending.match.session.resign(loser_color=pending.color)` -
+server/application/game_session.py's own new, narrow method (see that
+class's own "STAGE E2" docstring section for exactly why it lives
+there and exactly what it does: set the SAME `engine.state.game_over`
+flag a real king-capture GameOver already sets, and publish the SAME
+real `GameOver` event through the SAME `event_bus` every other real
+game event already flows through). This class's own EXISTING
+`_on_game_event`/`_broadcast_event` machinery (subscribed once per
+match in `_create_match`, completely untouched by this stage) then
+picks up and broadcasts that GameOver to this match's own connections
+with ZERO changes needed here - the still-connected opponent's own
+client displays it via the EXACT SAME GameOverOverlayRenderer/freeze-
+and-display UX a real king-capture-ended game already uses (see
+kungfu_chess/client/loop/network_game_loop_runner.py's own "GAME OVER
+OVER THE NETWORK" docstring section, unchanged by this stage), not a
+second, differently-worded "resignation" message.
+
+RECONNECT: HOW A NEW CONNECTION OBJECT RESUMES AN EXISTING MATCH/COLOR
+SLOT (`_resume_if_pending_disconnect`, new, called from
+`handle_connection` immediately after a successful AUTH, BEFORE the
+existing matchmaking-queue path): looks up
+`self._pending_disconnects` by the JUST-AUTHENTICATED username (the
+one stable identity that survived the old connection's own death - see
+"WHY... TRACKED BY USERNAME" above). If found (and not already resolved
+- see "A REAL, NARROW RACE" below), this is a resume, not a fresh
+join: `match.colors[connection] = pending.color` re-associates the
+BRAND NEW connection object with the SAME color in the SAME, still-
+running `_Match` (the old, dead connection object's own entry is left
+alone here - the OLD connection's own lingering `_handle_active_match_
+disconnect` coroutine pops it, once its own `await resolution` returns,
+exactly mirroring how any other disconnecting connection's own cleanup
+already works), `pending.resolution.set_result(True)` releases that
+lingering old coroutine, the opponent is sent
+`format_opponent_reconnected()`, and the resumed connection receives
+the EXACT SAME two-message join sequence a fresh match would
+(assigned_color+rating, then the current board text) - genuinely the
+SAME GameSession, mid-game, never restarted - before this method
+returns and `handle_connection` proceeds into the SAME `async for
+message in connection` loop as any other already-matched connection,
+with no special-cased code path there at all. If NOT found (the common
+case - a fresh login, or a username whose countdown already expired),
+this method returns None and `handle_connection` falls through to the
+existing, completely unmodified SEARCHING_FOR_OPPONENT_MESSAGE +
+`_wait_for_match` sequence.
+
+A REAL, NARROW RACE THIS STAGE GUARDS AGAINST (`pending.resolution.
+done()` checked before honoring a resume): it is possible, in
+principle, for a reconnect attempt and the tick loop's own expiry
+check to both be "in flight" at nearly the same real moment. Because
+`_check_disconnect_countdowns` always POPS an expiring entry from
+`self._pending_disconnects` before resolving its own future (and
+because both this method and that one run on the SAME single-threaded
+event loop, so neither can preempt the other mid-statement), only ONE
+of the two can ever actually WIN this race in practice - but the
+`.done()` check is kept anyway as a cheap, explicit invariant (mirrors
+`_check_matchmaking_timeouts`'s own identical `if future is not None
+and not future.done()` defensive check from Stage E1) rather than
+relying purely on dict-pop ordering to make it merely appear
+impossible. A reconnect that loses this race (vanishingly rare) simply
+falls through to ordinary matchmaking instead, exactly like any other
+username with no pending countdown.
+
+A DOUBLE-DISCONNECT RACE (BOTH PLAYERS OF THE SAME MATCH DISCONNECT
+INDEPENDENTLY) IS HANDLED BY GameSession.resign's OWN GUARD, NOT HERE:
+see that method's own "GUARDED AGAINST A DOUBLE-RESIGN RACE" docstring
+section - `_check_disconnect_countdowns` does not need its own separate
+guard for this, since resign() itself already refuses to overwrite an
+already-decided winner.
 """
 
 from __future__ import annotations
@@ -322,6 +496,7 @@ from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE,
 
 TICK_INTERVAL_S = 1 / 30
 DEFAULT_MATCHMAKING_TIMEOUT_S = 60.0
+DEFAULT_DISCONNECT_COUNTDOWN_S = 20.0
 
 _BROADCAST_EVENT_TYPES = (
     MoveAccepted,
@@ -345,6 +520,20 @@ class _Match:
     colors: Dict[ServerConnection, Color] = field(default_factory=dict)
 
 
+@dataclass
+class _PendingDisconnect:
+    """One username's own real, in-progress disconnect countdown - see
+    module docstring's "WHY DISCONNECT-COUNTDOWN STATE IS TRACKED BY
+    USERNAME, NOT BY CONNECTION OBJECT" section for the full reasoning
+    behind every field below."""
+
+    match: _Match
+    color: Color
+    username: str
+    disconnected_at: float
+    resolution: "asyncio.Future[bool]"
+
+
 class GameServer:
     """The APPLICATION half of the server track's APPLICATION/
     PRESENTATION split - see module docstring for the full reasoning
@@ -359,6 +548,7 @@ class GameServer:
         matchmaking_queue: Optional[MatchmakingQueue] = None,
         session_factory: Callable[[], GameSession] = GameSession,
         matchmaking_timeout_s: float = DEFAULT_MATCHMAKING_TIMEOUT_S,
+        disconnect_countdown_s: float = DEFAULT_DISCONNECT_COUNTDOWN_S,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         """Construct (or accept injected) collaborators - see module
@@ -394,10 +584,19 @@ class GameServer:
                 section. Defaults to 60 (this stage's own "one-minute
                 timeout" requirement) - overridable for tests, so no
                 test needs a real 60-second wait.
+            disconnect_countdown_s: How long (real seconds) a
+                connection that disconnects during an ACTIVE match may
+                remain reconnectable (under the SAME username) before
+                that match is auto-resigned in the opponent's favor -
+                see module docstring's "STAGE E2" section. Defaults to
+                20 (this stage's own "auto-resign after 20 seconds"
+                requirement) - overridable for tests, so no test needs
+                a real 20-second wait.
             clock: Callable returning the current time as a float -
                 defaults to time.perf_counter. Used both to construct
                 the default MatchmakingQueue and for this instance's
-                own periodic timeout check, so the two stay consistent.
+                own periodic timeout checks, so all three stay
+                consistent.
 
         Returns:
             None.
@@ -417,6 +616,7 @@ class GameServer:
         self._clock = clock
         self._session_factory = session_factory
         self._matchmaking_timeout_s = matchmaking_timeout_s
+        self._disconnect_countdown_s = disconnect_countdown_s
         self._matchmaking_queue = (
             matchmaking_queue if matchmaking_queue is not None else MatchmakingQueue(clock=self._clock)
         )
@@ -428,6 +628,11 @@ class GameServer:
         # None) - see module docstring's "TIMEOUT MECHANISM" and
         # "DISCONNECTION WHILE WAITING" sections.
         self._waiting_futures: Dict[ServerConnection, "asyncio.Future[Optional[_Match]]"] = {}
+
+        # Stage E2 - keyed by USERNAME, not connection object - see
+        # module docstring's "WHY DISCONNECT-COUNTDOWN STATE IS TRACKED
+        # BY USERNAME..." section for the full reasoning.
+        self._pending_disconnects: Dict[str, _PendingDisconnect] = {}
 
     async def handle_connection(self, connection: ServerConnection) -> None:
         """websockets.serve's own per-connection handler - authenticates
@@ -464,34 +669,42 @@ class GameServer:
             return
 
         self._connection_manager.add(connection)
-        await self._protocol.send(connection, SEARCHING_FOR_OPPONENT_MESSAGE)
 
-        match = await self._wait_for_match(connection, parsed_auth.username, rating)
-        if match is None:
-            # Timed out (the periodic check already sent the timeout
-            # message and closed the connection) or disconnected while
-            # still queued (nothing left to send at all) - either way,
-            # nothing further to do here.
-            self._connection_manager.remove(connection)
-            return
+        resumed = await self._resume_if_pending_disconnect(connection, parsed_auth.username, rating)
+        if resumed is not None:
+            match, color = resumed
+        else:
+            await self._protocol.send(connection, SEARCHING_FOR_OPPONENT_MESSAGE)
 
-        color = match.colors[connection]
-        await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
-        await self._protocol.send(connection, self._current_board_text(match))
+            match = await self._wait_for_match(connection, parsed_auth.username, rating)
+            if match is None:
+                # Timed out (the periodic check already sent the
+                # timeout message and closed the connection) or
+                # disconnected while still queued (nothing left to send
+                # at all) - either way, nothing further to do here.
+                self._connection_manager.remove(connection)
+                return
+
+            color = match.colors[connection]
+            await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
+            await self._protocol.send(connection, self._current_board_text(match))
 
         try:
             async for message in connection:
                 await self._handle_message(match, connection, color, message)
         except ConnectionClosed:
             pass
-        finally:
-            match.colors.pop(connection, None)
-            if not match.colors:
-                # See module docstring's "MATCH CLEANUP ON DISCONNECT"
-                # section - both players are gone, stop ticking this
-                # match forever.
-                self._matches.pop(match.match_id, None)
-            self._connection_manager.remove(connection)
+
+        # Stage E2 - a disconnect during an ACTIVE match no longer falls
+        # straight to cleanup: see module docstring's "STAGE E2" section
+        # and _handle_active_match_disconnect's own docstring for the
+        # full reasoning (a real, visible countdown, with narrow,
+        # scoped support for the SAME username reconnecting during it).
+        # This does NOT affect a disconnect while merely WAITING in the
+        # matchmaking queue at all - that path is entirely separate,
+        # inside _wait_for_match, above, unchanged by this stage.
+        await self._handle_active_match_disconnect(match, connection, color, parsed_auth.username)
+        self._connection_manager.remove(connection)
 
     async def _wait_for_match(
         self, connection: ServerConnection, username: str, rating: int
@@ -613,6 +826,136 @@ class GameServer:
             future = self._waiting_futures.get(connection)
             if future is not None and not future.done():
                 future.set_result(None)
+
+    async def _resume_if_pending_disconnect(
+        self, connection: ServerConnection, username: str, rating: int
+    ) -> Optional[Tuple[_Match, Color]]:
+        """If `username` has a real disconnect countdown currently
+        running (see module docstring's "STAGE E2" section), resume
+        this BRAND NEW connection into that SAME match/color and cancel
+        the countdown - otherwise, return None so the caller falls
+        through to ordinary matchmaking.
+
+        Args:
+            connection: The just-authenticated, brand new connection.
+            username: The just-authenticated username - the one stable
+                identity a pending disconnect is tracked by (see module
+                docstring's "WHY DISCONNECT-COUNTDOWN STATE IS TRACKED
+                BY USERNAME..." section).
+            rating: This connection's own current rating - only used to
+                format the resumed assigned_color message, exactly like
+                an ordinary fresh join would.
+
+        Returns:
+            (match, color) if this was a resume, or None if there was
+            no pending disconnect for `username` (the common case) or
+            it had already resolved (see module docstring's "A REAL,
+            NARROW RACE" section).
+        """
+
+        pending = self._pending_disconnects.pop(username, None)
+        if pending is None or pending.resolution.done():
+            return None
+
+        match = pending.match
+        color = pending.color
+        match.colors[connection] = color
+        pending.resolution.set_result(True)
+
+        opponents = tuple(c for c in match.colors if c is not connection)
+        for opponent in opponents:
+            await self._protocol.send(opponent, self._protocol.format_opponent_reconnected())
+
+        await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
+        await self._protocol.send(connection, self._current_board_text(match))
+        return match, color
+
+    async def _handle_active_match_disconnect(
+        self, match: _Match, connection: ServerConnection, color: Color, username: str
+    ) -> None:
+        """Called once `connection`'s own `async for message in
+        connection` loop has ended (a real ConnectionClosed) during an
+        ACTIVE match - see module docstring's "STAGE E2" section for
+        the full reasoning behind every decision below.
+
+        Args:
+            match: The real _Match `connection` was part of.
+            connection: The now-dead connection - never used again
+                beyond this method's own opponent-lookup/cleanup.
+            color: The color `connection` was playing as.
+            username: `connection`'s own authenticated username - the
+                key this countdown is tracked under.
+
+        Returns:
+            None.
+
+        Registers a real _PendingDisconnect, notifies the still-
+        connected opponent(s) once (never on a periodic timer - see
+        module docstring's "WIRE MESSAGE" section), then lingers,
+        `await`-ing a real future that is resolved externally by
+        whichever happens first: a reconnecting connection under the
+        SAME username (`_resume_if_pending_disconnect`, above,
+        resolves it True) or this instance's own tick-loop check
+        (`_check_disconnect_countdowns`, below, resolves it False after
+        a real auto-resign). Only once that future resolves does this
+        method perform the final `match.colors`/`self._matches`
+        cleanup - safe regardless of which outcome occurred: on a
+        successful reconnect, `match.colors[connection]` was already
+        overwritten by the NEW connection object (see
+        `_resume_if_pending_disconnect`), so popping the OLD, dead
+        `connection` object here is a harmless no-op that touches
+        nothing the new connection depends on.
+        """
+
+        loop = asyncio.get_running_loop()
+        resolution: "asyncio.Future[bool]" = loop.create_future()
+        self._pending_disconnects[username] = _PendingDisconnect(
+            match=match, color=color, username=username, disconnected_at=self._clock(), resolution=resolution
+        )
+
+        opponents = tuple(c for c in match.colors if c is not connection)
+        for opponent in opponents:
+            await self._protocol.send(
+                opponent, self._protocol.format_opponent_disconnected(self._disconnect_countdown_s)
+            )
+
+        await resolution
+
+        match.colors.pop(connection, None)
+        if not match.colors:
+            # See module docstring's "MATCH CLEANUP ON DISCONNECT"
+            # section - both players are gone, stop ticking this match
+            # forever.
+            self._matches.pop(match.match_id, None)
+
+    async def _check_disconnect_countdowns(self) -> None:
+        """Auto-resign every disconnect countdown that has run longer
+        than this instance's own `disconnect_countdown_s` with no
+        reconnect - see module docstring's "TIMEOUT MECHANISM REUSES
+        THE TICK LOOP" and "RESIGN REUSES THE EXISTING GameOver
+        MECHANISM" sections for the full reasoning.
+
+        Returns:
+            None.
+        """
+
+        now = self._clock()
+        expired_usernames = [
+            username
+            for username, pending in self._pending_disconnects.items()
+            if (now - pending.disconnected_at) > self._disconnect_countdown_s
+        ]
+        for username in expired_usernames:
+            pending = self._pending_disconnects.pop(username, None)
+            if pending is None or pending.resolution.done():
+                continue
+            # See GameSession.resign's own "GUARDED AGAINST A
+            # DOUBLE-RESIGN RACE" docstring section - resign() itself
+            # already refuses to overwrite an already-decided winner,
+            # so no separate guard is needed here for the case where
+            # BOTH players of this match disconnected independently.
+            pending.match.session.resign(loser_color=pending.color)
+            pending.resolution.set_result(False)
 
     async def _authenticate(self, username: str, password: str) -> Optional[int]:
         """Sign up (if `username` is new) or log in (if it already
@@ -775,12 +1118,14 @@ class GameServer:
 
     async def run_tick_loop(self) -> None:
         """Advance every currently active match by real, measured
-        wall-clock time, and check for matchmaking timeouts, forever -
-        see module docstring's "TICK LOOP NOW ITERATES EVERY ACTIVE
-        MATCH" and "TIMEOUT MECHANISM" sections. Runs independently of
-        any client message arriving; intended to be started exactly
-        once, as its own background asyncio task, for the lifetime of
-        the process (see server/main.py).
+        wall-clock time, and check for matchmaking timeouts and
+        disconnect-countdown expirations, forever - see module
+        docstring's "TICK LOOP NOW ITERATES EVERY ACTIVE MATCH",
+        "TIMEOUT MECHANISM", and "STAGE E2 - ... TIMEOUT MECHANISM
+        REUSES THE TICK LOOP" sections. Runs independently of any
+        client message arriving; intended to be started exactly once,
+        as its own background asyncio task, for the lifetime of the
+        process (see server/main.py).
 
         Returns:
             Never returns under normal operation (an infinite loop) -
@@ -796,3 +1141,4 @@ class GameServer:
             for match in list(self._matches.values()):
                 match.session.wait(delta_ms)
             await self._check_matchmaking_timeouts()
+            await self._check_disconnect_countdowns()
