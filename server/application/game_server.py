@@ -927,11 +927,60 @@ class GameServer:
             self._matchmaking_queue.remove(second.connection_id)
             self._create_match(first, second)
 
-    def _create_match(self, first: WaitingPlayer, second: WaitingPlayer) -> None:
+    def _construct_match(
+        self,
+        first_connection: ServerConnection,
+        first_username: str,
+        second_connection: ServerConnection,
+        second_username: str,
+    ) -> _Match:
         """Construct a real, fresh GameSession for exactly this pair,
-        assign colors by queue-join order (see module docstring's
-        "COLOR ASSIGNMENT FOR A MATCHED PAIR" section), subscribe this
-        match's own broadcaster, and wake up both connections' own
+        assign colors (first=White, second=Black - see module
+        docstring's "COLOR ASSIGNMENT FOR A MATCHED PAIR" section for
+        matchmaking's own join-order reasoning, and its "STAGE F4"
+        section for the identical reasoning applied to a room's own
+        host/guest join order instead), subscribe this match's own
+        broadcaster, and register it in `self._matches` - the ONE place
+        a `_Match` is ever built, whether the pairing came from
+        matchmaking (`_create_match`, below, a thin wrapper around this)
+        or from a completed room (Stage F4's own `_construct_match`
+        call inside the JoinRoomCommand/GUEST branch of
+        `handle_connection`) - see module docstring's "STAGE F4" section
+        for why this extraction, not two separate near-duplicate
+        construction blocks, is what "reuse existing construction
+        logic" concretely means here.
+
+        Args:
+            first_connection: The connection that becomes White.
+            first_username: That connection's own username.
+            second_connection: The connection that becomes Black.
+            second_username: That connection's own username.
+
+        Returns:
+            The newly-constructed, already-registered _Match. Does NOT
+            itself wake up anything waiting on a match to exist
+            (matchmaking's own `_waiting_futures` and a room's own
+            `_waiting_room_futures` are each resolved by their own
+            respective caller, immediately after this returns) - this
+            method's own job stops at "the match now exists."
+        """
+
+        match_id = self._next_match_id
+        self._next_match_id += 1
+        session = self._session_factory()
+        colors: Dict[ServerConnection, Color] = {first_connection: Color.WHITE, second_connection: Color.BLACK}
+        usernames: Dict[Color, str] = {Color.WHITE: first_username, Color.BLACK: second_username}
+        match = _Match(match_id=match_id, session=session, colors=colors, usernames=usernames)
+        self._matches[match_id] = match
+
+        for event_type in _BROADCAST_EVENT_TYPES:
+            session.event_bus.subscribe(event_type, functools.partial(self._on_game_event, match))
+
+        return match
+
+    def _create_match(self, first: WaitingPlayer, second: WaitingPlayer) -> None:
+        """Construct a match for this matched matchmaking pair (via
+        `_construct_match`, above) and wake up both connections' own
         handle_connection coroutines with the result.
 
         Args:
@@ -944,16 +993,7 @@ class GameServer:
             None.
         """
 
-        match_id = self._next_match_id
-        self._next_match_id += 1
-        session = self._session_factory()
-        colors: Dict[ServerConnection, Color] = {first.connection_id: Color.WHITE, second.connection_id: Color.BLACK}
-        usernames: Dict[Color, str] = {Color.WHITE: first.username, Color.BLACK: second.username}
-        match = _Match(match_id=match_id, session=session, colors=colors, usernames=usernames)
-        self._matches[match_id] = match
-
-        for event_type in _BROADCAST_EVENT_TYPES:
-            session.event_bus.subscribe(event_type, functools.partial(self._on_game_event, match))
+        match = self._construct_match(first.connection_id, first.username, second.connection_id, second.username)
 
         for entry in (first, second):
             future = self._waiting_futures.get(entry.connection_id)
