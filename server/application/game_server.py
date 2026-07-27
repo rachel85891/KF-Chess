@@ -605,6 +605,126 @@ restart/deploy that had nothing to do with their own play - a false
 and undesirable side effect this fix specifically avoids by resolving
 the future directly rather than routing shutdown through the SAME
 code path real countdown expiry uses.
+
+STAGE F4 - WIRING STAGE F3's ROOM CHOICE INTO A REAL GameSession
+(feature/rooms-f4-gameserver-wiring): before this stage, every
+authenticated connection unconditionally entered matchmaking - Stage
+F3 built the wire vocabulary for a real PLAY/CREATE_ROOM/JOIN_ROOM
+choice but wired it into nothing. This is the first stage in the
+Rooms/Viewers track to touch GameServer at all - E1's matchmaking and
+E2's disconnect-countdown/reconnect behavior for connections that still
+choose PLAY must keep working exactly as they did before this stage,
+which is why this stage's own scope is deliberately narrow (see below).
+
+A REAL, CONSEQUENTIAL PROTOCOL CHANGE, NOT A SIDE EFFECT TO MINIMIZE
+SILENTLY: every authenticated, non-resumed connection now reads ONE
+MORE message (its own room choice) before proceeding - mirrors this
+class's own "WHY 'server_full'... IS REMOVED ENTIRELY" precedent
+above: a real wire-protocol change legitimately requires updating
+every pre-existing test that authenticates and then waits directly for
+assigned_color/searching_for_opponent with no room-choice message ever
+sent (there was none to send, before this stage) - flagged here loudly,
+exactly like that earlier precedent, not treated as an unrelated
+cleanup (see this stage's own commit history for the exact test-helper
+migration this required).
+
+WHY THE ROOM-CHOICE MESSAGE IS READ ONLY IN THE NON-RESUMED BRANCH,
+NEVER FOR A Stage-E2 RECONNECT: `_resume_if_pending_disconnect`
+resuming a connection into its OWN existing match/color is not a fresh
+choice at all - the player already chose PLAY/CREATE_ROOM/JOIN_ROOM
+once, whenever they originally joined that same, still-running match;
+asking them to choose again on reconnect would be meaningless (there is
+no second "which mode" decision to make - they are rejoining the exact
+game they already chose into), and Stage E2's own resumed connection
+already proceeds straight into the shared message loop with zero
+special-casing there. This overrides Implementation_Plan.md's own
+implicit assumption that every connection makes a fresh choice - a
+reconnect, by this project's own existing E2 design, simply is not one.
+
+WHY PLAY DOES NOT ROUTE THROUGH SessionCoordinator.find_match, DESPITE
+Implementation_Plan.md's OWN LITERAL WORDING (a deliberate override,
+mirroring Stage F3's own identical precedent of overriding that same
+document's stale wording): SessionCoordinator.find_match's real,
+already-tested contract (Stage F2) is "attempt exactly one pairing,
+synchronously, no timeout concept, no disconnect-while-waiting
+handling of its own" - `_wait_for_match`/`_attempt_matchmaking`'s real,
+already-tested contract is meaningfully richer: draining every
+available pair per call (not just the newest arrival), a real
+60-second timeout via the tick loop, and a real disconnect-while-queued
+race (`_wait_for_match`'s own `asyncio.wait` against a live `recv()`).
+Rebuilding PLAY to fit find_match's narrower shape would mean either
+throwing away already-correct, already-tested production behavior for
+zero benefit, or reimplementing timeout/disconnect-while-waiting
+handling a SECOND time inside SessionCoordinator - directly
+contradicting this whole track's own standing "E1/E2 must keep working
+exactly the same" requirement. `self._matchmaking_queue` therefore
+remains PLAY's own real collaborator, completely unchanged;
+`self._session_coordinator` (new, this stage) is used ONLY for
+CREATE_ROOM/JOIN_ROOM - two separate collaborators for two genuinely
+different mechanisms is the honest shape here, not a shortcut.
+SessionCoordinator's own module docstring already anticipates a FUTURE
+stage fully unifying them behind a distributed backend; this stage is
+not that stage.
+
+_construct_match IS THE ONE PLACE A _Match IS EVER BUILT (see that
+method's own docstring): both `_create_match` (PLAY, via the
+matchmaking queue) and this stage's own room-completion branch (inside
+`_handle_room_choice`'s JoinRoomCommand/GUEST case) call it - this is
+what "reuse existing construction logic, not duplicate it"
+(Implementation_Plan.md's own F4 acceptance criterion) concretely
+means: one extraction, two callers, zero duplicated construction code.
+
+HOST=WHITE, GUEST=BLACK (mirrors "COLOR ASSIGNMENT FOR A MATCHED PAIR"
+above, applied to a room instead of the matchmaking queue): whoever
+created the room necessarily exists, and chose to wait, before anyone
+else could ever join it - an unambiguous, real join-order exactly
+analogous to matchmaking's own "earlier-queued becomes White" rule,
+just with a room's own host/guest relationship standing in for the
+queue's own earlier/later relationship.
+
+self._pending_rooms AND self._waiting_room_futures - GameServer's OWN
+BOOKKEEPING, NOT Room's: Room (server/application/room.py) deliberately
+knows nothing about usernames or connections at all (see that module's
+own docstring) - but constructing a real _Match for a completed room
+needs BOTH the host's own connection AND username, and something must
+wake the host's own `_wait_for_room_ready` the moment a guest actually
+joins. `self._pending_rooms: Dict[str, Tuple[ServerConnection, str]]`
+(keyed by room code) supplies the first; `self._waiting_room_futures:
+Dict[str, "asyncio.Future[Optional[_Match]]"]` (also keyed by room
+code - a room's own host has no WaitingPlayer entry to key off of the
+way matchmaking's own `_waiting_futures` keys by connection) supplies
+the second - both mirror `_waiting_futures`'s own established shape and
+invariants exactly, just keyed by code instead of connection.
+
+ACCEPTED GAP - AN ABANDONED ROOM CAN NEVER BE RECLAIMED (flagged here
+explicitly, mirroring this project's own established "accepted gaps,
+not oversights" convention, e.g. Stage E2's own "no general reconnect"
+gap): if a host disconnects before any guest ever joins,
+`_wait_for_room_ready` returns None and `self._pending_rooms` is
+cleaned up for that code - but the real Room object itself remains
+forever inside `self._session_coordinator`'s own internal registry,
+since the SessionCoordinator Protocol (deliberately, per Stage F2's own
+scope) exposes no removal method. A room code can therefore never be
+reused or reclaimed once created, even abandoned - and, relatedly, if a
+GUEST joins that same abandoned code before this stage's own
+`host_connection is None` check runs, `SessionCoordinator.join_room`
+has ALREADY (irreversibly) recorded that guest identity as a real
+occupant of the now-host-less Room, even though this connection is
+correctly told "room_not_found" and closed - a real, accepted
+consequence of the identical "no removal method" gap, not a separate
+bug. Extending SessionCoordinator's own Protocol with a removal method
+is explicitly out of THIS stage's scope (it was asked to WIRE F2's
+existing methods, not add new ones to it).
+
+ACCEPTED SCOPE BOUNDARY - A VIEWER'S CONNECTION IS CLOSED RIGHT AFTER
+"room_joined:viewer": real spectating (receiving board/event
+broadcasts, being excluded from move validation) is Stage F5 (viewer
+move-rejection) and Stage F6 (N-variable broadcast fan-out)'s own
+explicit, separate job - this stage's task was to wire CREATE_ROOM/
+JOIN_ROOM into a real GameSession for exactly a host+guest pair, not to
+build spectator infrastructure two stages early. A viewer therefore
+learns its own role, then is disconnected immediately - no board text,
+no event broadcasts, no move loop of any kind for this connection.
 """
 
 from __future__ import annotations
@@ -615,7 +735,7 @@ import contextlib
 import functools
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Union
 
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
@@ -636,11 +756,19 @@ from kungfu_chess.notation.jump_command import MalformedJumpCommandError, Parsed
 from server.application.elo_rating import compute_new_ratings
 from server.application.game_session import GameSession
 from server.application.matchmaking_queue import MatchmakingQueue, WaitingPlayer
+from server.application.room import Role
+from server.application.session_coordinator import InMemorySessionCoordinator, SessionCoordinator
 from server.persistence.user_repository import UserRepository
 from server.presentation.auth_command import MalformedAuthCommandError
 from server.presentation.connection_manager import ConnectionManager
 from server.presentation.move_command import MalformedCommandError, ParsedMoveCommand
 from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE, ProtocolHandler
+from server.presentation.room_choice_command import (
+    CreateRoomCommand,
+    JoinRoomCommand,
+    MalformedRoomChoiceCommandError,
+    PlayCommand,
+)
 
 TICK_INTERVAL_S = 1 / 30
 DEFAULT_MATCHMAKING_TIMEOUT_S = 60.0
@@ -699,6 +827,7 @@ class GameServer:
         protocol_handler: Optional[ProtocolHandler] = None,
         user_repository_db_path: Optional[str] = None,
         matchmaking_queue: Optional[MatchmakingQueue] = None,
+        session_coordinator: Optional[SessionCoordinator] = None,
         session_factory: Callable[[], GameSession] = GameSession,
         matchmaking_timeout_s: float = DEFAULT_MATCHMAKING_TIMEOUT_S,
         disconnect_countdown_s: float = DEFAULT_DISCONNECT_COUNTDOWN_S,
@@ -725,6 +854,14 @@ class GameServer:
                 Defaults to a fresh, real MatchmakingQueue constructed
                 with this instance's own `clock` - injectable for tests
                 that want to control the queue directly.
+            session_coordinator: The SessionCoordinator this instance
+                delegates CREATE_ROOM/JOIN_ROOM to - see module
+                docstring's "STAGE F4" section for why PLAY does NOT
+                also go through this (matchmaking_queue, above, remains
+                the real collaborator for PLAY, completely unchanged).
+                Defaults to a fresh, real InMemorySessionCoordinator -
+                injectable (DIP) for tests that want to control (or
+                directly inspect) room creation/joining.
             session_factory: A zero-argument callable constructing a
                 fresh GameSession for each new match - see module
                 docstring's "`session_factory` REPLACES..." section for
@@ -773,6 +910,9 @@ class GameServer:
         self._matchmaking_queue = (
             matchmaking_queue if matchmaking_queue is not None else MatchmakingQueue(clock=self._clock)
         )
+        self._session_coordinator: SessionCoordinator = (
+            session_coordinator if session_coordinator is not None else InMemorySessionCoordinator()
+        )
 
         self._matches: Dict[int, _Match] = {}
         self._next_match_id = 1
@@ -781,6 +921,23 @@ class GameServer:
         # None) - see module docstring's "TIMEOUT MECHANISM" and
         # "DISCONNECTION WHILE WAITING" sections.
         self._waiting_futures: Dict[ServerConnection, "asyncio.Future[Optional[_Match]]"] = {}
+
+        # Stage F4 - a room's own host (CreateRoomCommand) is tracked
+        # here, keyed by room code, purely as GameServer's OWN
+        # bookkeeping - see module docstring's "STAGE F4" section for
+        # why Room itself (server/application/room.py) deliberately
+        # knows nothing about usernames/connections at all, and why this
+        # class - the one place a username IS already available - is
+        # the right, and only, place to remember "who is this room's
+        # own host" for when a guest actually joins.
+        self._pending_rooms: Dict[str, Tuple[ServerConnection, str]] = {}
+        # Mirrors `_waiting_futures` above exactly, keyed by room code
+        # instead of by connection (a room's own host has no `WaitingPlayer`
+        # entry to key off of - the code IS the natural key here) -
+        # resolved either by a real JOIN_ROOM (with the real _Match) or
+        # the host disconnecting first (with None) - see
+        # `_wait_for_room_ready`'s own docstring.
+        self._waiting_room_futures: Dict[str, "asyncio.Future[Optional[_Match]]"] = {}
 
         # Stage E2 - keyed by USERNAME, not connection object - see
         # module docstring's "WHY DISCONNECT-COUNTDOWN STATE IS TRACKED
@@ -827,20 +984,34 @@ class GameServer:
         if resumed is not None:
             match, color = resumed
         else:
-            await self._protocol.send(connection, SEARCHING_FOR_OPPONENT_MESSAGE)
-
-            match = await self._wait_for_match(connection, parsed_auth.username, rating)
-            if match is None:
-                # Timed out (the periodic check already sent the
-                # timeout message and closed the connection) or
-                # disconnected while still queued (nothing left to send
-                # at all) - either way, nothing further to do here.
+            # Stage F4 - a reconnecting (resumed, above) connection never
+            # reaches this branch at all: a reconnect is not a fresh
+            # choice, by this project's own existing Stage E2 design (see
+            # module docstring's "STAGE F4" section) - only a genuinely
+            # new join makes a PLAY/CREATE_ROOM/JOIN_ROOM choice.
+            try:
+                raw_room_choice = await connection.recv()
+            except ConnectionClosed:
+                # The client disconnected before ever choosing - unlike
+                # the AUTH-parsing ConnectionClosed branch far above,
+                # self._connection_manager.add(connection) has ALREADY
+                # run by this point, so it must be undone here.
                 self._connection_manager.remove(connection)
                 return
 
-            color = match.colors[connection]
-            await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
-            await self._protocol.send(connection, self._current_board_text(match))
+            try:
+                parsed_choice = self._protocol.parse_incoming_room_choice(raw_room_choice)
+            except MalformedRoomChoiceCommandError as exc:
+                await self._protocol.send(connection, self._protocol.format_rejection(f"malformed:{exc}"))
+                await connection.close()
+                self._connection_manager.remove(connection)
+                return
+
+            outcome = await self._handle_room_choice(connection, parsed_choice, parsed_auth.username, rating)
+            if outcome is None:
+                self._connection_manager.remove(connection)
+                return
+            match, color = outcome
 
         try:
             async for message in connection:
@@ -858,6 +1029,168 @@ class GameServer:
         # inside _wait_for_match, above, unchanged by this stage.
         await self._handle_active_match_disconnect(match, connection, color, parsed_auth.username)
         self._connection_manager.remove(connection)
+
+    async def _handle_room_choice(
+        self,
+        connection: ServerConnection,
+        parsed_choice: Union[PlayCommand, CreateRoomCommand, JoinRoomCommand],
+        username: str,
+        rating: int,
+    ) -> Optional[Tuple[_Match, Color]]:
+        """Branch on a freshly-parsed post-AUTH room choice - see module
+        docstring's "STAGE F4" section for the full reasoning behind
+        every branch below. Mirrors `_resume_if_pending_disconnect`'s
+        own `Optional[Tuple[_Match, Color]]` return convention exactly:
+        a real (match, color) once this connection has a live match to
+        join `handle_connection`'s own shared message loop with, or None
+        if this connection has ALREADY been fully handled (rejected,
+        timed out, closed as a viewer, or abandoned) and
+        `handle_connection` should simply clean up and return.
+
+        Args:
+            connection: The just-authenticated connection making this
+                choice.
+            parsed_choice: The real PlayCommand/CreateRoomCommand/
+                JoinRoomCommand `handle_connection` already parsed.
+            username: This connection's own username.
+            rating: This connection's own current rating.
+
+        Returns:
+            (match, color) if this connection now has a live match to
+            join the shared message loop with; None if this connection
+            has already been fully handled and nothing more remains to
+            do for it.
+        """
+
+        if isinstance(parsed_choice, PlayCommand):
+            # The EXISTING matchmaking path (Stage E1/E2), byte-for-byte
+            # unchanged - see module docstring's "STAGE F4" section for
+            # why this does NOT also go through self._session_coordinator.
+            await self._protocol.send(connection, SEARCHING_FOR_OPPONENT_MESSAGE)
+
+            match = await self._wait_for_match(connection, username, rating)
+            if match is None:
+                # Timed out (the periodic check already sent the
+                # timeout message and closed the connection) or
+                # disconnected while still queued - either way, nothing
+                # further to do here.
+                return None
+
+            color = match.colors[connection]
+            await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
+            await self._protocol.send(connection, self._current_board_text(match))
+            return match, color
+
+        if isinstance(parsed_choice, CreateRoomCommand):
+            code = self._session_coordinator.create_room(connection)
+            self._pending_rooms[code] = (connection, username)
+            await self._protocol.send(connection, self._protocol.format_room_created(code))
+
+            match = await self._wait_for_room_ready(connection, code)
+            if match is None:
+                # The host disconnected before any guest ever joined -
+                # see module docstring's "STAGE F4" section's own
+                # accepted-gap note: the Room itself lives on forever
+                # inside self._session_coordinator (no removal method
+                # exists to reclaim it), but THIS instance's own
+                # bookkeeping for it is cleaned up here.
+                self._pending_rooms.pop(code, None)
+                return None
+
+            color = match.colors[connection]
+            await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
+            await self._protocol.send(connection, self._current_board_text(match))
+            return match, color
+
+        # JoinRoomCommand
+        result = self._session_coordinator.join_room(parsed_choice.code, connection)
+        if result is None:
+            await self._protocol.send(connection, self._protocol.format_room_not_found())
+            await connection.close()
+            return None
+
+        if result.role is Role.VIEWER:
+            # See module docstring's "STAGE F4" section's own accepted
+            # scope boundary: real spectating (board/event broadcasts,
+            # move-rejection) is Stage F5/F6's own separate job - this
+            # stage only wires CREATE_ROOM/JOIN_ROOM into a real
+            # host+guest GameSession.
+            await self._protocol.send(connection, self._protocol.format_room_joined(Role.VIEWER.value))
+            await connection.close()
+            return None
+
+        # result.role is Role.GUEST
+        host_connection, host_username = self._pending_rooms.pop(parsed_choice.code, (None, None))
+        if host_connection is None:
+            # The host itself already disconnected while waiting (see
+            # module docstring's "STAGE F4" section's own accepted-gap
+            # note) - the Room SessionCoordinator just added this
+            # identity to as a GUEST is now permanently stranded (no
+            # removal method exists to undo that either), but there is
+            # no live host connection left to ever construct a real
+            # match with, so this is treated identically to an unknown
+            # code from this connection's own point of view.
+            await self._protocol.send(connection, self._protocol.format_room_not_found())
+            await connection.close()
+            return None
+
+        # Host=White, Guest=Black - see module docstring's "STAGE F4"
+        # section: whoever created the room necessarily existed, and
+        # chose to wait, before anyone could join it - an unambiguous,
+        # real join-order analogous to matchmaking's own "earlier-queued
+        # becomes White" rule.
+        match = self._construct_match(host_connection, host_username, connection, username)
+        future = self._waiting_room_futures.pop(parsed_choice.code, None)
+        if future is not None and not future.done():
+            future.set_result(match)
+
+        await self._protocol.send(connection, self._protocol.format_room_joined(Role.GUEST.value))
+        color = match.colors[connection]
+        await self._protocol.send(connection, self._protocol.format_assigned_color(color, rating))
+        await self._protocol.send(connection, self._current_board_text(match))
+        return match, color
+
+    async def _wait_for_room_ready(self, connection: ServerConnection, code: str) -> Optional[_Match]:
+        """Wait for either a real guest to join this room or this
+        (host) connection disconnecting/sending something unexpected
+        while still waiting - mirrors `_wait_for_match`'s own
+        recv-task/future-task race exactly (see that method's own
+        "DISCONNECTION WHILE WAITING" module docstring section), keyed
+        by room code instead of by connection.
+
+        Args:
+            connection: The host connection now waiting for a guest.
+            code: This room's own real code.
+
+        Returns:
+            The real _Match a guest joined this room into, or None if
+            the host disconnected (or sent something unexpected) before
+            any guest ever joined.
+        """
+
+        loop = asyncio.get_running_loop()
+        match_future: "asyncio.Future[Optional[_Match]]" = loop.create_future()
+        self._waiting_room_futures[code] = match_future
+
+        recv_task = asyncio.ensure_future(connection.recv())
+        match_task = asyncio.ensure_future(match_future)
+        done, _pending = await asyncio.wait({recv_task, match_task}, return_when=asyncio.FIRST_COMPLETED)
+        self._waiting_room_futures.pop(code, None)
+
+        if match_task in done:
+            recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, ConnectionClosed):
+                await recv_task
+            return match_task.result()
+
+        # recv_task completed first - the host disconnected, or sent
+        # something unexpected, while still waiting for a guest.
+        match_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await match_task
+        with contextlib.suppress(ConnectionClosed):
+            recv_task.result()
+        return None
 
     async def _wait_for_match(
         self, connection: ServerConnection, username: str, rating: int
