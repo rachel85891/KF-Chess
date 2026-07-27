@@ -200,6 +200,53 @@ short colon-delimited literal, mirroring `format_assigned_color`'s own
 1216" and "(+16)" from the same one message, matching this stage's own
 requirement 3 UX example verbatim.
 
+STAGE F3 - ROOM CHOICE WIRE TEXT (feature/rooms-f3-wire-protocol-
+messages): parsing for one new, connect-time-only client message
+(`parse_incoming_room_choice`, a thin delegation to server/presentation/
+room_choice_command.py's own parse_room_choice_command, exactly
+mirroring `parse_incoming_auth_command`'s own delegation to
+parse_auth_command - see that section above), and formatting for three
+new, corresponding server responses, sent between a successful AUTH
+and the (not-yet-built, Stage F4's own job) PLAY/CREATE_ROOM/JOIN_ROOM
+branch inside GameServer.handle_connection:
+  - `format_room_created(code)` - "room_created:<code>", sent to a
+    connection that chose CREATE_ROOM, once SessionCoordinator.
+    create_room (Stage F4, not this stage) has produced a real code.
+  - `format_room_joined(role_label)` - "room_joined:<role_label>", sent
+    to a connection that chose JOIN_ROOM with a valid code, once
+    SessionCoordinator.join_room (Stage F4) has decided whether it
+    joined as a GUEST or a VIEWER. TAKES A PLAIN `str`, NOT
+    server.application.room.Role, DELIBERATELY: this file already
+    imports zero symbols from server/application/ (this project's own
+    established dependency-direction rule - server/application/ imports
+    FROM server/presentation/, never the reverse, re-verified directly
+    via `grep -rn "^from server.application" server/presentation/`
+    before this stage, returns nothing) - this class stays exactly as
+    agnostic about Role's existence as it already is about GameSession's
+    (see module docstring's "ZERO GameSession/ConnectionManager/
+    EventBus KNOWLEDGE" section for the identical principle, applied
+    here to a third, still-uninvolved module). A future GameServer
+    caller (Stage F4) passes `role.value` (e.g. "guest"/"viewer") - the
+    exact same plain-string handoff `format_assigned_color` already
+    does for `color.name.lower()` rather than accepting a formatted
+    Color object of its own choosing.
+  - `format_room_not_found()` - the bare "room_not_found" message, sent
+    to a connection that chose JOIN_ROOM with a code naming no real,
+    currently-tracked room - mirrors `format_opponent_reconnected`'s own
+    "thin wrapper around a bare module constant" shape exactly (a
+    plain, self-contained status string, no colon-delimited detail
+    needed - there is nothing further to say about "which code" here,
+    since the client already knows what it sent).
+None of these three touches SessionCoordinator, GameServer, or
+ConnectionManager in any way - this stage builds ONLY the parsing/
+formatting half; the real PLAY/CREATE_ROOM/JOIN_ROOM branches and every
+call into SessionCoordinator.find_match/create_room/join_room remain
+Stage F4's own, separate, more dangerous job (that stage touches
+GameServer, whose existing E1/E2 matchmaking behavior must keep working
+unchanged - this stage's own new methods are unused by anything yet,
+exactly like parse_incoming_auth_command was for the single commit that
+first introduced it, before GameServer was updated to call it).
+
 SENDING (`send`/`broadcast`): the exact ConnectionClosed-swallowing
 policy GameServer's own (now retired) `_safe_send`/`_broadcast` already
 established, moved here unchanged - see server/main.py's own
@@ -242,6 +289,12 @@ from kungfu_chess.notation.game_state_snapshot_wire_format import format_game_st
 from kungfu_chess.notation.jump_command import JUMP_COMMAND_PREFIX, ParsedJumpCommand, parse_jump_command
 from server.presentation.auth_command import ParsedAuthCommand, parse_auth_command
 from server.presentation.move_command import ParsedMoveCommand, parse_move_command
+from server.presentation.room_choice_command import (
+    CreateRoomCommand,
+    JoinRoomCommand,
+    PlayCommand,
+    parse_room_choice_command,
+)
 
 SERVER_FULL_MESSAGE = "server_full"
 _REJECTION_PREFIX = "rejected:"
@@ -250,6 +303,9 @@ _MATCHMAKING_TIMEOUT_PREFIX = "matchmaking_timeout:"
 _OPPONENT_DISCONNECTED_PREFIX = "opponent_disconnected:"
 OPPONENT_RECONNECTED_MESSAGE = "opponent_reconnected"
 _RATING_UPDATE_PREFIX = "rating_update:"
+_ROOM_CREATED_PREFIX = "room_created:"
+_ROOM_JOINED_PREFIX = "room_joined:"
+ROOM_NOT_FOUND_MESSAGE = "room_not_found"
 
 
 class ProtocolHandler:
@@ -354,6 +410,61 @@ class ProtocolHandler:
         broadcast."""
 
         return f"{_RATING_UPDATE_PREFIX}{old_rating}:{new_rating}"
+
+    def parse_incoming_room_choice(self, message: object) -> Union[PlayCommand, CreateRoomCommand, JoinRoomCommand]:
+        """Parse one raw post-AUTH choice message - see module
+        docstring's "STAGE F3 - ROOM CHOICE WIRE TEXT" section.
+
+        Args:
+            message: The raw text (or bytes) websockets delivered - sent
+                by a connection right after a successful AUTH, before
+                any assigned_color/room_created/room_joined response.
+
+        Returns:
+            The parsed PlayCommand, CreateRoomCommand, or JoinRoomCommand.
+
+        Raises:
+            MalformedRoomChoiceCommandError: From
+                parse_room_choice_command, for a message that isn't a
+                valid "PLAY"/"CREATE_ROOM"/"JOIN_ROOM:<code>" command.
+        """
+
+        return parse_room_choice_command(message)
+
+    def format_room_created(self, code: str) -> str:
+        """The "room_created:<code>" message sent to a connection that
+        chose CREATE_ROOM, once a real room code exists - see module
+        docstring's "STAGE F3" section."""
+
+        return f"{_ROOM_CREATED_PREFIX}{code}"
+
+    def format_room_joined(self, role_label: str) -> str:
+        """The "room_joined:<role_label>" message sent to a connection
+        that successfully joined an existing room.
+
+        Args:
+            role_label: A plain string (e.g. "guest"/"viewer") - NOT a
+                server.application.room.Role - see module docstring's
+                "STAGE F3" section for why this class never imports
+                Role (or anything else from server/application/) and
+                stays exactly this agnostic about it, mirroring
+                `format_assigned_color`'s own plain-string
+                `color.name.lower()` handoff.
+
+        Returns:
+            The formatted message.
+        """
+
+        return f"{_ROOM_JOINED_PREFIX}{role_label}"
+
+    def format_room_not_found(self) -> str:
+        """The bare "room_not_found" message sent to a connection that
+        chose JOIN_ROOM with a code naming no real, currently-tracked
+        room - see module docstring's "STAGE F3" section for why this
+        is a bare literal, mirroring `format_opponent_reconnected`'s own
+        shape exactly."""
+
+        return ROOM_NOT_FOUND_MESSAGE
 
     def format_rejection(self, reason: str) -> str:
         """The single "rejected:<reason>" wire convention every direct,
