@@ -542,6 +542,69 @@ auto-resigned loser's own dead connection, still present in
 `match.colors` at this exact moment - see Stage E2's own "MATCH CLEANUP
 ON DISCONNECT" section for why - `ProtocolHandler.send`'s own existing
 ConnectionClosed-swallowing policy already covers this, unchanged).
+
+STAGE - SERVER SHUTDOWN HANGS ON A PENDING DISCONNECT COUNTDOWN (fix/
+server-shutdown-hang-pending-disconnect, discovered during Stage F2's
+own diagnostic work as a real, reproduced hang, not a hypothetical
+one): `_handle_active_match_disconnect` (Stage E2) deliberately `await`s
+`pending.resolution` with NO timeout of its own - correct for the
+countdown feature itself, since that future is meant to be resolved
+externally, whenever a reconnect or a real countdown expiry happens
+(see that method's own docstring). The bug this stage fixes: NEITHER
+of those two things happens when the SERVER ITSELF is what's shutting
+down - a graceful shutdown intends to stop the whole process, not wait
+out however many players happen to have a countdown running at that
+exact moment. websockets 16.1.1's own `Server.close()` - the exact
+mechanism `async with server:` invokes on exit (see
+`websockets.asyncio.server.Server.__aexit__`, and this project's own
+server/main.py, which uses that context-manager form) - awaits
+`asyncio.wait(self.handlers.values())`, i.e. every connection handler
+task websockets itself spawned, before it considers the server closed.
+A `handle_connection` coroutine parked inside `_handle_active_match_
+disconnect`'s `await resolution` is exactly such a handler task -
+`close()` (and therefore `wait_closed()`) cannot return until that
+`await` does, which nothing was previously arranging to happen sooner
+than `disconnect_countdown_s` (20 real seconds, by default) - or,
+whenever no tick loop happens to be running to ever call
+`_check_disconnect_countdowns` at all (the common case for most of
+this project's own integration tests, and for ANY scenario where a
+reconnect would otherwise have cancelled the countdown), not at all,
+ever - reproduced directly: a real server, matched, both clients
+disconnected, then `server.close(); await server.wait_closed()`
+(unmodified production code) measurably fails to return within an 8
+real-second bound.
+
+`GameServer.shutdown()` (new) is the fix: resolves every currently-
+pending disconnect countdown immediately, so every such lingering
+`handle_connection` task returns right away instead of blocking
+`close()`/`wait_closed()`. The caller (server/main.py's own
+composition root, or a test's own teardown - see each's own updated
+shutdown sequence) is responsible for calling this BEFORE `server.
+close()` - `shutdown()` has no way to hook into `close()`'s own
+internals itself (GameServer never holds a reference to the `Server`
+object; only `handle_connection` was ever handed to `websockets.
+serve`), so ordering is the caller's own explicit responsibility, in
+exactly the one place each caller already decides "we are shutting
+down now."
+
+WHY RESOLVED (NOT CANCELLED), AND WHY `False` WITHOUT `session.
+resign()` - SEE `shutdown()`'s OWN DOCSTRING for the full reasoning;
+summarized here: resolving (rather than cancelling) lets `_handle_
+active_match_disconnect`'s existing post-`await` cleanup
+(`match.colors.pop(...)`/`self._matches.pop(...)`) run completely
+unmodified, with no new cancellation-handling code path to reason
+about. `False` is reused as the already-established "no reconnect
+happened" signal (mirroring `_check_disconnect_countdowns`'s own real
+timeout-expiry path) rather than inventing a third sentinel - but,
+deliberately, `session.resign()` is NEVER called here and no GameOver
+is ever published: the server process itself ending is an operational
+event, not a player-meaningful game outcome, and treating it as an
+auto-resign would silently and permanently penalize a player's real
+ELO rating (via `_apply_and_notify_rating_update`) for a server
+restart/deploy that had nothing to do with their own play - a false
+and undesirable side effect this fix specifically avoids by resolving
+the future directly rather than routing shutdown through the SAME
+code path real countdown expiry uses.
 """
 
 from __future__ import annotations
@@ -1047,6 +1110,44 @@ class GameServer:
             # BOTH players of this match disconnected independently.
             pending.match.session.resign(loser_color=pending.color)
             pending.resolution.set_result(False)
+
+    async def shutdown(self) -> None:
+        """Resolve every currently-pending disconnect countdown so no
+        `handle_connection` coroutine is left blocked on `await
+        resolution` (see `_handle_active_match_disconnect`'s own
+        docstring) when the SERVER ITSELF is shutting down - discovered
+        during Stage F2's diagnostic work as a real, reproducible hang
+        (see this method's own "STAGE - SERVER SHUTDOWN" module
+        docstring section for the full evidence and reasoning). The
+        caller (server/main.py's own composition root, or a test's own
+        teardown) is expected to call this BEFORE `server.close()`/
+        `await server.wait_closed()` - see module docstring for why
+        that ordering matters.
+
+        Returns:
+            None.
+
+        RESOLVED AS `False` (mirrors `_check_disconnect_countdowns`'s
+        own timeout-expiry signal), BUT WITHOUT calling `session.
+        resign()` or publishing a GameOver - see module docstring's
+        "STAGE - SERVER SHUTDOWN" section for why an auto-resign/ELO
+        update/broadcast side effect is deliberately NOT triggered
+        here: the value itself is never actually read by
+        `_handle_active_match_disconnect` (only `.done()` is checked
+        elsewhere, by `_resume_if_pending_disconnect`) - `False` is
+        simply reused as the existing "no reconnect" convention rather
+        than inventing a third sentinel value. Resolving (rather than
+        cancelling) the future lets `_handle_active_match_disconnect`'s
+        own existing, already-tested post-resolution cleanup
+        (`match.colors.pop(...)`/`self._matches.pop(...)`) run exactly
+        as it already does on a real timeout, with zero new code paths
+        to reason about in that method.
+        """
+
+        for pending in list(self._pending_disconnects.values()):
+            if not pending.resolution.done():
+                pending.resolution.set_result(False)
+        self._pending_disconnects.clear()
 
     async def _authenticate(self, username: str, password: str) -> Optional[int]:
         """Sign up (if `username` is new) or log in (if it already

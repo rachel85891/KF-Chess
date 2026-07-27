@@ -254,9 +254,19 @@ def main() -> None:
         # nothing else references).
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         try:
-            async with server:
-                await server.serve_forever()
+            await server.serve_forever()
         finally:
+            # See server/application/game_server.py's own "STAGE -
+            # SERVER SHUTDOWN HANGS ON A PENDING DISCONNECT COUNTDOWN"
+            # docstring section: this MUST run before server.close()/
+            # wait_closed(), below - `async with server:` (this
+            # function's own previous form) calls those exact two
+            # calls from its own __aexit__, with no opportunity for
+            # this instance to resolve a pending disconnect countdown
+            # first, which is exactly what let this hang happen.
+            await game_server.shutdown()
+            server.close()
+            await server.wait_closed()
             tick_task.cancel()
 
     asyncio.run(_serve_forever())
