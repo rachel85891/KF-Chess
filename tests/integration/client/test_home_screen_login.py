@@ -133,12 +133,24 @@ def test_shell_login_connects_to_a_real_server_and_shows_the_correct_assigned_co
     launched_runners: list[NetworkGameLoopRunner] = []
 
     def fake_input(prompt: str) -> str:
-        return "Alice"
+        # Stage F7 - run_shell_login_and_launch now also calls
+        # prompt_room_choice with this SAME input_fn (it is not a
+        # separate parameter - see home_screen.py's own module
+        # docstring), so this fake must distinguish the two prompts by
+        # text rather than always returning "Alice", which would make
+        # prompt_room_choice's own re-prompt loop spin forever on an
+        # invalid "Alice" choice. "1" (PLAY) preserves this test's
+        # pre-existing real-matchmaking scenario unchanged.
+        if "username" in prompt.lower():
+            return "Alice"
+        return "1"
 
     def fake_password_input(prompt: str) -> str:
         return "correct horse battery staple"
 
-    def real_connect(uri: str, username: str, password: str, on_searching_for_opponent) -> NetworkGameLoopRunner:
+    def real_connect(
+        uri: str, username: str, password: str, on_searching_for_opponent, room_choice: str, on_room_created
+    ) -> NetworkGameLoopRunner:
         # The exact real connection path production code uses (mirrors
         # home_screen.py's own _default_connect) - see module docstring
         # for why headless=True is the correct, established substitute
@@ -146,8 +158,14 @@ def test_shell_login_connects_to_a_real_server_and_shows_the_correct_assigned_co
         # through to NetworkGameLoopRunner's own now-required
         # constructor parameters (feature/home-screen-d2-auth-protocol),
         # proving they reach a REAL runner via this real connect path,
-        # not just a fake one.
-        return NetworkGameLoopRunner(uri, headless=True, username=username, password=password)
+        # not just a fake one. `room_choice`/`on_room_created` (Stage
+        # F7) are forwarded too, mirroring _default_connect exactly -
+        # this test always sends "PLAY" (see fake_input above), so
+        # real matchmaking behaves exactly as it did before Stage F7.
+        return NetworkGameLoopRunner(
+            uri, headless=True, username=username, password=password, room_choice=room_choice,
+            on_room_created=on_room_created,
+        )
 
     def spy_launch_gui(runner: NetworkGameLoopRunner) -> None:
         launched_runners.append(runner)
