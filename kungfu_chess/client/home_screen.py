@@ -167,23 +167,40 @@ MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE.
 from __future__ import annotations
 
 import getpass
-from typing import Callable
+from typing import Callable, Optional
 
 from kungfu_chess.client.loop.network_game_loop_runner import ConnectionRejectedError, NetworkGameLoopRunner
 from kungfu_chess.model.color import Color
 
 InputFn = Callable[[str], str]
 OutputFn = Callable[[str], None]
-ConnectFn = Callable[[str, str, str, Callable[[], None]], NetworkGameLoopRunner]
+ConnectFn = Callable[
+    [str, str, str, Callable[[], None], str, Optional[Callable[[str], None]]], NetworkGameLoopRunner
+]
 
 USERNAME_PROMPT_TEXT = "Enter your username: "
 _EMPTY_USERNAME_MESSAGE = "Username cannot be empty - please try again."
 PASSWORD_PROMPT_TEXT = "Enter your password: "
 _EMPTY_PASSWORD_MESSAGE = "Password cannot be empty - please try again."
+# Stage F7 - mirrors USERNAME_PROMPT_TEXT/PASSWORD_PROMPT_TEXT's own
+# established naming, applied to the new room-choice menu.
+ROOM_CHOICE_PROMPT_TEXT = (
+    "Choose an option:\n"
+    "  1) Play (matchmaking)\n"
+    "  2) Create Room\n"
+    "  3) Join Room\n"
+    "Enter 1, 2, or 3: "
+)
+_INVALID_ROOM_CHOICE_MESSAGE = "Invalid choice - please enter 1, 2, or 3."
+ROOM_CODE_PROMPT_TEXT = "Enter the room code: "
+_EMPTY_ROOM_CODE_MESSAGE = "Room code cannot be empty - please try again."
 SERVER_FULL_DISPLAY_MESSAGE = "Server is full - only two players are supported right now."
 WRONG_PASSWORD_DISPLAY_MESSAGE = "Incorrect password for that username - please try again."
 SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE = "Searching for an opponent (this may take up to a minute)..."
 MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE = "No opponent found within the time limit - please try again later."
+# Stage F7 - mirrors SERVER_FULL_DISPLAY_MESSAGE's own exact naming/
+# definition style.
+ROOM_NOT_FOUND_DISPLAY_MESSAGE = "Room not found - please check the code and try again."
 _MOVE_INSTRUCTIONS = (
     "Left-click your own piece, then left-click a destination to move it.",
     "Press 'q' or close the window to quit.",
@@ -247,9 +264,50 @@ def prompt_password(password_input_fn: InputFn = getpass.getpass, output_fn: Out
         output_fn(_EMPTY_PASSWORD_MESSAGE)
 
 
-def format_welcome_message(username: str, color: Color, rating: int) -> str:
+def prompt_room_choice(input_fn: InputFn = input, output_fn: OutputFn = print) -> str:
+    """Prompt for a room choice via `input_fn`, re-prompting for as
+    long as the reply isn't "1", "2", or "3" - mirrors prompt_username/
+    prompt_password's own exact shape (Stage F7).
+
+    Args:
+        input_fn: Called with the prompt text, expected to return the
+            raw reply string - defaults to the real `input` builtin.
+            For "3" (Join Room), called a SECOND time (reusing this
+            same `input_fn`) to collect the room code.
+        output_fn: Called with each rejection message (an invalid menu
+            choice, or a blank room code) - defaults to the real
+            `print` builtin.
+
+    Returns:
+        The exact WIRE TEXT to send as this connection's own room
+        choice: "PLAY", "CREATE_ROOM", or "JOIN_ROOM:<code>" (the code
+        stripped of leading/trailing whitespace, mirroring
+        prompt_username's own identical stripping - see
+        server/presentation/room_choice_command.py's own real grammar
+        for why this exact shape is what the server expects). This
+        function's own job stops at producing that string - it never
+        itself touches any connection.
+    """
+
+    while True:
+        choice = input_fn(ROOM_CHOICE_PROMPT_TEXT).strip()
+        if choice == "1":
+            return "PLAY"
+        if choice == "2":
+            return "CREATE_ROOM"
+        if choice == "3":
+            while True:
+                code = input_fn(ROOM_CODE_PROMPT_TEXT).strip()
+                if code:
+                    return f"JOIN_ROOM:{code}"
+                output_fn(_EMPTY_ROOM_CODE_MESSAGE)
+        output_fn(_INVALID_ROOM_CHOICE_MESSAGE)
+
+
+def format_welcome_message(username: str, color: Optional[Color], rating: Optional[int]) -> str:
     """The local, human-readable welcome message shown once this
-    client's assigned color and rating are known.
+    client's assigned color (or viewer status - Stage F7) and rating
+    are known.
 
     Args:
         username: The username prompt_username collected - no longer
@@ -259,37 +317,61 @@ def format_welcome_message(username: str, color: Color, rating: int) -> str:
         color: This connection's real, server-assigned Color
             (NetworkGameLoopRunner.assigned_color, set from the
             server's own real "assigned_color:<color>:<rating>" join
-            response).
+            response), or None if this connection joined a room as a
+            VIEWER (Stage F7 - NetworkGameLoopRunner.is_viewer
+            distinguishes this successful case from `color` simply
+            being unknown yet; a caller only ever calls this function
+            after a successful connect, so that ambiguity never
+            reaches here).
         rating: The account's real, server-returned rating
             (NetworkGameLoopRunner.rating) - Stage D2's own new field in
-            that same join response.
+            that same join response. None for a viewer (a viewer has no
+            rating in this match at all - see module docstring's "STAGE
+            F7" section).
 
     Returns:
-        e.g. "Welcome, Alice! You are playing as WHITE. Rating: 1200."
-        - `color.name` (the upper-case enum member name), not
-        `color.value` (the terse wire letter "w"/"b" the protocol
+        "Welcome, Alice! You are playing as WHITE. Rating: 1200." for a
+        real player - `color.name` (the upper-case enum member name),
+        not `color.value` (the terse wire letter "w"/"b" the protocol
         itself uses) - this message is for a human to read, matching
-        ProtocolHandler.format_assigned_color's own identical
-        "spelled out for a human, not the wire letter" choice.
+        ProtocolHandler.format_assigned_color's own identical "spelled
+        out for a human, not the wire letter" choice. For a viewer
+        (`color is None`), a distinct spectator message instead - see
+        module docstring's "STAGE F7" section for why this is one
+        function gaining a real branch (mirroring prompt_password's own
+        relationship to prompt_username as the nearest precedent for
+        "one growing set of cases"), not a second, parallel function.
     """
 
+    if color is None:
+        return f"Welcome, {username}! You are watching this match as a spectator."
     return f"Welcome, {username}! You are playing as {color.name}. Rating: {rating}."
 
 
 def _default_connect(
-    uri: str, username: str, password: str, on_searching_for_opponent: Callable[[], None]
+    uri: str,
+    username: str,
+    password: str,
+    on_searching_for_opponent: Callable[[], None],
+    room_choice: str,
+    on_room_created: Optional[Callable[[str], None]],
 ) -> NetworkGameLoopRunner:
     """The real production connect_fn - see module docstring's "WHY
     `connect_fn` TAKES `(uri, username)`" section (Stage C1) and "STAGE
-    D2"/"STAGE E1" sections for why this tiny wrapper exists rather
-    than passing NetworkGameLoopRunner itself as the default:
-    `username`/`password`/`on_searching_for_opponent` must reach that
-    class's own constructor as KEYWORD arguments (never positionally,
-    to avoid colliding with its `window_name`/`headless`/`clock`
-    positional parameters)."""
+    D2"/"STAGE E1"/"STAGE F7" sections for why this tiny wrapper exists
+    rather than passing NetworkGameLoopRunner itself as the default:
+    `username`/`password`/`on_searching_for_opponent`/`room_choice`/
+    `on_room_created` must reach that class's own constructor as
+    KEYWORD arguments (never positionally, to avoid colliding with its
+    `window_name`/`headless`/`clock` positional parameters)."""
 
     return NetworkGameLoopRunner(
-        uri, username=username, password=password, on_searching_for_opponent=on_searching_for_opponent
+        uri,
+        username=username,
+        password=password,
+        on_searching_for_opponent=on_searching_for_opponent,
+        room_choice=room_choice,
+        on_room_created=on_room_created,
     )
 
 
@@ -331,12 +413,12 @@ def run_shell_login_and_launch(
             message, and the move instructions).
         password_input_fn: See prompt_password.
         connect_fn: Called as `connect_fn(uri, username, password,
-            on_searching_for_opponent)`. Defaults to _default_connect -
-            see module docstring for why constructing a real
-            NetworkGameLoopRunner IS the exact, unmodified real
-            connection call, not a second one, and why
-            `username`/`password`/`on_searching_for_opponent` are
-            threaded through it.
+            on_searching_for_opponent, room_choice, on_room_created)`.
+            Defaults to _default_connect - see module docstring for why
+            constructing a real NetworkGameLoopRunner IS the exact,
+            unmodified real connection call, not a second one, and why
+            `username`/`password`/`on_searching_for_opponent`/
+            `room_choice`/`on_room_created` are threaded through it.
         launch_gui_fn: Defaults to _default_launch_gui - see module
             docstring.
 
@@ -345,35 +427,46 @@ def run_shell_login_and_launch(
 
     Order, and why it cannot be reordered (see module docstring's
     "SRP" section - this is the one place all four steps are wired
-    together): a username, then a password, are collected BEFORE any
-    connection attempt (connect_fn needs both), connecting happens next
-    (the one point that can raise ConnectionRejectedError, and that may
-    now print the searching-for-opponent message partway through, via
-    the injected callback, before it either succeeds or times out), and
-    the welcome message can only be formatted AFTER a successful connect
-    (it needs the real, server-assigned color AND rating - there is
-    nothing to report before that). A ConnectionRejectedError is caught
-    here and shown via WRONG_PASSWORD_DISPLAY_MESSAGE if `exc.reason ==
+    together): a username, then a password, THEN a room choice (Stage
+    F7 - needed before connecting too, for the identical reason the
+    username/password ordering is already justified), are collected
+    BEFORE any connection attempt (connect_fn needs all three),
+    connecting happens next (the one point that can raise
+    ConnectionRejectedError, and that may now print the searching-for-
+    opponent message partway through, via the injected callback, before
+    it either succeeds or times out), and the welcome message can only
+    be formatted AFTER a successful connect (it needs the real, server-
+    assigned color/viewer-status AND rating - there is nothing to
+    report before that). A ConnectionRejectedError is caught here and
+    shown via WRONG_PASSWORD_DISPLAY_MESSAGE if `exc.reason ==
     "wrong_password"`, SERVER_FULL_DISPLAY_MESSAGE if `exc.reason ==
     "server_full"`, MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE if `exc.reason
-    == "matchmaking_timeout"` (Stage E1), or a generic fallback showing
-    `exc.reason` verbatim for any other (defensive - this client's own
-    connect_fn always sends a well-formed AUTH command, so a
-    "malformed:..." reason should never actually reach this branch in
-    practice, but is not silently misreported as "server full" if it
-    somehow did). launch_gui_fn is reached (and therefore ever called)
-    only on the non-rejected path, per this stage's own explicit
-    requirement that a rejected connection must never attempt to
-    construct/launch a GUI.
+    == "matchmaking_timeout"` (Stage E1), ROOM_NOT_FOUND_DISPLAY_MESSAGE
+    if `exc.reason == "room_not_found"` (Stage F7), or a generic
+    fallback showing `exc.reason` verbatim for any other (defensive -
+    this client's own connect_fn always sends a well-formed AUTH
+    command, so a "malformed:..." reason should never actually reach
+    this branch in practice, but is not silently misreported as "server
+    full" if it somehow did). launch_gui_fn is reached (and therefore
+    ever called) only on the non-rejected path, per this stage's own
+    explicit requirement that a rejected connection must never attempt
+    to construct/launch a GUI - a successful VIEWER join (Stage F7) is
+    NOT a rejection, so launch_gui_fn IS reached for a viewer.
     """
 
     username = prompt_username(input_fn, output_fn)
     password = prompt_password(password_input_fn, output_fn)
+    room_choice = prompt_room_choice(input_fn, output_fn)
 
     output_fn(f"Connecting to {uri} ...")
     try:
         runner = connect_fn(
-            uri, username, password, lambda: output_fn(SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE)
+            uri,
+            username,
+            password,
+            lambda: output_fn(SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE),
+            room_choice,
+            lambda code: output_fn(f"Room created! Share this code with a friend: {code}"),
         )
     except ConnectionRejectedError as exc:
         if exc.reason == "wrong_password":
@@ -382,13 +475,18 @@ def run_shell_login_and_launch(
             output_fn(SERVER_FULL_DISPLAY_MESSAGE)
         elif exc.reason == "matchmaking_timeout":
             output_fn(MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE)
+        elif exc.reason == "room_not_found":
+            output_fn(ROOM_NOT_FOUND_DISPLAY_MESSAGE)
         else:
             output_fn(f"Connection rejected: {exc.reason}")
         return
 
     output_fn(format_welcome_message(username, runner.assigned_color, runner.rating))
-    for line in _MOVE_INSTRUCTIONS:
-        output_fn(line)
+    # Stage F7 - there is nothing for a viewer to click, so these
+    # instructions would be actively misleading for one.
+    if not runner.is_viewer:
+        for line in _MOVE_INSTRUCTIONS:
+            output_fn(line)
 
     launch_gui_fn(runner)
     output_fn("Game loop ended.")

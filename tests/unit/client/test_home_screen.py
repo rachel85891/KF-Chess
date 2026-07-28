@@ -19,11 +19,13 @@ from __future__ import annotations
 
 from kungfu_chess.client.home_screen import (
     MATCHMAKING_TIMEOUT_DISPLAY_MESSAGE,
+    ROOM_NOT_FOUND_DISPLAY_MESSAGE,
     SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE,
     SERVER_FULL_DISPLAY_MESSAGE,
     WRONG_PASSWORD_DISPLAY_MESSAGE,
     format_welcome_message,
     prompt_password,
+    prompt_room_choice,
     prompt_username,
     run_shell_login_and_launch,
 )
@@ -126,25 +128,39 @@ def test_format_welcome_message_includes_the_username_color_and_rating():
     assert format_welcome_message("Bob", Color.BLACK, 1450) == "Welcome, Bob! You are playing as BLACK. Rating: 1450."
 
 
-class _FakeRunner:
-    """A tiny stand-in for a real NetworkGameLoopRunner - only the two
-    attributes run_shell_login_and_launch actually reads
-    (assigned_color, rating) are present, so a test can prove this
-    class never reaches into any other real GUI/network attribute
-    before handing the runner off to launch_gui_fn."""
+def test_format_welcome_message_produces_a_distinct_spectator_message_for_a_viewer():
+    # Stage F7 - color is None for a viewer, distinct from a real
+    # player's message, never "playing as None."
+    message = format_welcome_message("Carol", None, None)
 
-    def __init__(self, assigned_color: Color, rating: int = 1200) -> None:
+    assert message == "Welcome, Carol! You are watching this match as a spectator."
+    assert "playing as" not in message
+    assert "Rating" not in message
+
+
+class _FakeRunner:
+    """A tiny stand-in for a real NetworkGameLoopRunner - only the
+    attributes run_shell_login_and_launch actually reads (assigned_color,
+    rating, is_viewer) are present, so a test can prove this class never
+    reaches into any other real GUI/network attribute before handing the
+    runner off to launch_gui_fn."""
+
+    def __init__(self, assigned_color: Color, rating: int = 1200, is_viewer: bool = False) -> None:
         self.assigned_color = assigned_color
         self.rating = rating
+        self.is_viewer = is_viewer
 
 
 def test_successful_login_connects_with_the_collected_credentials_prints_the_correct_welcome_and_launches_the_gui():
-    io = _FakeIO(["Alice", "correct horse battery staple"])
+    io = _FakeIO(["Alice", "correct horse battery staple", "1"])
     fake_runner = _FakeRunner(Color.WHITE, rating=1200)
     connect_calls: list[tuple[str, object, object]] = []
     launch_calls: list[object] = []
 
-    def fake_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
+    def fake_connect(
+        uri: str, username: object, password: object, on_searching_for_opponent: object, room_choice: object,
+        on_room_created: object,
+    ):
         connect_calls.append((uri, username, password))
         return fake_runner
 
@@ -170,10 +186,13 @@ def test_successful_login_connects_with_the_collected_credentials_prints_the_cor
 
 
 def test_server_full_response_shows_the_correct_message_and_never_launches_the_gui():
-    io = _FakeIO(["Alice", "correct horse battery staple"])
+    io = _FakeIO(["Alice", "correct horse battery staple", "1"])
     launch_calls: list[object] = []
 
-    def rejecting_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
+    def rejecting_connect(
+        uri: str, username: object, password: object, on_searching_for_opponent: object, room_choice: object,
+        on_room_created: object,
+    ):
         raise ConnectionRejectedError(f"server rejected this connection (server_full): {uri}", reason="server_full")
 
     def fake_launch(runner: object) -> None:
@@ -193,10 +212,13 @@ def test_server_full_response_shows_the_correct_message_and_never_launches_the_g
 
 
 def test_wrong_password_response_shows_the_correct_message_and_never_launches_the_gui():
-    io = _FakeIO(["Alice", "wrong password"])
+    io = _FakeIO(["Alice", "wrong password", "1"])
     launch_calls: list[object] = []
 
-    def rejecting_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
+    def rejecting_connect(
+        uri: str, username: object, password: object, on_searching_for_opponent: object, room_choice: object,
+        on_room_created: object,
+    ):
         raise ConnectionRejectedError(f"server rejected this connection (wrong_password): {uri}", reason="wrong_password")
 
     def fake_launch(runner: object) -> None:
@@ -217,10 +239,13 @@ def test_wrong_password_response_shows_the_correct_message_and_never_launches_th
 
 
 def test_matchmaking_timeout_response_shows_the_correct_message_and_never_launches_the_gui():
-    io = _FakeIO(["Alice", "correct horse battery staple"])
+    io = _FakeIO(["Alice", "correct horse battery staple", "1"])
     launch_calls: list[object] = []
 
-    def rejecting_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
+    def rejecting_connect(
+        uri: str, username: object, password: object, on_searching_for_opponent: object, room_choice: object,
+        on_room_created: object,
+    ):
         raise ConnectionRejectedError(
             f"server rejected this connection (matchmaking_timeout): {uri}", reason="matchmaking_timeout"
         )
@@ -243,15 +268,74 @@ def test_matchmaking_timeout_response_shows_the_correct_message_and_never_launch
     assert launch_calls == []
 
 
+def test_room_not_found_response_shows_the_correct_message_and_never_launches_the_gui():
+    # Stage F7 - a real, new rejection reason (an unknown JOIN_ROOM
+    # code, or a room whose host already vanished).
+    io = _FakeIO(["Alice", "correct horse battery staple", "3", "NOPE00"])
+    launch_calls: list[object] = []
+
+    def rejecting_connect(
+        uri: str, username: object, password: object, on_searching_for_opponent: object, room_choice: object,
+        on_room_created: object,
+    ):
+        raise ConnectionRejectedError(f"server rejected this connection (room_not_found): {uri}", reason="room_not_found")
+
+    def fake_launch(runner: object) -> None:
+        launch_calls.append(runner)
+
+    run_shell_login_and_launch(
+        "ws://localhost:8765",
+        input_fn=io.input_fn,
+        output_fn=io.output_fn,
+        password_input_fn=io.password_input_fn,
+        connect_fn=rejecting_connect,
+        launch_gui_fn=fake_launch,
+    )
+
+    assert ROOM_NOT_FOUND_DISPLAY_MESSAGE in io.printed
+    assert launch_calls == []
+
+
+def test_a_viewer_join_launches_the_gui_and_never_prints_move_instructions():
+    # Stage F7 - a successful VIEWER join is NOT a rejection - the GUI
+    # IS launched, but the (irrelevant, misleading) move instructions
+    # are not printed for someone who cannot click.
+    io = _FakeIO(["Carol", "correct horse battery staple", "3", "ABCDEF"])
+    fake_runner = _FakeRunner(assigned_color=None, rating=None, is_viewer=True)
+    launch_calls: list[object] = []
+
+    def fake_connect(
+        uri: str, username: object, password: object, on_searching_for_opponent: object, room_choice: object,
+        on_room_created: object,
+    ):
+        return fake_runner
+
+    run_shell_login_and_launch(
+        "ws://localhost:8765",
+        input_fn=io.input_fn,
+        output_fn=io.output_fn,
+        password_input_fn=io.password_input_fn,
+        connect_fn=fake_connect,
+        launch_gui_fn=launch_calls.append,
+    )
+
+    assert launch_calls == [fake_runner]
+    assert "Welcome, Carol! You are watching this match as a spectator." in io.printed
+    assert not any("left-click" in line.lower() for line in io.printed)
+
+
 def test_searching_for_opponent_callback_prints_the_correct_message_when_the_real_connect_fn_invokes_it():
     # connect_fn is handed a callback (mirrors the real _default_connect
     # -> NetworkGameLoopRunner -> NetworkGameClient chain) - this proves
     # run_shell_login_and_launch supplies one that prints the correct
     # message, and only when/if connect_fn actually calls it (real,
     # server-confirmed feedback - never printed eagerly beforehand).
-    io = _FakeIO(["Alice", "correct horse battery staple"])
+    io = _FakeIO(["Alice", "correct horse battery staple", "1"])
 
-    def connect_that_reports_searching(uri: str, username: object, password: object, on_searching_for_opponent):
+    def connect_that_reports_searching(
+        uri: str, username: object, password: object, on_searching_for_opponent, room_choice: object,
+        on_room_created: object,
+    ):
         on_searching_for_opponent()
         on_searching_for_opponent()  # a real server could send this more than once
         return _FakeRunner(Color.WHITE)
@@ -268,21 +352,31 @@ def test_searching_for_opponent_callback_prints_the_correct_message_when_the_rea
     assert io.printed.count(SEARCHING_FOR_OPPONENT_DISPLAY_MESSAGE) == 2
 
 
-def test_username_then_password_are_prompted_before_any_connection_attempt():
-    # Proves the ORDER: username, then password, then connecting - not
-    # any other order.
+def test_username_then_password_then_room_choice_are_prompted_before_any_connection_attempt():
+    # Proves the ORDER: username, then password, then the room-choice
+    # menu (Stage F7), then connecting - not any other order.
     order: list[str] = []
-    io = _FakeIO(["Alice", "correct horse battery staple"])
+    io = _FakeIO(["Alice", "correct horse battery staple", "1"])
 
     def recording_input(prompt: str) -> str:
-        order.append("username_prompt")
+        # prompt_room_choice also uses input_fn (not a separate
+        # parameter) - distinguish its call from prompt_username's by
+        # the prompt text itself, exactly like recording_password_input
+        # already distinguishes its own single responsibility.
+        if "username" in prompt.lower():
+            order.append("username_prompt")
+        else:
+            order.append("room_choice_prompt")
         return io.input_fn(prompt)
 
     def recording_password_input(prompt: str) -> str:
         order.append("password_prompt")
         return io.password_input_fn(prompt)
 
-    def fake_connect(uri: str, username: object, password: object, on_searching_for_opponent: object):
+    def fake_connect(
+        uri: str, username: object, password: object, on_searching_for_opponent: object, room_choice: object,
+        on_room_created: object,
+    ):
         order.append("connect")
         return _FakeRunner(Color.WHITE)
 
@@ -295,4 +389,36 @@ def test_username_then_password_are_prompted_before_any_connection_attempt():
         launch_gui_fn=lambda runner: None,
     )
 
-    assert order == ["username_prompt", "password_prompt", "connect"]
+    assert order == ["username_prompt", "password_prompt", "room_choice_prompt", "connect"]
+
+
+def test_prompt_room_choice_returns_play_for_choice_one():
+    io = _FakeIO(["1"])
+
+    assert prompt_room_choice(io.input_fn, io.output_fn) == "PLAY"
+
+
+def test_prompt_room_choice_returns_create_room_for_choice_two():
+    io = _FakeIO(["2"])
+
+    assert prompt_room_choice(io.input_fn, io.output_fn) == "CREATE_ROOM"
+
+
+def test_prompt_room_choice_prompts_a_second_time_for_the_room_code_on_choice_three():
+    io = _FakeIO(["3", "ABCDEF"])
+
+    assert prompt_room_choice(io.input_fn, io.output_fn) == "JOIN_ROOM:ABCDEF"
+
+
+def test_prompt_room_choice_re_prompts_on_an_invalid_initial_choice():
+    io = _FakeIO(["9", "bogus", "1"])
+
+    assert prompt_room_choice(io.input_fn, io.output_fn) == "PLAY"
+    assert any("invalid" in line.lower() for line in io.printed)
+
+
+def test_prompt_room_choice_re_prompts_on_a_blank_room_code_after_choosing_join_room():
+    io = _FakeIO(["3", "   ", "ABCDEF"])
+
+    assert prompt_room_choice(io.input_fn, io.output_fn) == "JOIN_ROOM:ABCDEF"
+    assert any("empty" in line.lower() for line in io.printed)
