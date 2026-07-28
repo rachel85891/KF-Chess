@@ -717,14 +717,107 @@ is explicitly out of THIS stage's scope (it was asked to WIRE F2's
 existing methods, not add new ones to it).
 
 ACCEPTED SCOPE BOUNDARY - A VIEWER'S CONNECTION IS CLOSED RIGHT AFTER
-"room_joined:viewer": real spectating (receiving board/event
-broadcasts, being excluded from move validation) is Stage F5 (viewer
-move-rejection) and Stage F6 (N-variable broadcast fan-out)'s own
-explicit, separate job - this stage's task was to wire CREATE_ROOM/
-JOIN_ROOM into a real GameSession for exactly a host+guest pair, not to
-build spectator infrastructure two stages early. A viewer therefore
-learns its own role, then is disconnected immediately - no board text,
-no event broadcasts, no move loop of any kind for this connection.
+"room_joined:viewer" (SUPERSEDED BY STAGE F5, BELOW - kept here as
+historical record of Stage F4's own original, deliberately narrower
+scope): real spectating (receiving board/event broadcasts, being
+excluded from move validation) was Stage F5 (viewer move-rejection) and
+Stage F6 (N-variable broadcast fan-out)'s own explicit, separate job -
+Stage F4's task was to wire CREATE_ROOM/JOIN_ROOM into a real
+GameSession for exactly a host+guest pair, not to build spectator
+infrastructure two stages early.
+
+STAGE F5 - A VIEWER ACTUALLY STAYS CONNECTED AND WATCHES
+(feature/rooms-f5-viewer-role-enforcement): replaces Stage F4's own
+"close the connection right after room_joined:viewer" placeholder - a
+viewer now joins the SAME shared `async for message in connection`
+loop every player already uses, with `assigned_color` (renamed
+`Optional[Color]` throughout this chain) set to `None` to mean "this
+connection is a viewer, not a player."
+
+A GENUINE OVERLAP BETWEEN F5's AND F6's OWN STATED SCOPES, RESOLVED
+HERE (Implementation_Plan.md's own F5 acceptance criteria already say
+"the viewer still receives all normal broadcasts," which `_broadcast_
+event`'s own pre-existing `tuple(match.colors.keys())` - exactly two
+connections, hardcoded, by construction - could never satisfy without
+ALSO being the exact extension F6's own task literally describes: "audit
+every broadcast loop... never a hardcoded assumption of exactly 2." This
+is a real inconsistency in a document written before F1/F2/F4 were
+actually built, not something resolvable by picking one document's
+wording over the other. RESOLUTION: F5 performs the ONE minimal
+extension `_broadcast_event` needs to make ITS OWN narrow "2 players + 1
+viewer" acceptance test true (`tuple(match.colors.keys()) +
+tuple(match.viewer_connections)`) - nothing broader. F6 remains
+responsible for the wider audit: every OTHER loop in this file that
+might assume "exactly 2" (if any exist beyond `_broadcast_event`), and
+the broader "2 players + 3 viewers = 5 connections, all treated
+identically" correctness test Implementation_Plan.md's own F6 section
+describes - deliberately NOT attempted in this stage.
+
+`assigned_color` WIDENED TO `Optional[Color]` THROUGHOUT THE CHAIN
+(`_handle_room_choice`'s own return type, `_handle_message`/
+`_handle_move_command`/`_handle_jump_command`'s own parameter) - NO NEW
+VIEWER-SPECIFIC BRANCH ANYWHERE: a real, parsed `ParsedMoveCommand.
+color`/`ParsedJumpCommand.color` is always a genuine `Color`, never
+`None` - the EXISTING `if parsed.color is not assigned_color: reject
+("wrong_color")` check in both `_handle_move_command` and
+`_handle_jump_command` therefore already, correctly, unconditionally
+rejects every move/jump from a viewer (`assigned_color is None`)
+regardless of which color it claims - Implementation_Plan.md's own "a
+third value on an existing mechanism, not a new one" made completely
+literal: zero new code paths in either handler.
+
+`self._room_matches: Dict[str, _Match]` - A SEPARATE DICT FROM
+`self._pending_rooms`, WITH A DELIBERATELY DIFFERENT LIFETIME:
+`self._pending_rooms` (Stage F4) tracks ONLY the "waiting for a first
+guest" phase of a room's life, and is popped the moment that phase ends
+(a real GUEST joins, or the host disconnects first) - it has nothing
+left to say once a room is complete. `self._room_matches` begins its
+own life at EXACTLY that same moment (populated inside the JoinRoomCommand/
+GUEST branch, immediately after `_construct_match` succeeds) and answers
+a different, ongoing question for the REST of that match's real
+lifetime: "which real _Match does this room code now point to" - the
+one thing a THIRD, later-arriving VIEWER actually needs to find.
+
+ACCEPTED, DEFERRED GAP - `self._room_matches` ENTRIES ARE NEVER POPPED,
+EVEN AFTER A MATCH ENDS (mirrors Stage F4's own identical "abandoned
+room can never be reclaimed" gap precisely): this stage's own scope is
+wiring viewers into a match that is currently LIVE, not building
+match-lifecycle cleanup for one that has already ended - `_room_matches`
+entries, like `SessionCoordinator`'s own room registry, simply grow for
+the lifetime of the process. A viewer joining a room code whose match
+already ended would still find a real (but finished) `_Match` here and
+join it as a spectator of its own final state - not incorrect, merely
+unbounded memory growth, explicitly left to a future stage.
+
+ACCEPTED "PHANTOM ROOM" EDGE CASE - A THIRD JOIN_ROOM ON AN ABANDONED
+CODE GETS `room_not_found`, NOT A CRASH OR A VIEWER ROLE (a further,
+direct consequence of Stage F4's own already-accepted gap, not a new
+bug): if a host disconnects before any guest ever joins, a SECOND
+connection JOIN_ROOM-ing that same code is already told `room_not_found`
+(Stage F4) - but `SessionCoordinator.join_room` has, by then,
+irreversibly recorded that second identity as a real GUEST occupant of
+the now host-less Room (Stage F4's own "no removal method" gap). A
+THIRD connection JOIN_ROOM-ing that SAME code therefore reaches
+`Role.VIEWER` from `SessionCoordinator`'s own, entirely correct,
+capacity rules (the Room genuinely shows 2 occupants) - but
+`self._room_matches.get(code)` is `None`, because no real `_Match` was
+ever constructed for this code (the GUEST branch's own
+`host_connection is None` check returned before ever reaching
+`_construct_match`). This connection is therefore treated identically
+to an unknown code (`room_not_found`, closed) - `self._room_matches`
+being the definitive "does a real match exist" signal, decoupled from
+SessionCoordinator's own Room-capacity bookkeeping, is exactly what
+makes this the correct outcome rather than a crash or a silently-joined
+viewer with nothing to watch.
+
+A VIEWER'S OWN DISCONNECT IS A COMPLETE NON-EVENT FOR THE MATCH: unlike
+a real player (Stage E2's disconnect countdown/auto-resign), a viewer
+disconnecting (`color is None` in `handle_connection`'s own post-
+message-loop cleanup) never calls `_handle_active_match_disconnect` at
+all - only removes itself from `match.viewer_connections` - the two
+real players are entirely unaffected either way, and that mechanism
+exists to protect an actual PLAYER's own match outcome, not to track
+who is merely watching.
 """
 
 from __future__ import annotations
@@ -735,7 +828,7 @@ import contextlib
 import functools
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
@@ -799,6 +892,14 @@ class _Match:
     # populated once, in _create_match, from the two WaitingPlayer.
     # username fields already available there.
     usernames: Dict[Color, str] = field(default_factory=dict)
+    # Stage F5 - see module docstring's "STAGE F5" section: `colors`
+    # above holds exactly the two real players, UNCHANGED by this
+    # stage; this new field holds every OTHER connection currently
+    # watching this same match, in join order - appended to as each
+    # viewer joins (`_handle_room_choice`'s JoinRoomCommand/VIEWER
+    # branch), never removed except on that viewer's own disconnect
+    # (`handle_connection`'s own post-message-loop cleanup).
+    viewer_connections: List[ServerConnection] = field(default_factory=list)
 
 
 @dataclass
@@ -938,6 +1039,17 @@ class GameServer:
         # the host disconnecting first (with None) - see
         # `_wait_for_room_ready`'s own docstring.
         self._waiting_room_futures: Dict[str, "asyncio.Future[Optional[_Match]]"] = {}
+        # Stage F5 - see module docstring's "STAGE F5" section for why
+        # this is a SEPARATE dict from `self._pending_rooms` above (that
+        # one tracks only the "waiting for a first guest" phase, and is
+        # popped once a room is complete; this one tracks "which real
+        # _Match does this room code now point to", for the entire
+        # remaining lifetime of that match) - populated exactly once, at
+        # the moment a room's SECOND occupant (the GUEST) completes it,
+        # and consulted by every subsequent VIEWER arrival for that same
+        # code. Deliberately never popped when a match ends (an accepted,
+        # deferred gap - see module docstring's own "STAGE F5" section).
+        self._room_matches: Dict[str, _Match] = {}
 
         # Stage E2 - keyed by USERNAME, not connection object - see
         # module docstring's "WHY DISCONNECT-COUNTDOWN STATE IS TRACKED
@@ -1019,15 +1131,27 @@ class GameServer:
         except ConnectionClosed:
             pass
 
-        # Stage E2 - a disconnect during an ACTIVE match no longer falls
-        # straight to cleanup: see module docstring's "STAGE E2" section
-        # and _handle_active_match_disconnect's own docstring for the
-        # full reasoning (a real, visible countdown, with narrow,
-        # scoped support for the SAME username reconnecting during it).
-        # This does NOT affect a disconnect while merely WAITING in the
-        # matchmaking queue at all - that path is entirely separate,
-        # inside _wait_for_match, above, unchanged by this stage.
-        await self._handle_active_match_disconnect(match, connection, color, parsed_auth.username)
+        if color is not None:
+            # Stage E2 - a disconnect during an ACTIVE match no longer
+            # falls straight to cleanup: see module docstring's "STAGE
+            # E2" section and _handle_active_match_disconnect's own
+            # docstring for the full reasoning (a real, visible
+            # countdown, with narrow, scoped support for the SAME
+            # username reconnecting during it). This does NOT affect a
+            # disconnect while merely WAITING in the matchmaking queue
+            # at all - that path is entirely separate, inside
+            # _wait_for_match, above, unchanged by this stage.
+            await self._handle_active_match_disconnect(match, connection, color, parsed_auth.username)
+        else:
+            # Stage F5 - `color is None` means `connection` is a VIEWER
+            # (see module docstring's "STAGE F5" section) - a viewer
+            # disconnecting is a complete non-event for the match
+            # itself: the two real players are entirely unaffected
+            # either way, so this never starts a countdown or triggers
+            # auto-resign (that mechanism exists for actual players
+            # only) - just stop watching.
+            if connection in match.viewer_connections:
+                match.viewer_connections.remove(connection)
         self._connection_manager.remove(connection)
 
     async def _handle_room_choice(
@@ -1036,16 +1160,21 @@ class GameServer:
         parsed_choice: Union[PlayCommand, CreateRoomCommand, JoinRoomCommand],
         username: str,
         rating: int,
-    ) -> Optional[Tuple[_Match, Color]]:
+    ) -> Optional[Tuple[_Match, Optional[Color]]]:
         """Branch on a freshly-parsed post-AUTH room choice - see module
-        docstring's "STAGE F4" section for the full reasoning behind
-        every branch below. Mirrors `_resume_if_pending_disconnect`'s
-        own `Optional[Tuple[_Match, Color]]` return convention exactly:
-        a real (match, color) once this connection has a live match to
-        join `handle_connection`'s own shared message loop with, or None
-        if this connection has ALREADY been fully handled (rejected,
-        timed out, closed as a viewer, or abandoned) and
-        `handle_connection` should simply clean up and return.
+        docstring's "STAGE F4" and "STAGE F5" sections for the full
+        reasoning behind every branch below. Mirrors
+        `_resume_if_pending_disconnect`'s own
+        `Optional[Tuple[_Match, Color]]` return convention, widened to
+        `Optional[Color]` (Stage F5): a real (match, color) once this
+        connection has a live match to join `handle_connection`'s own
+        shared message loop with as a PLAYER, (match, None) if it joins
+        that SAME shared loop as a VIEWER instead (see module
+        docstring's "STAGE F5" section for what `None` means at every
+        downstream call site this reaches), or plain `None` if this
+        connection has ALREADY been fully handled (rejected, timed out,
+        or abandoned) and `handle_connection` should simply clean up and
+        return.
 
         Args:
             connection: The just-authenticated connection making this
@@ -1057,9 +1186,9 @@ class GameServer:
 
         Returns:
             (match, color) if this connection now has a live match to
-            join the shared message loop with; None if this connection
-            has already been fully handled and nothing more remains to
-            do for it.
+            join the shared message loop with (color is None for a
+            viewer - Stage F5); None if this connection has already been
+            fully handled and nothing more remains to do for it.
         """
 
         if isinstance(parsed_choice, PlayCommand):
@@ -1110,14 +1239,36 @@ class GameServer:
             return None
 
         if result.role is Role.VIEWER:
-            # See module docstring's "STAGE F4" section's own accepted
-            # scope boundary: real spectating (board/event broadcasts,
-            # move-rejection) is Stage F5/F6's own separate job - this
-            # stage only wires CREATE_ROOM/JOIN_ROOM into a real
-            # host+guest GameSession.
+            # Stage F5 - replaces Stage F4's own "send room_joined:
+            # viewer, close, return" placeholder entirely: a viewer now
+            # actually stays connected and watches. `self._room_matches`
+            # (not SessionCoordinator's own Room, which knows nothing
+            # about which real _Match a code maps to) is the definitive
+            # answer to "does a real match exist for this code yet" -
+            # see module docstring's "STAGE F5" section for the "phantom
+            # room" edge case this None-check exists to catch: a THIRD
+            # connection can reach Role.VIEWER (per SessionCoordinator's
+            # own room-capacity rules) for a code whose host already
+            # vanished before any real match was ever constructed
+            # (Stage F4's own already-accepted gap) - this is that same
+            # gap's further consequence, not a new bug.
+            match = self._room_matches.get(parsed_choice.code)
+            if match is None:
+                await self._protocol.send(connection, self._protocol.format_room_not_found())
+                await connection.close()
+                return None
+
+            match.viewer_connections.append(connection)
             await self._protocol.send(connection, self._protocol.format_room_joined(Role.VIEWER.value))
-            await connection.close()
-            return None
+            # A viewer joining mid-game needs to see the CURRENT board
+            # immediately, not wait for the next event - mirrors every
+            # other join path's own "send the current board text right
+            # after the role message" convention throughout this file.
+            await self._protocol.send(connection, self._current_board_text(match))
+            # None here IS the "third value on wrong_color's existing
+            # mechanism" Implementation_Plan.md's own F5 section
+            # describes - see _handle_move_command's own docstring.
+            return match, None
 
         # result.role is Role.GUEST
         host_connection, host_username = self._pending_rooms.pop(parsed_choice.code, (None, None))
@@ -1140,6 +1291,12 @@ class GameServer:
         # real join-order analogous to matchmaking's own "earlier-queued
         # becomes White" rule.
         match = self._construct_match(host_connection, host_username, connection, username)
+        # Stage F5 - the room is now COMPLETE (host+guest both real) -
+        # this is the exact moment `self._room_matches` is populated,
+        # see module docstring's "STAGE F5" section for why this is a
+        # separate dict from `self._pending_rooms` (already popped,
+        # above) and why it is never popped again itself.
+        self._room_matches[parsed_choice.code] = match
         future = self._waiting_room_futures.pop(parsed_choice.code, None)
         if future is not None and not future.done():
             future.set_result(match)
@@ -1567,7 +1724,7 @@ class GameServer:
         return self._user_repository.get_rating(username)
 
     async def _handle_message(
-        self, match: _Match, connection: ServerConnection, assigned_color: Color, message: object
+        self, match: _Match, connection: ServerConnection, assigned_color: Optional[Color], message: object
     ) -> None:
         """Parse one raw incoming message and dispatch it to the
         matching handler - see module docstring's "JUMP COMMAND
@@ -1578,7 +1735,10 @@ class GameServer:
             match: The real _Match this connection belongs to.
             connection: The connection `message` arrived on.
             assigned_color: The color this connection was assigned when
-                matched.
+                matched, or None if this connection is a VIEWER (Stage
+                F5 - see module docstring's "STAGE F5" section and
+                `_handle_move_command`'s own docstring for what a viewer
+                sending a move/jump command actually experiences).
             message: The raw text (or bytes) websockets delivered.
 
         Returns:
@@ -1597,11 +1757,23 @@ class GameServer:
             await self._handle_move_command(match, connection, assigned_color, parsed)
 
     async def _handle_move_command(
-        self, match: _Match, connection: ServerConnection, assigned_color: Color, parsed: ParsedMoveCommand
+        self, match: _Match, connection: ServerConnection, assigned_color: Optional[Color], parsed: ParsedMoveCommand
     ) -> None:
         """Validate and dispatch one ALREADY-PARSED move command - see
         module docstring's "MOVE COMMAND REJECTION SCHEME" for the
-        exact rejection responses this sends."""
+        exact rejection responses this sends.
+
+        STAGE F5 - A VIEWER'S MOVE IS REJECTED BY THIS SAME wrong_color
+        CHECK, WITH NO NEW BRANCH: `assigned_color` is None for a viewer
+        (see module docstring's "STAGE F5" section) - `parsed.color` is
+        always a real, parsed Color, never None, so
+        `parsed.color is not assigned_color` is unconditionally True for
+        a viewer regardless of which color it claims, rejecting with the
+        exact same "rejected:wrong_color" wire text a real player's own
+        wrong-color attempt already produces. This is
+        Implementation_Plan.md's own "a third value on an existing
+        mechanism, not a new one" made literal - no viewer-specific
+        `if` was added anywhere in this method."""
 
         if parsed.color is not assigned_color:
             await self._protocol.send(connection, self._protocol.format_rejection("wrong_color"))
@@ -1618,11 +1790,14 @@ class GameServer:
         match.session.request_move(parsed.from_cell, parsed.to_cell)
 
     async def _handle_jump_command(
-        self, match: _Match, connection: ServerConnection, assigned_color: Color, parsed: ParsedJumpCommand
+        self, match: _Match, connection: ServerConnection, assigned_color: Optional[Color], parsed: ParsedJumpCommand
     ) -> None:
         """Validate and dispatch one ALREADY-PARSED jump command - see
         module docstring's "JUMP COMMAND ROUTING AND REJECTION SCHEME"
-        for the exact rejection responses this sends."""
+        for the exact rejection responses this sends - see
+        `_handle_move_command`'s own docstring for why a viewer
+        (`assigned_color is None`) is rejected by this SAME
+        `wrong_color` check, with no new branch."""
 
         if parsed.color is not assigned_color:
             await self._protocol.send(connection, self._protocol.format_rejection("wrong_color"))
@@ -1658,9 +1833,12 @@ class GameServer:
         `event` (if any), THEN the existing board-text snapshot, THEN
         (for MoveAccepted/JumpAccepted/PieceArrived only) the score/
         move-log/elapsed-clock snapshot - to THIS MATCH's own two
-        connections only, never every connection on the server."""
+        players AND any viewers currently watching (Stage F5 - see
+        module docstring's "STAGE F5" section for why this is the ONE,
+        minimal fan-out change this stage makes, not the broader F6
+        audit), never every connection on the server."""
 
-        connections: Tuple[ServerConnection, ...] = tuple(match.colors.keys())
+        connections: Tuple[ServerConnection, ...] = tuple(match.colors.keys()) + tuple(match.viewer_connections)
         wire_text = self._protocol.format_event(event)
         if wire_text is not None:
             await self._protocol.broadcast(connections, wire_text)
