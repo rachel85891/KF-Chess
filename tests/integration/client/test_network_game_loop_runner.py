@@ -347,3 +347,86 @@ def test_two_independent_runners_get_opposite_colors_and_each_see_the_others_mov
     finally:
         runner_white.close()
         test_server.stop()
+
+
+def test_a_viewer_never_raises_connection_rejected_and_has_no_input_layer_but_still_watches():
+    # Stage F7 - Requirement B.1's own critical fix, proven with a real
+    # test, not just a code-reading claim: a real viewer connection must
+    # NOT raise ConnectionRejectedError (assigned_color is None for a
+    # viewer too, exactly like a real rejection - see
+    # network_game_loop_runner.py's own "STAGE F7" docstring section).
+    test_server = _BackgroundTestServer()
+    created_codes: list[str] = []
+    result_host: list[NetworkGameLoopRunner] = []
+
+    def _construct_host() -> None:
+        result_host.append(
+            NetworkGameLoopRunner(
+                test_server.uri,
+                username="alice",
+                password="password1",
+                headless=True,
+                room_choice="CREATE_ROOM",
+                on_room_created=created_codes.append,
+            )
+        )
+
+    host_thread = threading.Thread(target=_construct_host, daemon=True)
+    host_thread.start()
+
+    deadline = time.perf_counter() + _JOIN_TIMEOUT_S
+    while not created_codes and time.perf_counter() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+    assert created_codes  # on_room_created fired with a real code
+    code = created_codes[0]
+
+    guest = NetworkGameLoopRunner(
+        test_server.uri, username="bob", password="password2", headless=True, room_choice=f"JOIN_ROOM:{code}"
+    )
+    host_thread.join(timeout=_JOIN_TIMEOUT_S)
+    host = result_host[0]
+
+    viewer = None
+    try:
+        assert host.assigned_color is Color.WHITE  # Host=White (Stage F4)
+        assert guest.assigned_color is Color.BLACK
+
+        # THE critical assertion: constructing a viewer must not raise.
+        viewer = NetworkGameLoopRunner(
+            test_server.uri,
+            username="carol",
+            password="password3",
+            headless=True,
+            room_choice=f"JOIN_ROOM:{code}",
+        )
+
+        assert viewer.is_viewer is True
+        assert viewer.click_controller is None
+        assert viewer.mouse_adapter is None
+
+        # A real move broadcast from the two actual players is still
+        # received and does not raise.
+        e2 = Position(row=6, col=4)
+        e4 = Position(row=4, col=4)
+        host.network_client.send_move(Color.WHITE, PieceKind.PAWN, e2, e4)
+
+        def arrived(r: NetworkGameLoopRunner) -> bool:
+            piece = r.board.piece_at(e4) if r.board is not None else None
+            return piece is not None and piece.kind is PieceKind.PAWN
+
+        timeout_s = (2 * MS_PER_SQUARE) / 1000 + 3.0
+        _poll_until(viewer, arrived, timeout_s)
+
+        assert viewer.board.piece_at(e2) is None
+        assert viewer.board.piece_at(e4).color is Color.WHITE
+
+        # Requirement B.5's own render-path guards actually hold under a
+        # real frame (selected=... ternary, click_controller/
+        # mouse_adapter None-checks) - not merely a type-check.
+        viewer._run_one_frame()
+    finally:
+        if viewer is not None:
+            viewer.close()
+        guest.close()
+        host.close()
+        test_server.stop()

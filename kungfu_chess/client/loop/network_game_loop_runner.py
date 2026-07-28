@@ -782,6 +782,59 @@ GameOverOverlayRenderer's own new, identically-optional
 `own_rating_change` parameter in `_run_one_frame` - reusing the EXACT
 SAME existing GameOver overlay/freeze-and-display UX (this stage's own
 explicit requirement), not a second, separate rating display.
+
+STAGE F7 - VIEWER MODE: `assigned_color is None` NO LONGER ALWAYS MEANS
+"REJECTED" (feature/rooms-f7-client-room-menu-and-viewer-mode): a
+successful JOIN_ROOM can now assign the VIEWER role (Stage F5) - the
+server never gives a viewer a Color, so `NetworkGameClient.
+assigned_color` (and therefore `self.assigned_color` here) is `None`
+for a viewer, EXACTLY the same value a real rejection already produces.
+THE CRITICAL FIX: `__init__`'s own rejection check widened from
+`if self.assigned_color is None:` to
+`if self.assigned_color is None and not self.network_client.is_viewer:`
+- getting this wrong would make a successfully-joined viewer
+indistinguishable from a rejected connection (raising
+ConnectionRejectedError for someone who was actually just told to go
+watch). `self.is_viewer`/`self.room_code` mirror `self.rating`'s own
+"read straight from network_client after a successful connect" shape.
+
+VIEWER MODE SKIPS CONSTRUCTING THE INPUT LAYER ENTIRELY (Implementation_
+Plan.md's own explicit wording - "there's nothing for a viewer to
+click, so the input layer simply isn't built for this session, rather
+than being built and then blocked"): both `self.click_controller`
+(NetworkClickController) and `self.mouse_adapter` (MouseAdapter,
+including its own `.attach()`/debug-callback attachment) are `None` for
+a viewer - `cv2.namedWindow`/window creation itself is NOT skipped (a
+viewer still WATCHES the game; only clicking is unavailable).
+
+EVERY OTHER REFERENCE TO click_controller/mouse_adapter THAT CAN RUN
+UNCONDITIONALLY NOW GUARDS AGAINST None (re-verified directly by
+grepping every "self.click_controller"/"self.mouse_adapter" occurrence
+in this whole file, not merely assumed complete): `_apply_broadcast`'s own
+`click_controller.board = board` (runs on every new board state, for a
+viewer too), the GameOver handler's own `click_controller.game_over =
+True` (runs whenever any match ends), the per-frame render call's own
+`selected=click_controller.selected` (a viewer has no "selected cell"
+concept - now `None` for a viewer via a ternary, since a viewer still
+needs to keep SEEING the board every frame), and the window-resize
+handler's own `mouse_adapter._mapper = ScreenToImageMapper(...)` (a
+viewer's own window can still be resized by the user, even without
+being able to click in it). `_request_jump` and
+`_attach_debug_mouse_callback` need NO guard of their own - re-verified
+directly that neither can ever actually be reached for a viewer once
+the above is done: `_request_jump` is only ever invoked as
+MouseAdapter's own `on_jump_requested` callback (a viewer's `None`
+mouse_adapter is never attached to receive it), and
+`_attach_debug_mouse_callback` is only ever called from inside the SAME
+`if not self.is_viewer:` block that also attaches the real mouse
+callback - a viewer's own `__init__` never reaches that call at all.
+
+`is_local_player=(self.assigned_color is Color.WHITE)`/`is Color.BLACK`
+(the two PlayerLabelRenderer call sites) NEED NO CHANGE AT ALL -
+CONFIRMED CORRECT AS-IS, NOT A SILENT GAP (mirroring Stage F6's own
+audit style): for a viewer, `self.assigned_color is None`, so BOTH
+already, correctly, evaluate to False - neither panel is "the local
+player" for someone who isn't playing.
 """
 
 from __future__ import annotations
@@ -919,6 +972,8 @@ class NetworkGameLoopRunner:
         headless: bool = False,
         clock: Callable[[], float] = time.perf_counter,
         on_searching_for_opponent: Optional[Callable[[], None]] = None,
+        room_choice: str = "PLAY",
+        on_room_created: Optional[Callable[[str], None]] = None,
     ) -> None:
         """Connect to `uri` with real credentials, learn this client's
         assigned color and rating, and wire every reused rendering/
@@ -964,6 +1019,18 @@ class NetworkGameLoopRunner:
                 - forwarded straight through, unchanged. Defaults to
                 None (no callback); this class itself never reacts to
                 it.
+            room_choice: The exact wire text to send after AUTH - one
+                of "PLAY", "CREATE_ROOM", or "JOIN_ROOM:<code>" (Stage
+                F7 - see NetworkGameClient.connect's own identical
+                parameter) - forwarded straight through, unchanged.
+                Defaults to "PLAY" - see module docstring's "STAGE F7"
+                section for why this default keeps every pre-existing
+                caller's own real, tested behavior unchanged.
+            on_room_created: Called with the real room code the moment
+                this connection receives "room_created:<code>" (Stage
+                F7 - see NetworkGameClient.connect's own identical
+                parameter) - forwarded straight through, unchanged.
+                Defaults to None.
 
         Returns:
             None.
@@ -973,7 +1040,11 @@ class NetworkGameLoopRunner:
                 connection - "server_full", a real login failure, or a
                 real matchmaking timeout (see module docstring's
                 "STAGE D2" section and NetworkGameClient's own "STAGE
-                E1" section - `reason` distinguishes all three).
+                E1" section - `reason` distinguishes all three). Does
+                NOT raise for a successful JOIN_ROOM that assigned the
+                VIEWER role (Stage F7 - see module docstring's "STAGE
+                F7" section for why `assigned_color is None` alone is
+                no longer sufficient to detect a rejection).
         """
 
         self._headless = headless
@@ -983,18 +1054,37 @@ class NetworkGameLoopRunner:
         self.username = username
 
         self.network_client = NetworkGameClient()
-        self.assigned_color = self.network_client.connect(uri, username, password, on_searching_for_opponent)
-        if self.assigned_color is None:
+        self.assigned_color = self.network_client.connect(
+            uri, username, password, on_searching_for_opponent, room_choice, on_room_created
+        )
+        # Stage F7 - THE CRITICAL FIX: a VIEWER also has assigned_color
+        # is None, but is NOT rejected - see module docstring's "STAGE
+        # F7" section and NetworkGameClient._JoinResponse's own docstring
+        # for why `self.network_client.is_viewer` must be checked here,
+        # not just `self.assigned_color is None` alone (a viewer would
+        # otherwise be indistinguishable from a rejected connection).
+        if self.assigned_color is None and not self.network_client.is_viewer:
             reason = self.network_client.rejection_reason
             self.network_client.close()
             raise ConnectionRejectedError(f"server rejected this connection ({reason}): {uri}", reason=reason)
 
         self.rating = self.network_client.rating
+        # Stage F7 - mirrors self.rating's own "read straight from
+        # network_client after a successful connect" shape exactly.
+        self.is_viewer = self.network_client.is_viewer
+        self.room_code = self.network_client.room_code
 
         self.board: Optional[Board] = None
-        self.click_controller = NetworkClickController(
-            assigned_color=self.assigned_color, network_client=self.network_client
-        )
+        # Stage F7 - a viewer has nothing to click, so the input layer
+        # simply isn't built for this session at all (per Implementation_
+        # Plan.md's own explicit wording), rather than being built and
+        # then blocked - see module docstring's "STAGE F7" section.
+        if not self.is_viewer:
+            self.click_controller: Optional[NetworkClickController] = NetworkClickController(
+                assigned_color=self.assigned_color, network_client=self.network_client
+            )
+        else:
+            self.click_controller = None
 
         # Stage B7 - see module docstring's "STAGE B7 - REAL EVENT-
         # DRIVEN ANIMATION" section for the full reasoning behind both:
@@ -1080,17 +1170,28 @@ class NetworkGameLoopRunner:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
         mapper = ScreenToImageMapper(window_origin=(self._board_origin_x, self._board_origin_y), window_scale=1.0)
-        # NetworkClickController duck-types Controller's `click(x, y)`
-        # method - see module docstring's "REUSING MouseAdapter" note.
-        # on_jump_requested=self._request_jump wires right-click the
-        # same way GameLoopRunner's own identically-named method does
-        # locally (see module docstring's "JUMP OVER THE NETWORK"
-        # section) - previously never passed at all in network mode.
-        self.mouse_adapter = MouseAdapter(mapper, self.click_controller, on_jump_requested=self._request_jump)
-        if not headless:
-            self.mouse_adapter.attach(window_name)
-            if _DEBUG_CLICKS:
-                self._attach_debug_mouse_callback(window_name)
+        # Stage F7 - see this method's own earlier "STAGE F7" comment on
+        # self.click_controller: a viewer gets no MouseAdapter either,
+        # for the identical reason (there is nothing for it to route
+        # clicks to). cv2.namedWindow/window creation itself is NOT
+        # skipped (above) - a viewer still WATCHES the game, only
+        # clicking is unavailable.
+        if not self.is_viewer:
+            # NetworkClickController duck-types Controller's `click(x, y)`
+            # method - see module docstring's "REUSING MouseAdapter" note.
+            # on_jump_requested=self._request_jump wires right-click the
+            # same way GameLoopRunner's own identically-named method does
+            # locally (see module docstring's "JUMP OVER THE NETWORK"
+            # section) - previously never passed at all in network mode.
+            self.mouse_adapter: Optional[MouseAdapter] = MouseAdapter(
+                mapper, self.click_controller, on_jump_requested=self._request_jump
+            )
+            if not headless:
+                self.mouse_adapter.attach(window_name)
+                if _DEBUG_CLICKS:
+                    self._attach_debug_mouse_callback(window_name)
+        else:
+            self.mouse_adapter = None
 
     def _request_jump(self, cell: Position) -> None:
         """MouseAdapter's on_jump_requested callback - mirrors
@@ -1156,7 +1257,11 @@ class NetworkGameLoopRunner:
 
         if self.board is None:
             self.board = board
-            self.click_controller.board = board
+            # Stage F7 - a viewer has no click_controller at all (see
+            # __init__'s own "STAGE F7" comment) - this runs on every
+            # new board state for every connection, including viewers.
+            if self.click_controller is not None:
+                self.click_controller.board = board
             self.piece_animator_registry = PieceAnimatorRegistry.from_board(board)
             return
 
@@ -1596,7 +1701,11 @@ class NetworkGameLoopRunner:
 
         self._game_over = True
         self._game_over_winner_color = event.winner_color
-        self.click_controller.game_over = True
+        # Stage F7 - a viewer has no click_controller (nothing for it to
+        # freeze) - this runs unconditionally whenever any match ends,
+        # for every connection, including viewers.
+        if self.click_controller is not None:
+            self.click_controller.game_over = True
 
     def _apply_opponent_disconnected(self, text: str) -> None:
         """Parse one raw "opponent_disconnected:<seconds>" broadcast and
@@ -1823,9 +1932,13 @@ class NetworkGameLoopRunner:
         surface = ImgSurface(board_canvas, self.asset_cache, self.piece_animator_registry)
 
         if self.board is not None:
+            # Stage F7 - a viewer has no "selected cell" concept at all
+            # (no click_controller to hold one) - this runs EVERY
+            # rendered frame, for a viewer too (a viewer still needs to
+            # keep SEEING the board).
             snapshot = build_snapshot_from_board(
                 self.board,
-                selected=self.click_controller.selected,
+                selected=(self.click_controller.selected if self.click_controller is not None else None),
                 active_motions=self._compute_motions_for_rendering(),
             )
             Renderer(surface).render(snapshot)
@@ -1935,9 +2048,13 @@ class NetworkGameLoopRunner:
             # resolves board_origin_x/_y pixels too far right/down.
             board_window_origin_x = origin_x + self._board_origin_x * scale
             board_window_origin_y = origin_y + self._board_origin_y * scale
-            self.mouse_adapter._mapper = ScreenToImageMapper(
-                window_origin=(round(board_window_origin_x), round(board_window_origin_y)), window_scale=scale
-            )
+            # Stage F7 - a viewer's own window can still be resized by
+            # the user, even though they can't click pieces in it - a
+            # viewer simply has no mouse_adapter to refresh at all.
+            if self.mouse_adapter is not None:
+                self.mouse_adapter._mapper = ScreenToImageMapper(
+                    window_origin=(round(board_window_origin_x), round(board_window_origin_y)), window_scale=scale
+                )
             resized = main_canvas.resize(round(self._total_canvas_width * scale), round(self._total_canvas_height * scale))
             display_canvas = Img.blank_canvas(actual_width, actual_height, background_color=CANVAS_BACKGROUND_COLOR)
             display_canvas.paste(resized, round(origin_x), round(origin_y))
