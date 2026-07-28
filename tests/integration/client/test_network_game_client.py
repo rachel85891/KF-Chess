@@ -373,3 +373,112 @@ def test_close_after_a_real_connect_is_safe_and_does_not_hang():
         if dummy is not None:
             dummy.close()
         test_server.stop()
+
+
+def _start_connect_with_room_choice(
+    client: NetworkGameClient, uri: str, username: str, password: str, room_choice: str, on_room_created=None
+) -> threading.Thread:
+    """Mirrors _start_connect's own shape exactly, extended with the
+    real room_choice/on_room_created parameters this stage adds (Stage
+    F7) - a host waits synchronously for a real guest to join, so this
+    also needs its own background thread, exactly like two matchmaking
+    clients waiting on each other already do."""
+
+    thread = threading.Thread(
+        target=client.connect,
+        args=(uri, username, password, None, room_choice),
+        kwargs={"on_room_created": on_room_created},
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def test_create_room_then_join_room_matches_host_and_guest_with_real_colors():
+    test_server = _BackgroundTestServer()
+    host = NetworkGameClient()
+    guest = NetworkGameClient()
+    created_codes: list[str] = []
+    try:
+        host_thread = _start_connect_with_room_choice(
+            host, test_server.uri, "alice", "password1", "CREATE_ROOM", on_room_created=created_codes.append
+        )
+        # Give the host's own background thread a real moment to reach
+        # room_created before asserting on it - the host is otherwise
+        # still blocked waiting for a guest at this exact point.
+        deadline = time.perf_counter() + _JOIN_TIMEOUT_S
+        while not created_codes and time.perf_counter() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+
+        assert created_codes  # on_room_created fired with a real code
+        code = created_codes[0]
+        assert host.room_code == code
+
+        guest_thread = _start_connect_with_room_choice(
+            guest, test_server.uri, "bob", "password2", f"JOIN_ROOM:{code}"
+        )
+        host_thread.join(timeout=_JOIN_TIMEOUT_S)
+        guest_thread.join(timeout=_JOIN_TIMEOUT_S)
+
+        # Host=White, Guest=Black - see server/application/
+        # game_server.py's own "STAGE F4" docstring section.
+        assert host.assigned_color is Color.WHITE
+        assert guest.assigned_color is Color.BLACK
+        assert host.is_viewer is False
+        assert guest.is_viewer is False
+        assert guest.rejection_reason is None
+    finally:
+        host.close()
+        guest.close()
+        test_server.stop()
+
+
+def test_a_third_join_room_on_a_full_room_becomes_a_viewer_not_a_rejection():
+    test_server = _BackgroundTestServer()
+    host = NetworkGameClient()
+    guest = NetworkGameClient()
+    viewer = NetworkGameClient()
+    created_codes: list[str] = []
+    try:
+        host_thread = _start_connect_with_room_choice(
+            host, test_server.uri, "alice", "password1", "CREATE_ROOM", on_room_created=created_codes.append
+        )
+        deadline = time.perf_counter() + _JOIN_TIMEOUT_S
+        while not created_codes and time.perf_counter() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+        code = created_codes[0]
+
+        guest_thread = _start_connect_with_room_choice(
+            guest, test_server.uri, "bob", "password2", f"JOIN_ROOM:{code}"
+        )
+        host_thread.join(timeout=_JOIN_TIMEOUT_S)
+        guest_thread.join(timeout=_JOIN_TIMEOUT_S)
+
+        # A THIRD connection, joining the now-full room - a real
+        # success (viewer), never a rejection (see _JoinResponse's own
+        # docstring for why `assigned_color is None` alone can never
+        # tell the two apart).
+        viewer.connect(test_server.uri, "carol", "password3", room_choice=f"JOIN_ROOM:{code}")
+
+        assert viewer.is_viewer is True
+        assert viewer.assigned_color is None
+        assert viewer.rejection_reason is None
+    finally:
+        host.close()
+        guest.close()
+        viewer.close()
+        test_server.stop()
+
+
+def test_join_room_on_an_unknown_code_is_a_real_rejection_not_a_viewer():
+    test_server = _BackgroundTestServer()
+    client = NetworkGameClient()
+    try:
+        client.connect(test_server.uri, "alice", "password1", room_choice="JOIN_ROOM:NOPE00")
+
+        assert client.rejection_reason == "room_not_found"
+        assert client.is_viewer is False
+        assert client.assigned_color is None
+    finally:
+        client.close()
+        test_server.stop()

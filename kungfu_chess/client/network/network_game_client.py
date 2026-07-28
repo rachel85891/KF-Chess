@@ -178,6 +178,53 @@ line the moment this callback fires, rather than only knowing
 afterward that time passed) - see kungfu_chess.client.loop.
 network_game_loop_runner.NetworkGameLoopRunner's own docstring for how
 this is threaded one level further up.
+
+STAGE F7 - THE CLIENT FINALLY SENDS THE ROOM CHOICE STAGE F3/F4 ALWAYS
+EXPECTED (feature/rooms-f7-client-room-menu-and-viewer-mode):
+server/application/game_server.py's own handle_connection has read a
+second, post-AUTH message (PLAY/CREATE_ROOM/JOIN_ROOM:<code>) since
+Stage F4 - this class simply never sent it before now, because
+building that was always this stage's own job. `connect()` gains
+`room_choice: str = "PLAY"` - a defaulted, TRAILING parameter (never
+inserted earlier in the signature) specifically so every existing
+caller's own unmodified call site keeps producing its exact same, real,
+already-tested behavior (unconditional matchmaking) automatically, with
+zero edits required anywhere those call sites live.
+
+THE JOIN LOOP NOW ALSO KEEPS READING PAST TWO NEW, NON-FINAL MESSAGE
+SHAPES: "room_created:<code>" (CREATE_ROOM's own host is not yet
+matched with a guest - this is purely informational, mirroring
+"searching_for_opponent"'s own identical "keep looping, call the
+optional callback" shape, via the new `on_room_created` parameter) and
+bare "room_joined:guest" (also informational only - the real final
+outcome, `assigned_color`, follows immediately after on the wire,
+exactly like the pre-existing matchmaking sequence already works, so
+this needs no callback of its own at all). Every OTHER message
+(including the two genuinely NEW terminal shapes, "room_joined:viewer"
+and "room_not_found") still ends the loop and is handed to
+_parse_join_response completely unchanged in structure.
+
+self.is_viewer/self.room_code MIRROR self.rating/self.rejection_reason's
+OWN "connect() populates it, a caller reads it after the fact" SHAPE
+EXACTLY - see _JoinResponse's own docstring for the one genuinely new
+subtlety this stage introduces: `assigned_color is None` can now mean
+EITHER "rejected" OR "successfully joined as a viewer" - never both,
+but a caller MUST check `self.is_viewer` before assuming the former
+(see kungfu_chess.client.loop.network_game_loop_runner.
+NetworkGameLoopRunner's own "STAGE F7" docstring section for the exact,
+critical fix this distinction required there).
+
+A VIEWER'S OWN BOARD-TEXT MESSAGE NEEDS NO SPECIAL HANDLING HERE AT
+ALL: sent by the server immediately after "room_joined:viewer" (Stage
+F5), it flows into `_receive_loop`/`poll_incoming()` exactly like a
+real player's own post-assigned_color board text already does today -
+re-verified directly against this class's own existing control flow
+before writing this: `_do_connect` only ever reads messages itself
+UNTIL the one, final first-stage outcome arrives, then immediately
+hands off to `_receive_loop` as a background task - neither method
+inspects the CONTENT of anything that arrives afterward, so a viewer's
+board text is already, correctly, just another item in `poll_incoming`'s
+own stream, with no code change needed to make that true.
 """
 
 from __future__ import annotations
@@ -210,6 +257,13 @@ _REJECTION_PREFIX = "rejected:"
 _SEARCHING_FOR_OPPONENT_MESSAGE = "searching_for_opponent"
 _MATCHMAKING_TIMEOUT_PREFIX = "matchmaking_timeout:"
 _MATCHMAKING_TIMEOUT_REASON = "matchmaking_timeout"
+# Stage F7 - the client-side half of Stages F3-F5's own room-choice wire
+# vocabulary, duplicated here for the identical "a client must never
+# import from server/" reason as every constant above it.
+_ROOM_CREATED_PREFIX = "room_created:"
+_ROOM_JOINED_GUEST_MESSAGE = "room_joined:guest"
+_ROOM_JOINED_VIEWER_MESSAGE = "room_joined:viewer"
+_ROOM_NOT_FOUND_MESSAGE = "room_not_found"
 
 _THREAD_START_TIMEOUT_S = 5.0
 _CLOSE_TIMEOUT_S = 5.0
@@ -234,38 +288,66 @@ class _JoinResponse:
     _parse_join_response's own docstring. Exactly one of
     (color and rating) or rejection_reason is populated, never both -
     color/rating are None on rejection, rejection_reason is None on
-    success."""
+    success.
+
+    STAGE F7 - `color is None` NOW HAS TWO POSSIBLE MEANINGS, NEVER
+    BOTH AT ONCE: a real rejection (`rejection_reason` set, `is_viewer`
+    False), OR a successful JOIN_ROOM as a viewer (`is_viewer` True,
+    `rejection_reason` None - a viewer is never assigned a Color at
+    all, per server/application/game_server.py's own Stage F5 design).
+    A caller MUST check `is_viewer` before assuming `color is None`
+    means rejected - see NetworkGameLoopRunner's own "STAGE F7" docstring
+    section for the exact fix this distinction requires there."""
 
     color: Optional[Color]
     rating: Optional[int]
     rejection_reason: Optional[str]
+    is_viewer: bool = False
 
 
 def _parse_join_response(message: str) -> _JoinResponse:
     """Parse the server's FINAL first-stage message (after any
-    "searching_for_opponent" messages have already been drained by
-    _do_connect's own loop - see module docstring's "STAGE E1" section)
-    into a _JoinResponse.
+    "searching_for_opponent"/"room_created:<code>"/"room_joined:guest"
+    messages have already been drained by _do_connect's own loop - see
+    module docstring's "STAGE E1"/"STAGE F7" sections) into a
+    _JoinResponse.
 
     Args:
         message: The raw message from the server - expected to be
             "assigned_color:<color>:<rating>", "server_full",
-            "matchmaking_timeout:<detail>", or "rejected:<reason>" (see
+            "matchmaking_timeout:<detail>", "rejected:<reason>",
+            "room_not_found", or "room_joined:viewer" (see
             server/application/game_server.py's own handle_connection,
             re-checked directly for these exact literal shapes before
             writing this).
 
     Returns:
-        A _JoinResponse - success (color+rating) or rejection
-        (rejection_reason), never both.
+        A _JoinResponse - success (color+rating, or is_viewer=True) or
+        rejection (rejection_reason) - see _JoinResponse's own docstring
+        for why `color is None` alone is never enough to tell those two
+        apart.
 
     Raises:
         UnexpectedJoinResponseError: If `message` matches none of the
-            four documented forms.
+            six documented forms.
     """
 
     if message == _SERVER_FULL_MESSAGE:
         return _JoinResponse(color=None, rating=None, rejection_reason=_SERVER_FULL_MESSAGE)
+
+    if message == _ROOM_NOT_FOUND_MESSAGE:
+        # Stage F7 - mirrors _SERVER_FULL_MESSAGE's own exact bare-
+        # literal handling shape (server/application/game_server.py's
+        # own room_not_found is sent for both an unknown JOIN_ROOM code
+        # and a room whose host already vanished - see that class's own
+        # "STAGE F4"/"STAGE F5" docstring sections).
+        return _JoinResponse(color=None, rating=None, rejection_reason=_ROOM_NOT_FOUND_MESSAGE)
+
+    if message == _ROOM_JOINED_VIEWER_MESSAGE:
+        # Stage F7 - THIS IS A SUCCESS, NOT A REJECTION (see
+        # _JoinResponse's own docstring for why this distinction is
+        # load-bearing): a viewer is simply never assigned a Color.
+        return _JoinResponse(color=None, rating=None, rejection_reason=None, is_viewer=True)
 
     if message.startswith(_MATCHMAKING_TIMEOUT_PREFIX):
         return _JoinResponse(color=None, rating=None, rejection_reason=_MATCHMAKING_TIMEOUT_REASON)
@@ -313,6 +395,18 @@ class NetworkGameClient:
         # (on success) or the real reason a connection was rejected.
         self.rating: Optional[int] = None
         self.rejection_reason: Optional[str] = None
+        # Stage F7 - mirrors self.rating/self.rejection_reason's own
+        # "populated by connect(), read after the fact" shape exactly.
+        # self.is_viewer is True only on a successful JOIN_ROOM that
+        # assigned the VIEWER role (see _JoinResponse's own docstring for
+        # why `assigned_color is None` alone can never distinguish this
+        # from a real rejection). self.room_code is set only when THIS
+        # connection's own choice was CREATE_ROOM and the server actually
+        # confirmed a real code - useful beyond the one-shot
+        # on_room_created callback (e.g. a GUI redisplaying the code
+        # later).
+        self.is_viewer: bool = False
+        self.room_code: Optional[str] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -325,14 +419,16 @@ class NetworkGameClient:
         username: str,
         password: str,
         on_searching_for_opponent: Optional[Callable[[], None]] = None,
+        room_choice: str = "PLAY",
+        on_room_created: Optional[Callable[[str], None]] = None,
     ) -> Optional[Color]:
         """Start this client's background thread + event loop, open a
         real WebSocket connection to `uri`, send the real AUTH command
-        (Stage D2), and wait for the real matchmaking outcome (Stage
-        E1 - a match, or a timeout) - see module docstring's "WHY THE
-        FIRST MESSAGE... IS HANDLED SEPARATELY" and "STAGE E1" sections
-        for why this method blocks the calling thread for exactly this
-        much (now potentially much longer than before Stage E1), and no
+        (Stage D2), then the real room choice (Stage F7), and wait for
+        the real join outcome (a match, a completed room, or a timeout)
+        - see module docstring's "WHY THE FIRST MESSAGE... IS HANDLED
+        SEPARATELY", "STAGE E1", and "STAGE F7" sections for why this
+        method blocks the calling thread for exactly this much, and no
         more.
 
         Args:
@@ -351,13 +447,33 @@ class NetworkGameClient:
                 callback) - purely for a caller that wants real-time
                 feedback during a potentially long wait; never required
                 for correctness.
+            room_choice: The exact wire text to send right after AUTH -
+                one of "PLAY", "CREATE_ROOM", or "JOIN_ROOM:<code>" (see
+                server/presentation/room_choice_command.py's own real
+                grammar). The CALLER is responsible for formatting
+                "JOIN_ROOM:<code>" itself - this class stays as "dumb"
+                about room semantics as it already is about move
+                semantics (see module docstring's "WHAT THIS CLASS
+                DELIBERATELY DOES NOT DO" section for the identical
+                precedent). Defaults to "PLAY" - see module docstring's
+                "STAGE F7" section for why this default keeps every
+                pre-existing caller's own real, tested behavior
+                unchanged.
+            on_room_created: Called with the real room code the moment
+                this connection receives "room_created:<code>" (only
+                possible if `room_choice` was "CREATE_ROOM") - mirrors
+                `on_searching_for_opponent`'s own shape exactly. Defaults
+                to None.
 
         Returns:
             The Color this connection was assigned (also stored as
             self.assigned_color), or None if the server rejected this
-            connection or it timed out waiting for a match (self.
-            rejection_reason distinguishes "server_full",
-            "wrong_password", and "matchmaking_timeout" - see module
+            connection, it timed out waiting for a match, or it joined
+            a room as a VIEWER (self.is_viewer distinguishes this last,
+            successful case from a real rejection - see _JoinResponse's
+            own docstring; self.rejection_reason distinguishes
+            "server_full", "wrong_password", "matchmaking_timeout", and
+            "room_not_found" for the rejected cases - see module
             docstring).
 
         Raises:
@@ -367,7 +483,8 @@ class NetworkGameClient:
         self._start_background_loop()
 
         future = asyncio.run_coroutine_threadsafe(
-            self._do_connect(uri, username, password, on_searching_for_opponent), self._loop
+            self._do_connect(uri, username, password, on_searching_for_opponent, room_choice, on_room_created),
+            self._loop,
         )
         self.assigned_color = future.result()
         return self.assigned_color
@@ -397,37 +514,50 @@ class NetworkGameClient:
             raise NetworkGameClientError("background event loop failed to start in time")
 
     async def _do_connect(
-        self, uri: str, username: str, password: str, on_searching_for_opponent: Optional[Callable[[], None]]
+        self,
+        uri: str,
+        username: str,
+        password: str,
+        on_searching_for_opponent: Optional[Callable[[], None]],
+        room_choice: str,
+        on_room_created: Optional[Callable[[str], None]],
     ) -> Optional[Color]:
         """Runs ON the background loop's own thread (scheduled via
         run_coroutine_threadsafe by connect(), above): open the real
         connection, send the real AUTH command (Stage D2 - this
         connection's own very first message, before anything is ever
-        read back), then loop reading messages until the REAL,
-        FINAL first-stage outcome arrives (Stage E1 - see module
-        docstring's "STAGE E1" section for why this is now a loop, not
-        a single read), and start the long-running receive loop as a
-        plain task on this SAME loop (safe here - unlike send_move,
-        this runs already inside the loop's own thread, so a bare
-        asyncio task is the correct, simpler primitive;
-        run_coroutine_threadsafe is only needed to get INTO this thread
-        from another one in the first place).
+        read back), then the real room choice (Stage F7 - this
+        connection's own SECOND message, exactly matching
+        server/application/game_server.py's own handle_connection, which
+        reads a room choice right after AUTH), then loop reading
+        messages until the REAL, FINAL first-stage outcome arrives
+        (Stage E1/F7 - see module docstring's "STAGE E1"/"STAGE F7"
+        sections for why this is a loop, not a single read), and start
+        the long-running receive loop as a plain task on this SAME loop
+        (safe here - unlike send_move, this runs already inside the
+        loop's own thread, so a bare asyncio task is the correct,
+        simpler primitive; run_coroutine_threadsafe is only needed to
+        get INTO this thread from another one in the first place).
 
         Args:
             uri: The WebSocket URI to connect to.
             username: See connect().
             password: See connect().
             on_searching_for_opponent: See connect().
+            room_choice: See connect().
+            on_room_created: See connect().
 
         Returns:
             The parsed join response's own color (see
-            _parse_join_response) - self.rating/self.rejection_reason
-            are set as a side effect before returning, mirroring how
-            self.assigned_color is set by connect() itself, one level up.
+            _parse_join_response) - self.rating/self.rejection_reason/
+            self.is_viewer are set as a side effect before returning,
+            mirroring how self.assigned_color is set by connect() itself,
+            one level up.
         """
 
         self._connection = await websockets.connect(uri)
         await self._connection.send(format_auth_command(username, password))
+        await self._connection.send(room_choice)
 
         while True:
             message = await self._connection.recv()
@@ -435,11 +565,23 @@ class NetworkGameClient:
                 if on_searching_for_opponent is not None:
                     on_searching_for_opponent()
                 continue
+            if message.startswith(_ROOM_CREATED_PREFIX):
+                self.room_code = message[len(_ROOM_CREATED_PREFIX) :]
+                if on_room_created is not None:
+                    on_room_created(self.room_code)
+                continue
+            if message == _ROOM_JOINED_GUEST_MESSAGE:
+                # Informational only - the real final outcome
+                # (assigned_color) follows immediately after this on the
+                # wire, exactly like the pre-existing matchmaking
+                # sequence already works.
+                continue
             break
 
         asyncio.get_running_loop().create_task(self._receive_loop())
 
         parsed = _parse_join_response(message)
+        self.is_viewer = parsed.is_viewer
         self.rating = parsed.rating
         self.rejection_reason = parsed.rejection_reason
         return parsed.color
