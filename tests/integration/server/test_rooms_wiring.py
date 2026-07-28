@@ -330,3 +330,101 @@ def test_play_still_matchmakes_two_play_clients_exactly_as_before_non_regression
             await client2.close()
 
     asyncio.run(scenario())
+
+
+async def _drain_one_real_event(connections: list) -> list:
+    """Drain exactly one real game event's own full 3-message shape
+    (wire event, board text, state snapshot - see
+    server/application/game_server.py's own _broadcast_event docstring)
+    from every connection in `connections`, in lockstep, returning each
+    connection's own board-text message (the 2nd of the 3) - the one
+    piece every caller below actually wants to compare across every
+    connection. Stage F6 - the whole point of this helper is that it
+    takes an arbitrary NUMBER of connections, never assuming exactly 2."""
+
+    boards = []
+    for connection in connections:
+        await asyncio.wait_for(connection.recv(), timeout=_RECV_TIMEOUT_S)  # wire event
+        boards.append(await asyncio.wait_for(connection.recv(), timeout=_RECV_TIMEOUT_S))  # board text
+        await asyncio.wait_for(connection.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+    return boards
+
+
+def test_two_players_and_three_viewers_all_five_connections_receive_every_broadcast_identically():
+    # Stage F6's own definitive multi-viewer correctness test, deferred
+    # by Stage F5 - see server/application/game_server.py's own
+    # "STAGE F6" docstring section: 2 real players + 3 viewers = 5
+    # connections, all treated identically by _broadcast_event's own
+    # fan-out (already fixed in Stage F5) - re-verified here at N=3
+    # viewers specifically, not just Stage F5's own N=1 case.
+    async def scenario():
+        async with _running_game_server() as (uri, _game_server):
+            host = await websockets.connect(uri)
+            await host.send(format_auth_command("alice", "correct horse battery staple"))
+            await host.send("CREATE_ROOM")
+            room_created = await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
+            code = room_created.split(":", 1)[1]
+
+            guest = await websockets.connect(uri)
+            await guest.send(format_auth_command("bob", "another real password"))
+            await guest.send(f"JOIN_ROOM:{code}")
+            assert await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S) == "room_joined:guest"
+
+            host_welcome = await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
+            await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)  # host board
+            await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)  # guest assigned_color
+            await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)  # guest board
+            host_color, _host_rating = _parse_assigned_color_and_rating(host_welcome)
+            assert host_color == "white"
+
+            viewers = []
+            for name, password in (
+                ("carol", "yet another password"),
+                ("dave", "still another password"),
+                ("erin", "one more password"),
+            ):
+                viewer = await websockets.connect(uri)
+                await viewer.send(format_auth_command(name, password))
+                await viewer.send(f"JOIN_ROOM:{code}")
+                assert await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S) == "room_joined:viewer"
+                await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)  # initial board
+                viewers.append(viewer)
+            viewer1, viewer2, viewer3 = viewers
+
+            all_five = [host, guest, viewer1, viewer2, viewer3]
+
+            # A real move, from the real White (host) client - MoveAccepted
+            # then PieceArrived, each its own full 3-message broadcast.
+            await host.send("WPe2e4")
+            move_boards = await _drain_one_real_event(all_five)
+            arrival_boards = await _drain_one_real_event(all_five)
+
+            # ALL FIVE connections received the identical wire text, at
+            # both stages of the broadcast - not just "each got
+            # something," the exact same content, host/guest/viewers alike.
+            assert len(set(move_boards)) == 1
+            assert len(set(arrival_boards)) == 1
+            assert move_boards[0] != arrival_boards[0]  # the board genuinely advanced
+
+            # One of the three viewers disconnects.
+            await viewer2.close()
+            await asyncio.sleep(_REACTION_DELAY_S)
+
+            # A second real move (Black, from the guest) - the three
+            # REMAINING connections must still receive it identically;
+            # viewer2's own departure must not disturb anyone else's feed.
+            await guest.send("BPe7e5")
+            remaining = [host, guest, viewer1, viewer3]
+            second_move_boards = await _drain_one_real_event(remaining)
+            second_arrival_boards = await _drain_one_real_event(remaining)
+
+            assert len(set(second_move_boards)) == 1
+            assert len(set(second_arrival_boards)) == 1
+            assert second_arrival_boards[0] != arrival_boards[0]  # advanced again
+
+            await host.close()
+            await guest.close()
+            await viewer1.close()
+            await viewer3.close()
+
+    asyncio.run(scenario())

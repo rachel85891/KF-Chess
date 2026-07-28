@@ -818,6 +818,67 @@ all - only removes itself from `match.viewer_connections` - the two
 real players are entirely unaffected either way, and that mechanism
 exists to protect an actual PLAYER's own match outcome, not to track
 who is merely watching.
+
+STAGE F6 - BROADCAST-CORRECTNESS AUDIT FOR A VARIABLE NUMBER OF VIEWERS
+(feature/rooms-f6-broadcast-audit): Stage F5 already made the ONE
+change actually required for its own narrow "2 players + 1 viewer"
+acceptance test to pass (`_broadcast_event`'s own `connections` tuple
+gained `+ tuple(match.viewer_connections)`) and explicitly deferred two
+things to this stage: a real audit of every OTHER place in this file
+that sends to more than one connection at once, and the broader
+"2 players + 3 viewers = 5 connections, all treated identically"
+correctness test. This stage performed both - re-running
+the same grep used to scope this task (matching "for connection",
+"connections:", "connections =", and "self._protocol.broadcast")
+against server/application/game_server.py directly (plus a second
+pass for `match.colors`-adjacent iteration the first grep's own literal
+wording could miss, e.g. `for c in match.colors`) and reading every
+result, not merely accepting Stage F5's own prior conclusion on faith.
+THE AUDIT ITSELF - every location found, and why each is correct
+exactly as it stands today:
+  - `_broadcast_event`'s own `connections` tuple (`tuple(match.colors.
+    keys()) + tuple(match.viewer_connections)`) - the ONE genuine "send
+    to every connection currently in this match" loop in the entire
+    file - already fixed in Stage F5, RE-VERIFIED HERE at N=3 viewers
+    (5 total connections), not just Stage F5's own N=1 case (see this
+    stage's own new `test_two_players_and_three_viewers_all_five_
+    connections_receive_every_broadcast_identically`, tests/
+    integration/server/test_rooms_wiring.py) - no further change
+    needed.
+  - `_handle_active_match_disconnect`'s and `_resume_if_pending_
+    disconnect`'s own `opponents = tuple(c for c in match.colors if c
+    is not connection)` - CORRECTLY scoped to `match.colors` (real
+    players) ONLY, deliberately excluding viewers: "opponent_
+    disconnected"/"opponent_reconnected" are Stage E2's own real-
+    player-only disconnect-countdown mechanism - a viewer has no
+    personal stake in a PLAYER's own countdown (it is not "their"
+    opponent in any sense this mechanism means), and Stage F5/F6
+    neither extended nor were asked to extend that mechanism to
+    viewers. Not a bug; not touched.
+  - `_apply_and_notify_rating_update`'s own `for connection, color in
+    match.colors.items():` - CORRECTLY scoped to `match.colors` ONLY: a
+    viewer has no rating in this match at all (ratings belong to the
+    two real players who actually played it) - there is nothing to
+    notify a viewer of here, by definition, not by oversight.
+  - The tick loop (`run_tick_loop`'s own `for match in list(self.
+    _matches.values()): match.session.wait(delta_ms)`) - never
+    references any connection at all; it advances `GameSession` state
+    only, entirely unaffected by however many viewers (or players) are
+    currently watching. Nothing to fix.
+  - `ProtocolHandler.broadcast` (server/presentation/protocol_
+    handler.py) - independently re-verified: takes a plain `Iterable[
+    ServerConnection]` and loops over it (`for connection in
+    connections: await self.send(connection, text)`) with zero
+    hardcoded count assumption anywhere in its own body - already
+    correctly N-agnostic, confirmed directly rather than assumed from
+    its own docstring's claim.
+CONCLUSION: no production code in this file needed to change beyond
+this docstring section itself - Stage F5's own single, minimal
+`_broadcast_event` fix was already complete and correct for any N, not
+merely N=1. This stage's own real, required deliverable is exactly this
+audit-and-document work, plus the new N=3 test proving it, per this
+stage's own explicit task framing ("more important here than any new
+code").
 """
 
 from __future__ import annotations
