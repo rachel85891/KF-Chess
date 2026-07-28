@@ -107,6 +107,19 @@ async def _running_game_server(session: GameSession):
             await tick_task
         except asyncio.CancelledError:
             pass
+        # A brief, real moment for every just-disconnected connection's
+        # own handle_connection coroutine to actually reach
+        # _handle_active_match_disconnect and register its own pending
+        # countdown (a genuine scheduling race when two clients close
+        # back-to-back - re-verified directly) - mirrors this project's
+        # own established _REACTION_DELAY_S convention.
+        await asyncio.sleep(0.2)
+        # See server/application/game_server.py's own "STAGE - SERVER
+        # SHUTDOWN HANGS ON A PENDING DISCONNECT COUNTDOWN" docstring
+        # section: resolves any pending disconnect countdown BEFORE
+        # close()/wait_closed(), below, so a test ending with both
+        # players of an active match disconnected doesn't hang here.
+        await game_server.shutdown()
         server.close()
         await server.wait_closed()
 
@@ -120,6 +133,10 @@ async def _authenticate_and_drain_join(client, username: str, password: str) -> 
     opponent."""
 
     await client.send(format_auth_command(username, password))
+    # Stage F4 - a real client now chooses a mode after AUTH; "PLAY"
+    # reproduces this file's own pre-F4 behavior (unconditional
+    # matchmaking) exactly.
+    await client.send("PLAY")
     searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
     assert searching == "searching_for_opponent"
     welcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)

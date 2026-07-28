@@ -65,6 +65,10 @@ def _single_piece_session() -> GameSession:
 
 async def _auth_and_drain(client, username: str, password: str) -> None:
     await client.send(f"AUTH:{username}:{password}")
+    # Stage F4 - a real client now chooses a mode after AUTH; "PLAY"
+    # reproduces this file's own pre-F4 behavior (unconditional
+    # matchmaking) exactly.
+    await client.send("PLAY")
     await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)  # searching_for_opponent
     await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)  # assigned_color
     await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)  # board state

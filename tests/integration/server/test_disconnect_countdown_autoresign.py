@@ -75,32 +75,25 @@ async def _running_game_server(disconnect_countdown_s: float = 20.0):
         except asyncio.CancelledError:
             pass
 
-        # A scenario that deliberately never lets a real disconnect
-        # countdown resolve (e.g. proving the game isn't over yet,
-        # without waiting the full window out), or that closes a
-        # connection right at the very end of its own scenario body
-        # (its own handle_connection coroutine may not have even
-        # reached _handle_active_match_disconnect yet - a genuine
-        # scheduling race, not something a single "resolve every
-        # currently-pending future" pass before close() can reliably
-        # catch), would otherwise leave that connection's own
-        # handle_connection coroutine parked forever at `await
-        # resolution` (see GameServer's own _handle_active_match_
-        # disconnect docstring) - websockets' own Server.wait_closed()
-        # waits for every such in-flight handler task to actually
-        # finish, not just for sockets to close, so it could hang here
-        # forever. The real production server (server/main.py) never
-        # calls wait_closed() at all (it runs serve_forever() until the
-        # process itself is killed) - this is a test-teardown-only
-        # concern, fixed by bounding the wait: a lingering handler task
-        # left over from a scenario that intentionally never resolved
-        # its own countdown is harmless to abandon once the test itself
-        # has already gotten everything it needs.
+        # A brief, real moment for every just-disconnected connection's
+        # own handle_connection coroutine to actually reach
+        # _handle_active_match_disconnect and register its own pending
+        # countdown (a genuine scheduling race when two clients close
+        # back-to-back - re-verified directly) - mirrors this project's
+        # own established _REACTION_DELAY_S convention.
+        await asyncio.sleep(0.2)
+        # See server/application/game_server.py's own "STAGE - SERVER
+        # SHUTDOWN HANGS ON A PENDING DISCONNECT COUNTDOWN" docstring
+        # section: resolves any pending disconnect countdown (including
+        # one a scenario deliberately never let resolve on its own, e.g.
+        # proving the game isn't over yet without waiting the full
+        # window out) BEFORE close()/wait_closed(), below - superseding
+        # this fixture's own earlier bounded-timeout-and-swallow
+        # workaround for the identical hang, from before that real fix
+        # existed.
+        await game_server.shutdown()
         server.close()
-        try:
-            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
-        except asyncio.TimeoutError:
-            pass
+        await server.wait_closed()
 
 
 def _parse_assigned_color_and_rating(message: str) -> tuple[str, int]:
@@ -118,6 +111,10 @@ async def _join_and_await_match(uri: str, username: str, password: str):
 
     client = await websockets.connect(uri)
     await client.send(format_auth_command(username, password))
+    # Stage F4 - a real client now chooses a mode after AUTH; "PLAY"
+    # reproduces this file's own pre-F4 behavior (unconditional
+    # matchmaking) exactly.
+    await client.send("PLAY")
     searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
     assert searching == SEARCHING_FOR_OPPONENT_MESSAGE
     welcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
@@ -247,6 +244,8 @@ def test_a_disconnect_while_merely_waiting_in_the_matchmaking_queue_is_completel
         async with _running_game_server(disconnect_countdown_s=_SHORT_COUNTDOWN_S) as (uri, game_server):
             client = await websockets.connect(uri)
             await client.send(format_auth_command("vanisher", "a real password"))
+            # Stage F4 - a real client now chooses a mode after AUTH.
+            await client.send("PLAY")
             searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
             assert searching == SEARCHING_FOR_OPPONENT_MESSAGE
 
@@ -268,6 +267,8 @@ def test_a_disconnect_while_merely_waiting_in_the_matchmaking_queue_is_completel
             # matchmaking-timeout mechanism, untouched.
             async with websockets.connect(uri) as client2:
                 await client2.send(format_auth_command("still_alive", "a real password"))
+                # Stage F4 - a real client now chooses a mode after AUTH.
+                await client2.send("PLAY")
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # searching
 
     asyncio.run(scenario())

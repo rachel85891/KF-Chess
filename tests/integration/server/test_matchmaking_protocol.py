@@ -63,6 +63,19 @@ async def _running_game_server(user_repository_db_path: str, matchmaking_timeout
             await tick_task
         except asyncio.CancelledError:
             pass
+        # A brief, real moment for every just-disconnected connection's
+        # own handle_connection coroutine to actually reach
+        # _handle_active_match_disconnect and register its own pending
+        # countdown (a genuine scheduling race when two clients close
+        # back-to-back - re-verified directly) - mirrors this project's
+        # own established _REACTION_DELAY_S convention.
+        await asyncio.sleep(0.2)
+        # See server/application/game_server.py's own "STAGE - SERVER
+        # SHUTDOWN HANGS ON A PENDING DISCONNECT COUNTDOWN" docstring
+        # section: resolves any pending disconnect countdown BEFORE
+        # close()/wait_closed(), below, so a test ending with both
+        # players of an active match disconnected doesn't hang here.
+        await game_server.shutdown()
         server.close()
         await server.wait_closed()
 
@@ -82,6 +95,10 @@ async def _join_and_await_outcome(uri: str, username: str, password: str):
 
     client = await websockets.connect(uri)
     await client.send(format_auth_command(username, password))
+    # Stage F4 - a real client now chooses a mode after AUTH; "PLAY"
+    # reproduces this file's own pre-F4 behavior (unconditional
+    # matchmaking) exactly.
+    await client.send("PLAY")
     searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
     assert searching == SEARCHING_FOR_OPPONENT_MESSAGE
     outcome = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
@@ -182,6 +199,8 @@ def test_a_lone_client_with_no_compatible_opponent_times_out_with_the_correct_me
         async with _running_game_server(":memory:", matchmaking_timeout_s=_SHORT_TIMEOUT_S) as (uri, _game_server):
             async with websockets.connect(uri) as client:
                 await client.send(format_auth_command("solo", "a real password"))
+                # Stage F4 - a real client now chooses a mode after AUTH.
+                await client.send("PLAY")
                 searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
                 assert searching == SEARCHING_FOR_OPPONENT_MESSAGE
 
@@ -200,6 +219,8 @@ def test_disconnecting_while_still_waiting_in_queue_leaves_no_stale_entry_behind
         async with _running_game_server(":memory:", matchmaking_timeout_s=_SHORT_TIMEOUT_S) as (uri, game_server):
             client = await websockets.connect(uri)
             await client.send(format_auth_command("vanisher", "a real password"))
+            # Stage F4 - a real client now chooses a mode after AUTH.
+            await client.send("PLAY")
             searching = await asyncio.wait_for(client.recv(), timeout=_RECV_TIMEOUT_S)
             assert searching == SEARCHING_FOR_OPPONENT_MESSAGE
 
@@ -218,6 +239,8 @@ def test_disconnecting_while_still_waiting_in_queue_leaves_no_stale_entry_behind
             # entry did not corrupt the queue.
             async with websockets.connect(uri) as client2:
                 await client2.send(format_auth_command("still_alive", "a real password"))
+                # Stage F4 - a real client now chooses a mode after AUTH.
+                await client2.send("PLAY")
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)  # searching
                 timeout_message = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 assert timeout_message.startswith("matchmaking_timeout:")
