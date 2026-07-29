@@ -58,7 +58,7 @@ from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.notation.auth_command_format import format_auth_command
 from server.application.game_server import GameServer
-from server.persistence.user_repository import DEFAULT_STARTING_RATING, UserRepository
+from server.persistence.user_repository import DEFAULT_STARTING_RATING, SqliteUserRepository
 from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE
 
 # Marked slow: this file constructs a real, background-threaded/tasked
@@ -179,7 +179,7 @@ def test_existing_username_with_correct_password_logs_in_and_returns_the_real_st
         # fresh, default-rated dummy would NOT be within 100 points of
         # 1450 and would never match.
         db_path = str(tmp_path / "auth_protocol_test.db")
-        seed_repo = UserRepository(db_path=db_path)
+        seed_repo = SqliteUserRepository(db_path=db_path)
         seed_repo.create_account("alice", "correct horse battery staple")
         seed_repo.update_rating("alice", 1450)  # a distinguishable, non-default rating
         seed_repo.create_account("alice_opponent", "opponent password")

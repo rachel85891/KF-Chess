@@ -15,11 +15,11 @@ import sqlite3
 
 import pytest
 
-from server.persistence.user_repository import DEFAULT_STARTING_RATING, UserNotFoundError, UserRepository
+from server.persistence.user_repository import DEFAULT_STARTING_RATING, SqliteUserRepository, UserNotFoundError
 
 
-def _repo() -> UserRepository:
-    return UserRepository(db_path=":memory:")
+def _repo() -> SqliteUserRepository:
+    return SqliteUserRepository(db_path=":memory:")
 
 
 def test_create_account_succeeds_for_a_new_username_with_the_default_starting_rating():
@@ -149,12 +149,12 @@ def test_a_real_file_backed_database_path_also_works(tmp_path):
     # test still never touches any REAL, persistent project file.
     db_path = str(tmp_path / "kf_chess_users_test.db")
 
-    repo = UserRepository(db_path=db_path)
+    repo = SqliteUserRepository(db_path=db_path)
     repo.create_account("alice", "correct horse battery staple")
 
     # A second, independent connection to the SAME real file sees the
     # same, real, committed data - proving this isn't just an in-memory
     # illusion.
-    repo_reopened = UserRepository(db_path=db_path)
+    repo_reopened = SqliteUserRepository(db_path=db_path)
     assert repo_reopened.verify_login("alice", "correct horse battery staple") is True
     assert repo_reopened.get_rating("alice") == DEFAULT_STARTING_RATING

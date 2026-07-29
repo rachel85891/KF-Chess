@@ -34,7 +34,7 @@ from websockets.exceptions import ConnectionClosed
 
 from kungfu_chess.notation.auth_command_format import format_auth_command
 from server.application.game_server import GameServer
-from server.persistence.user_repository import DEFAULT_STARTING_RATING, UserRepository
+from server.persistence.user_repository import DEFAULT_STARTING_RATING, SqliteUserRepository
 from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE
 
 # Marked slow: this file constructs a real, background-threaded/tasked
@@ -169,7 +169,7 @@ def test_two_far_rating_clients_do_not_match_each_other_and_both_time_out(tmp_pa
         # CONSTRUCTION" docstring section for why a shared connection
         # OBJECT could never be used here instead).
         db_path = str(tmp_path / "matchmaking_far_ratings_test.db")
-        seed_repo = UserRepository(db_path=db_path)
+        seed_repo = SqliteUserRepository(db_path=db_path)
         seed_repo.create_account("grandmaster", "correct horse battery staple")
         seed_repo.update_rating("grandmaster", 2000)  # 800 points from a fresh 1200 account
 

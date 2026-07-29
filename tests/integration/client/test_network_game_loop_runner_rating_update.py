@@ -57,7 +57,7 @@ from kungfu_chess.model.position import Position
 from server.application.elo_rating import compute_new_ratings
 from server.application.game_server import GameServer
 from server.application.game_session import GameSession
-from server.persistence.user_repository import UserRepository
+from server.persistence.user_repository import SqliteUserRepository
 
 # Marked slow: this file constructs a real, background-threaded/tasked
 # server and relies on real wall-clock waiting (asyncio.sleep/time.sleep,
@@ -157,7 +157,7 @@ def _poll_until(runner: NetworkGameLoopRunner, predicate, timeout_s: float) -> N
 
 def test_a_real_king_capture_computes_and_persists_a_real_elo_update_and_the_client_displays_it(tmp_path):
     db_path = str(tmp_path / "rating_update_test.db")
-    seed_repo = UserRepository(db_path=db_path)
+    seed_repo = SqliteUserRepository(db_path=db_path)
     seed_repo.create_account("alice", "correct horse battery staple")
     seed_repo.update_rating("alice", _ALICE_STARTING_RATING)
     seed_repo.create_account("bob", "another real password")
@@ -213,7 +213,7 @@ def test_a_real_king_capture_computes_and_persists_a_real_elo_update_and_the_cli
         # runner is always logged in as "alice", the raw opponent
         # always as "bob" (fixed usernames above), so this is unambiguous
         # regardless of which of the two actually ended up White.
-        verify_repo = UserRepository(db_path=db_path)
+        verify_repo = SqliteUserRepository(db_path=db_path)
         assert verify_repo.get_rating("alice") == runner_expected_new
         assert verify_repo.get_rating("bob") == opponent_expected_new
     finally:

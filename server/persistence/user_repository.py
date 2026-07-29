@@ -208,11 +208,15 @@ def _hash_password(password: str, salt: bytes) -> str:
     return derived_key.hex()
 
 
-class UserRepository:
+class SqliteUserRepository:
     """A standalone, server-side user store - see module docstring for
     the full reasoning behind every decision below. Zero networking,
     zero GameSession/GameServer/protocol knowledge - a pure SQLite-
-    backed persistence class."""
+    backed persistence class.
+
+    This is the composition root's own concrete choice, wired directly
+    into server/application/game_server.py's `_authenticate_sync` - see
+    that method for the only real construction site of this class."""
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
         """Open (creating if necessary) the real SQLite database at
