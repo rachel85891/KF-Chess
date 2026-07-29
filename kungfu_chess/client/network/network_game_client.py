@@ -413,6 +413,19 @@ class NetworkGameClient:
         self._connection: Optional[ClientConnection] = None
         self._incoming: "queue.Queue[str]" = queue.Queue()
 
+        # Stage G1 - the exact arguments the most recent connect() call
+        # used, so a later reconnect attempt (_attempt_reconnect) can
+        # replay them identically - see module docstring's "STAGE G1"
+        # section. Populated once, in _do_connect itself (the single
+        # place both the original connect() and every later reconnect
+        # attempt funnel through), never duplicated here.
+        self._reconnect_uri: Optional[str] = None
+        self._reconnect_username: Optional[str] = None
+        self._reconnect_password: Optional[str] = None
+        self._reconnect_room_choice: Optional[str] = None
+        self._reconnect_on_searching_for_opponent: Optional[Callable[[], None]] = None
+        self._reconnect_on_room_created: Optional[Callable[[str], None]] = None
+
     def connect(
         self,
         uri: str,
@@ -554,6 +567,21 @@ class NetworkGameClient:
             mirroring how self.assigned_color is set by connect() itself,
             one level up.
         """
+
+        # Stage G1 - remember the exact arguments this call used, so a
+        # later reconnect attempt can replay them identically (see
+        # module docstring's "STAGE G1" section and __init__'s own
+        # "STAGE G1" comment) - stored here rather than in connect()
+        # itself so a reconnect attempt (which calls THIS method
+        # directly, reusing it as its own retry body, never connect())
+        # keeps this state correctly up to date too, with no duplicate
+        # storage logic anywhere else.
+        self._reconnect_uri = uri
+        self._reconnect_username = username
+        self._reconnect_password = password
+        self._reconnect_room_choice = room_choice
+        self._reconnect_on_searching_for_opponent = on_searching_for_opponent
+        self._reconnect_on_room_created = on_room_created
 
         # Stage G2 - the client side of the same explicit decision made
         # in server/main.py's run_server: pins `permessage-deflate`
