@@ -9,26 +9,58 @@ come here for the task list. Stage letters continue this project's own
 existing convention (Stages B1→E2 already exist in the codebase; Stage F,
 Rooms, is already planned separately) — this plan uses **G onward**.
 
+> **Updated for the external design review** (PostgreSQL instead of
+> Cassandra/ScyllaDB; NATS + Redis, decided together rather than left as an
+> either/or; a full nine-service split — API Gateway, WebSocket Gateway,
+> Auth Service, Rooms API, Matchmaker, Game Allocator, Match-Host/Game
+> Server Shard, Rating Service — rather than three consolidated roles;
+> one-worker-process-per-CPU-core multiprocessing inside each Match-Host
+> pod; and a Docker Compose milestone before full Kubernetes) — see
+> `Server_Design.md` §19 for the full reasoning behind each change. Also
+> includes Stage G4, a lean delta-based wire protocol decided independently
+> of the review, cutting the project's own measured traffic estimate from
+> ~150–250 Gbps to a ~11 Gbps design estimate (`Server_Design.md` §14).
+> Every stage below that changed as a result is marked *(revised)*.
+
 ---
 
 ## 0. Phase overview
 
+> **Status, checked directly against the current codebase:** Phase 2
+> (F1–F7) is **✅ done** — `room.py`, `session_coordinator.py`,
+> `room_choice_command.py` all exist and match this plan's own design.
+> **H2 is also ✅ done** — F2 *is* H2, the same piece of work, already
+> implemented as part of Stage F. **The real next starting point is H1**
+> (`UserRepository` → `Protocol`), still a concrete class today — in
+> parallel with G1–G4, which have no dependency on anything.
+>
+> **Also flagged:** the `Server_Design.md` §-references throughout this
+> plan (e.g. `§1.5`, `§5.3`) cite that document's *previous* Part 1–5
+> numbering. `Server_Design.md` has since been rebuilt as 20 flat
+> sections (§1–§20); these citations are stale pointers, not wrong
+> content — a full remap is pending (tracked for the next joint cleanup
+> pass) but doesn't block starting work on any stage below, since each
+> stage's files/tasks/acceptance-criteria are unchanged either way.
+
 | Phase | Stages | What it delivers | Depends on |
 |---|---|---|---|
-| 0 | G1–G3 | Immediate, zero-dependency wins — no infra needed | Nothing — start today |
-| 1 | H1–H2 | Foundational `Protocol` abstractions, in-memory only | Nothing — pure refactor |
-| 2 | F1–F7 | Rooms + Viewers feature, fully detailed below | H2 (`SessionCoordinator`) for F2 onward; F1 itself has no dependency |
-| 3 | I1–I3 | Real distributed backends stood up | H1, H2, K3s/Docker learning |
-| 4 | J1–J4 | Gateway/Match-Host topology split, on K8s | I1–I3 |
-| 5 | K1–K4 | Resilience hardening | J1–J4 |
-| 6 | L1–L3 | Operations, monitoring, capacity validation | J1–J4, K1–K4 |
+| 0 | G1–G4 | Immediate, zero-dependency wins — no infra needed | Nothing — start today |
+| 1 | H1–H2 | Foundational `Protocol` abstractions, in-memory only | Nothing — pure refactor. **H2: ✅ done** (see status note above) |
+| 2 | F1–F7 | Rooms + Viewers feature, fully detailed below | **✅ done** (see status note above) |
+| 3 | I0–I9 | *(revised)* Docker Compose small working version, then real distributed backends (PostgreSQL, Redis, NATS) plus the full service split (Auth/Rooms-API/Matchmaker/Game-Allocator/Rating Service) and per-shard multiprocessing | H1 (not yet done), H2 (✅ done); I0 needs only Docker, not K3s |
+| 4 | J1–J5 | *(revised)* Full nine-service topology split, on K8s | I0–I9 |
+| 5 | K1–K4 | Resilience hardening | J1–J5 |
+| 6 | L1–L3 | Operations, monitoring, capacity validation | J1–J5, K1–K4 |
 
 **Why this order:** Phase 0 and Phase 1 need nothing but this repo and a
 Python environment — they can start in parallel, today, before any cloud
-provider or K8s cluster exists. Phase 2 (Rooms) only needs Phase 1's
-`SessionCoordinator` interface to exist, not its production backend, so it
-can proceed in parallel with Phase 3. Phases 3–6 are strictly sequential —
-each needs the previous phase's infrastructure actually running.
+provider or K8s cluster exists. **Phase 2 is already complete** — it's
+listed here for dependency-graph completeness, not as remaining work.
+**Phase 3 now starts with I0, a Docker Compose milestone that needs only
+Docker** (not a K3s cluster) — matching the priority of shipping
+"something small that works" before the full Kubernetes topology. Phases
+3–6 remain otherwise sequential — each needs the previous phase's
+infrastructure actually running.
 
 ---
 
@@ -81,10 +113,55 @@ one missing piece that activates it.
   entry point, call `uvloop.install()` (or use
   `asyncio.run(..., loop_factory=uvloop.new_event_loop)` depending on the
   Python version in use) before starting the event loop.
-- **Acceptance criteria:** existing test suite passes unchanged (this is a
-  pure runtime swap, no application-level behavior change); note in this
-  plan once done that this becomes the default for both the Gateway and
-  Match-Host entry points once Phase 4 splits them.
+### G4 — Lean wire protocol: sequence numbers + delta board/log (`Server_Design.md` §3.5/§3.8 — chosen after comparison against the colleague's ~16 Gbps estimate)
+
+**Why this is in Phase 0, not deferred:** no cloud infra needed — this is a
+pure protocol/application-layer change, buildable and testable today,
+exactly like G1–G3.
+
+- **Files:**
+  - `server/presentation/protocol_handler.py` — three new message types:
+    - `BOARD_DELTA:<seq>:<cell>:<token>,<cell>:<token>,...` — only the
+      squares that changed since the last broadcast in this match (usually
+      2: the from-cell and to-cell), not the full 64-square board.
+    - `LOG_DELTA:<seq>:<entry>` — only the single newest move/capture-log
+      entry, not the full accumulated history.
+    - `RESYNC_REQUEST` (client → server) — "I detected a gap in `seq`,
+      send me a full state."
+  - `server/application/game_server.py` — each match tracks its own
+    monotonically-increasing `seq` counter; `_broadcast_event` computes the
+    diff between the previous broadcast's board and the current one
+    (instead of re-printing the full board every time), and sends only the
+    newest log entry (instead of the full accumulated `MovesLogSnapshot`).
+  - **The existing full-board/full-log messages are kept, not deleted** —
+    reused as the "keyframe" response to `RESYNC_REQUEST`, so a client that
+    ever loses sync can always recover fully.
+  - `kungfu_chess/client/network/network_game_client.py` — track the last
+    `seq` received per room; on a gap (received `seq` isn't exactly
+    `last_seq + 1`), send `RESYNC_REQUEST` and apply the returned full
+    board/log as a fresh baseline before resuming delta application.
+- **Acceptance criteria:**
+  - Unit test: given a previous board and a new board differing in exactly
+    2 squares, the delta-computation function returns exactly those 2
+    squares, nothing else.
+  - Unit test: `LOG_DELTA` contains only the newest entry, regardless of
+    how many entries the match has accumulated (this is the test that
+    directly proves the quadratic-growth problem from §3.5 is gone — the
+    message size must stay constant as match length grows, not increase).
+  - Integration test: simulate a dropped message (skip a `seq` on the
+    client side deliberately) and confirm the client sends
+    `RESYNC_REQUEST` and correctly resumes from the returned keyframe.
+  - Regression test: a client that never drops a message ends up with the
+    exact same final board/log state as today's full-resend design would
+    produce — this change must be invisible in outcome, only smaller on
+    the wire.
+- **Expected result (a design estimate, not yet a measurement — validate
+  against Phase 6's L3 load test once this is built):** roughly ~70 bytes
+  per broadcast event instead of the current ~782-byte representative
+  figure — bringing the fleet-wide aggregate from Part 3's measured
+  ~150–250 Gbps down to a design estimate of **~11 Gbps**, converging with
+  the colleague's own ~16 Gbps estimate (see `Server_Design.md` Part 3 for
+  the full before/after comparison).
 
 ---
 
@@ -92,7 +169,7 @@ one missing piece that activates it.
 
 Pure refactors — no new infrastructure, no behavior change for any existing
 caller. These unlock every later phase without needing a cloud provider,
-Cassandra, or Redis to exist yet.
+PostgreSQL, or Redis to exist yet.
 
 ### H1 — `UserRepository` becomes a `Protocol` (`Server_Design.md` §1.5)
 
@@ -120,7 +197,7 @@ Cassandra, or Redis to exist yet.
   `isinstance(repo, UserRepository)` if using `@runtime_checkable`, or a
   static type-check pass with `mypy`/`pyright`).
 
-### H2 — `SessionCoordinator` `Protocol` + in-memory implementation (`Server_Design.md` §2.3, ties directly to the already-agreed Stage F2 design)
+### H2 — `SessionCoordinator` `Protocol` + in-memory implementation — ✅ DONE (identical work to F2 below)
 
 This is the single most structurally important stage in this plan — it's
 the shared foundation both the Rooms feature (Phase 2/Stage F) and the
@@ -164,7 +241,7 @@ implementation are one piece of work, shared by both this feature and the
 production topology in Phase 3/4. F3 onward proceeds only after F2/H2 is
 in place.
 
-### F1 — `RoomCode` + `Room` (pure, headless — no networking, no `GameServer`)
+### F1 — `RoomCode` + `Room` (pure, headless — no networking, no `GameServer`) — ✅ DONE
 
 - **Files:**
   - `server/application/room_code.py` — `RoomCode` value object; named
@@ -200,7 +277,7 @@ in place.
   characters (O/0, I/1, L) — flagged, not decided unilaterally; assume 6
   characters, ambiguous-excluded, until confirmed.
 
-### F2 — `SessionCoordinator` (identical work item to Phase 1's H2 — see there for full detail)
+### F2 — `SessionCoordinator` (identical work item to Phase 1's H2 — see there for full detail) — ✅ DONE
 
 This is the stage where `MatchmakingQueue` (existing, Stage E1) and F1's
 `Room` get unified behind one `Protocol`
@@ -217,7 +294,7 @@ it belongs at the coordinator level, not inside `Room` or
   asserts the coordinator retries and produces a second, distinct code
   rather than silently overwriting the first room.
 
-### F3 — Wire protocol messages (Create/Join) — presentation layer only
+### F3 — Wire protocol messages (Create/Join) — presentation layer only — ✅ DONE
 
 - **File:** `server/presentation/protocol_handler.py`.
 - **Task:** add parsing for the post-AUTH choice
@@ -233,7 +310,7 @@ it belongs at the coordinator level, not inside `Room` or
   message, malformed-input handling (e.g. a `JOIN_ROOM:` with no code,
   or a code that fails F1's own alphabet/length validation).
 
-### F4 — Real wiring into `GameServer`
+### F4 — Real wiring into `GameServer` — ✅ DONE
 
 - **File:** `server/application/game_server.py`.
 - **Task:** after AUTH, branch on the client's F3 choice; `PLAY` calls
@@ -249,7 +326,7 @@ it belongs at the coordinator level, not inside `Room` or
   matchmakes exactly as today (non-regression check against the Phase 1
   H2 safety-net suite).
 
-### F5 — Viewer role enforcement
+### F5 — Viewer role enforcement — ✅ DONE
 
 - **Files:** `server/application/game_server.py` (move/jump handling),
   reusing the existing rejection path already used for `wrong_color`.
@@ -262,7 +339,7 @@ it belongs at the coordinator level, not inside `Room` or
   an existing `wrong_color` test; the viewer still receives all normal
   broadcasts (board, events).
 
-### F6 — Broadcast correctness for a variable number of viewers
+### F6 — Broadcast correctness for a variable number of viewers — ✅ DONE
 
 - **File:** `server/application/game_server.py` (`_broadcast_event` and
   any other iteration over "connections in this match").
@@ -277,7 +354,7 @@ it belongs at the coordinator level, not inside `Room` or
   identically; a second test with 0 viewers confirms no regression for the
   common case.
 
-### F7 — Client: room menu + viewer mode
+### F7 — Client: room menu + viewer mode — ✅ DONE
 
 - **Files:**
   - `kungfu_chess/client/.../home_screen.py` — add a Play / Create Room /
@@ -294,38 +371,82 @@ it belongs at the coordinator level, not inside `Room` or
 
 ---
 
-## Phase 3 — Real distributed backends
+## Phase 3 — Docker Compose milestone, then real distributed backends *(revised)*
 
-**Prerequisite:** a K3s (or equivalent) cluster available to deploy to —
-this is where the "learn Docker/K8s/K3s independently" requirement
-directly gates further progress. Also prerequisite: cloud-provider choice
-remains open (`Server_Design.md` §1.7) — everything in this phase is
-provider-agnostic by design (self-hosted, open-source components), so it
-does **not** block on that decision.
+**This phase now has two parts, not one** — directly reflecting the
+external review's own instruction: *"something small that works"* before
+the full topology. I0 needs **only Docker** (not a K3s cluster); I1
+onward needs K3s and is where the "learn Docker/K8s/K3s independently"
+requirement gates further progress. Cloud-provider choice remains open
+(`Server_Design.md` §1.7) — everything in this phase is provider-agnostic
+by design (self-hosted, open-source components), so nothing here blocks
+on that decision.
 
-### I1 — Cassandra/ScyllaDB deployment + `UserRepository` production backend (`Server_Design.md` §1.3, §1.7, §5.4)
+### I0 — Docker Compose: small, working, end-to-end version (new, `Server_Design.md` §1.9/§2.10's "small that works" principle)
 
-- **Infra:** deploy Cassandra or ScyllaDB via its official Helm chart onto
-  the K3s cluster; configure **replication factor ≥3** across available
-  failure domains (`Server_Design.md` §5.4).
-- **Code:** new `server/persistence/cassandra_user_repository.py`
-  implementing the `UserRepository` `Protocol` from H1 — `create_account`/
-  `verify_login` at `QUORUM` consistency, `get_rating` at
-  `ONE`/`LOCAL_ONE` (per the decided per-operation consistency,
-  `Server_Design.md` §1.7 item 3). Same PBKDF2 hashing scheme, unchanged.
+**Do this stage first, before I1–I4.** Goal: one `docker-compose.yml`
+that brings up a minimal but *real* version of every backend component,
+runs locally, and plays one full game end-to-end — proving the
+architecture works before investing in the full K3s topology.
+
+- **File:** new `deploy/docker-compose.yml` at the repo root.
+- **Task:** define services for: `postgres` (official image, one
+  container, no replication yet — that's I1), `redis` (official image,
+  single instance, no Sentinel/Cluster yet — that's I2), the existing
+  server process (`server/main.py`, unchanged — Phase 4's role split
+  hasn't happened yet at this stage), built from a single `Dockerfile`
+  at the repo root.
+- **Task:** wire the existing `UserRepository`/`SessionCoordinator`
+  composition root (`server/main.py`) to read connection strings from
+  environment variables (`POSTGRES_URL`, `REDIS_URL`) rather than
+  hardcoded paths, so the same code runs against Docker Compose's
+  services instead of local SQLite/in-memory defaults.
+- **Acceptance criteria:** `docker-compose up` brings up all containers
+  healthy; a manual end-to-end test (two real clients, or the existing
+  integration test suite pointed at the Compose stack via environment
+  variables) completes one full match, with the account created via
+  Postgres and matchmaking coordinated via Redis. **This is the
+  milestone to demo, not Phase 4's full K3s topology** — smaller scope,
+  proves the architecture, satisfies the review's explicit preference.
+
+### I1 — PostgreSQL deployment + `UserRepository` production backend (`Server_Design.md` §1.3, §1.7, §1.9, §5.4) *(revised: PostgreSQL, not Cassandra/ScyllaDB)*
+
+- **Infra:** deploy PostgreSQL onto the K3s cluster (a Helm chart, e.g.
+  `bitnami/postgresql`, or the Postgres Operator if HA is set up directly)
+  with **streaming replication** to at least one standby, and automated
+  failover tooling (e.g. Patroni) per `Server_Design.md` §5.4's revised
+  failure-mode design.
+- **Code:** new `server/persistence/postgres_user_repository.py`
+  implementing the `UserRepository` `Protocol` from H1 — ordinary SQL
+  (`INSERT`/`SELECT`/`UPDATE` against a `users` table);
+  `create_account`/`verify_login`/`update_rating` routed to the primary,
+  `get_rating` eligible to read from a replica (§1.7's per-operation
+  routing). Same PBKDF2 hashing scheme, unchanged.
 - **Acceptance criteria:** the *exact same* `UserRepository` `Protocol`
   test suite from H1 (parameterized/re-run against this new
   implementation, not a new test file) passes unchanged — proves the
   swap is truly transparent to callers, the entire point of H1's
-  refactor. Add a chaos test: kill one Cassandra/Scylla node mid-test-run,
-  confirm `QUORUM` operations still succeed with 3 replicas.
+  refactor. Add a failover chaos test: kill the primary mid-test-run,
+  confirm the standby is promoted and writes resume within the
+  configured failover window; confirm `get_rating` (routed to a
+  replica) is largely unaffected throughout, per §5.4's own reasoning.
+- **Flagged, not resolved in this stage:** the single-primary
+  write-throughput ceiling against the ~166K writes/sec peak estimate
+  (`Server_Design.md` §1.7 item 4) — Citus is the named scale-out path,
+  not implemented here, per the review's own "small that works first"
+  priority.
 
-### I2 — Redis deployment + caching layer + `SessionCoordinator` production backend (`Server_Design.md` §1.6, §2.3, §2.6, §5.5)
+### I2 — Redis deployment + caching layer + `SessionCoordinator` production backend, now with pub/sub (`Server_Design.md` §1.6, §2.3, §2.4, §2.6, §5.5) *(revised: adds NATS/Redis Pub/Sub)*
 
 - **Infra:** deploy Redis via Sentinel or Cluster mode (not a single
   instance) on K3s. Per §5.5/§5.9's recommendation, evaluate running
   **without** RDB/AOF persistence given this store's bounded-loss-tolerant
-  data.
+  data. **Decide NATS vs. Redis Pub/Sub for the message relay here**
+  (`Server_Design.md` §2.9's flagged open item) — Redis Pub/Sub reuses
+  this same deployment (fewer moving parts); NATS is a separate
+  deployment with stronger delivery guarantees (JetStream). Default to
+  Redis Pub/Sub for I2/I0's "small that works" scope unless a concrete
+  reason to add NATS emerges.
 - **Code:**
   - `server/persistence/cached_user_repository.py` — a decorator
     implementing the same `UserRepository` `Protocol`, wrapping any other
@@ -333,17 +454,33 @@ does **not** block on that decision.
     `get_rating` specifically (§1.6).
   - `server/application/redis_session_coordinator.py` implementing the
     `SessionCoordinator` `Protocol` from H2: matchmaking queue as a Redis
-    sorted set, room registry as a Redis hash, presence map as simple
-    key-value entries (`Server_Design.md` §2.3's table, implemented
-    directly).
+    sorted set, room registry as a Redis hash, Match-Host ownership
+    records as key-value entries used by I3's Game Allocator
+    (`Server_Design.md` §2.3's table, implemented directly).
 - **Acceptance criteria:** the *same* `SessionCoordinator` `Protocol` test
   suite from H2 passes against this Redis-backed implementation unchanged.
   Add a Sentinel-failover chaos test: trigger a failover mid-test, confirm
-  behavior matches §5.5's documented bounded-loss expectation (a
+  behavior matches §5.5's documented bounded-loss expectation (an
   in-flight queue entry may be lost and must be retryable, not that the
   system stays fully available through the failover).
 
-### I3 — `server_full` safety valve reinstated (`Server_Design.md` §5.7)
+### I3 — Game Allocator (new, `Server_Design.md` §2.3, adopted from the external design review)
+
+- **File:** new `server/application/game_allocator.py`.
+- **Task:** implement least-loaded Match-Host selection as a second Redis
+  sorted set, scored by each Match-Host pod's current active-match count
+  (not rating — a distinct sorted set from I2's matchmaking queue, same
+  Redis primitive reused). Called by the WebSocket Gateway role (Phase 4)
+  at the moment `SessionCoordinator` resolves a match/room as ready.
+- **Acceptance criteria:** a unit test with several stubbed Match-Host
+  "load" entries confirms the allocator always returns the currently
+  lowest-scored pod; a test confirms the allocator updates a pod's score
+  correctly as matches start/end on it (increment on allocation,
+  decrement on completion — this decrement needs a corresponding call
+  from Match-Host's own `GameSession`-teardown path, a small addition to
+  Phase 4's J1).
+
+### I4 — `server_full` safety valve reinstated (`Server_Design.md` §5.7)
 
 - **File:** `server/application/game_server.py`,
   `server/presentation/protocol_handler.py` (message already exists,
@@ -357,63 +494,204 @@ does **not** block on that decision.
   history already had for the fixed-single-match design (same assertion
   shape, new trigger condition).
 
+### I5 — Split Auth Service out of the API Gateway (new, `Server_Design.md` §2, §19.2)
+
+- **File:** new `server/application/auth_service.py` — wraps I1's
+  `UserRepository` (`create_account`/`verify_login`/`get_rating`) behind
+  its own internal RPC boundary, called by the API Gateway rather than
+  the Gateway holding a `UserRepository` reference directly.
+- **Task:** the API Gateway (J1) is refactored to call this service
+  instead of `UserRepository` directly — a thin network hop internally,
+  matching the reviewed architecture's own service boundary (§2's table).
+- **Acceptance criteria:** the existing `UserRepository` `Protocol` test
+  suite is unaffected (this is a caller-side change only); a new
+  integration test confirms the API Gateway's AUTH flow works identically
+  through the new internal call, not directly.
+
+### I6 — Split Rooms API (CRUD/history) from live allocation (new, `Server_Design.md` §2, §19.2)
+
+- **File:** new `server/application/rooms_api.py` — room create/list/
+  inspect and match-history queries, backed by I1's PostgreSQL (once
+  match history is actually persisted — see I8) and I2's Redis (for
+  currently-active room lookups).
+- **Task:** `SessionCoordinator.create_room`/`join_room` (Stage F2) is
+  refactored so room *bookkeeping* (this stage) is distinct from the
+  *allocation decision* (I3's `GameAllocator`) — today both are conflated
+  in one call, correct for a single process, but not once these become
+  two separate deployables.
+- **Acceptance criteria:** the existing `SessionCoordinator` `Protocol`
+  test suite (Stage F2/H2) passes unchanged against the refactored split;
+  a new test confirms `create_room` no longer makes any shard-assignment
+  decision itself — that call now goes through I3 explicitly.
+
+### I7 — Matchmaker as its own explicit component, distinct from Game Allocator (new, `Server_Design.md` §2, §19.2)
+
+- **File:** new `server/application/matchmaker.py` — wraps the existing
+  `MatchmakingQueue` (Stage E1, unchanged internally) behind its own
+  service boundary; on a successful pairing, emits a "matched" event
+  (via NATS, once I2's pub/sub choice is wired — see I2) rather than
+  returning the result directly to whatever called `find_match`.
+- **Task:** `SessionCoordinator.find_match` becomes a thin adapter that
+  publishes to the Matchmaker rather than containing the pairing logic
+  itself directly.
+- **Acceptance criteria:** `MatchmakingQueue`'s own existing unit test
+  suite (Stage E1) passes completely unchanged (proves this is a pure
+  wrapping, not a rewrite); a new test confirms a successful pairing
+  produces exactly one "matched" event, consumed once.
+
+### I8 — Rating Service as its own event-driven component (new, `Server_Design.md` §2, §16, §19.2)
+
+- **File:** new `server/application/rating_service.py` — wraps the
+  existing `elo_rating.py` (unchanged internally); subscribes to a
+  "match completed" event (NATS) rather than being called directly from
+  `game_server.py`/`GameSession` teardown.
+- **Task:** `GameSession`'s own end-of-match path (checkmate/timeout/
+  resignation) is changed to *publish* the match result rather than call
+  `UserRepository.update_rating` inline — the Rating Service is what
+  actually performs that write, and additionally persists match history
+  to PostgreSQL (the first real implementation of "games, results, move
+  history" from `Server_Design.md` §1.9/§12).
+- **Acceptance criteria:** `elo_rating.py`'s own existing unit tests pass
+  unchanged; a new integration test confirms a completed match produces
+  exactly one rating update and one match-history row, even if the event
+  is (harmlessly) delivered twice — an idempotency test, since at-least-
+  once delivery is a real property of most pub/sub systems, not
+  something to assume away.
+
+### I9 — Multiprocessing per Game Server Shard: one worker process per CPU core (new, `Server_Design.md` §10, §19.2 — the concrete fix for the Part 2 §2.1 CPU bottleneck this project's own earlier analysis flagged but never resolved)
+
+- **Files:** `server/main_match_host.py` restructured into a
+  **supervisor** process that spawns and monitors **N worker
+  processes** (`multiprocessing`, N = configured CPU core count), each
+  running its own independent `asyncio` event loop and owning a disjoint
+  subset of the pod's active rooms — not one asyncio process trying to
+  share a single core across every room the pod hosts.
+- **Task:** the supervisor heartbeats aggregate pod load (sum of all its
+  workers' active-match counts) into I3's Game Allocator sorted set,
+  same as before — but the *routing* now needs one more level of
+  precision: the pub/sub topic name (J2) or presence record must include
+  the specific worker's identifier, not just the pod's, so a message
+  reaches the exact process hosting that room, bypassing the supervisor
+  on the hot path.
+- **Acceptance criteria:** a load test confirming total rooms hosted by
+  one pod scales close to linearly with configured worker count (proving
+  real parallelism, not just concurrency) — this is the first stage that
+  can actually produce a *measured* per-pod capacity number, closing the
+  open item flagged repeatedly since Part 2 §2.9/§3.9 of the earlier
+  document. A supervisor-crash test confirms workers are re-spawned
+  without losing already-in-progress rooms hosted by *other* still-alive
+  workers.
+
 ---
 
-## Phase 4 — Gateway/Match-Host topology split (`Server_Design.md` Part 2, Part 4)
+## Phase 4 — Full nine-service topology split (`Server_Design.md` Part 2, Part 4, §2, §19.2) *(revised: nine services, pub/sub relay, multiprocessing — not three roles)*
 
-**Prerequisite:** Phase 3's backends deployed and reachable from the K3s
-cluster.
+**Prerequisite:** Phase 3's backends (I0–I9) deployed and reachable from
+the K3s cluster.
 
-### J1 — Split composition roots
+### J1 — Split composition roots *(revised: entry points for all nine services, not three)*
 
-- **Files:** new `server/main_gateway.py` and `server/main_match_host.py`,
-  replacing (or branching from) the single existing `server/main.py`.
-- **Task:** `main_gateway.py` wires `ConnectionManager` + `AUTH` handling +
-  `SessionCoordinator` (I2's Redis-backed implementation) — no
-  `GameSession`/tick loop. `main_match_host.py` wires `GameSession`
-  creation/tick-loop hosting only, reachable *internally* (not
-  client-facing) — no `ConnectionManager`, no AUTH.
+- **Files:** new `server/main_api_gateway.py`, `server/main_ws_gateway.py`,
+  `server/main_auth_service.py` (I5), `server/main_rooms_api.py` (I6),
+  `server/main_matchmaker.py` (I7), `server/main_game_allocator.py` (I3),
+  `server/main_match_host.py`, and `server/main_rating_service.py` (I8) —
+  seven new entry points total, replacing the single existing
+  `server/main.py`.
+- **Task:**
+  - `main_api_gateway.py` calls I5's Auth Service internally (not
+    `UserRepository` directly) for AUTH; forwards room CRUD/history
+    requests to I6's Rooms API. No WebSocket handling, no
+    `SessionCoordinator`, no `GameSession` knowledge at all
+    (`Server_Design.md` §2's Role A0).
+  - `main_ws_gateway.py` wires `ConnectionManager`, calls I7's Matchmaker
+    and I6's Rooms API (not `SessionCoordinator` directly — that class is
+    now split across I6/I7/I3, see those stages), and J3's relay to reach
+    whichever Match-Host is allocated. No `GameSession`/tick loop, no
+    direct `UserRepository` access (AUTH now belongs to the API Gateway;
+    the WebSocket Gateway trusts a session token issued by it — a small,
+    real protocol addition worth scoping explicitly when this stage
+    starts).
+  - `main_auth_service.py`, `main_rooms_api.py`, `main_matchmaker.py`,
+    `main_game_allocator.py`, `main_rating_service.py` each wire exactly
+    one of I5–I8/I3's own components and nothing else — no networking
+    beyond their own internal RPC/pub-sub surface.
+  - `main_match_host.py` becomes I9's supervisor entry point (worker
+    processes, not a single asyncio loop) — reachable *internally* only,
+    via J2's pub/sub, never client-facing.
 - **Acceptance criteria:** each new entry point has its own smoke test
   confirming it starts and exposes only the responsibilities described
-  above (e.g. a Match-Host instance refuses/has no code path for a raw
-  client AUTH message).
+  above (e.g. a Match-Host instance has no code path for a raw client AUTH
+  message; an API Gateway instance has no code path for a `move`/`jump`
+  message; the Rating Service has no code path reachable from a client at
+  all, only from the "match completed" event).
 
-### J2 — Internal Gateway↔Match-Host relay (`Server_Design.md` §2.4)
+### J2 — Gateway↔Match-Host pub/sub relay (`Server_Design.md` §2.4, §2.10) *(revised: pub/sub, not direct TCP)*
 
-- **New module:** `server/application/relay.py` (or similar) — the
-  Gateway-side component that, once `SessionCoordinator` resolves a
-  match/room to a specific Match-Host address (via I2's presence map),
-  opens its own internal connection to that Match-Host and pipes frames
-  bidirectionally between it and the real client connection.
-- **Acceptance criteria:** an integration test with one Gateway process
-  and one Match-Host process (both local, real network sockets between
-  them) confirming a full move round-trip (client → Gateway → Match-Host
-  → Gateway → client) produces identical wire output to the current
-  single-process design's own existing integration tests.
+- **New module:** `server/application/relay.py` — the WebSocket-Gateway-side
+  component that, once `SessionCoordinator` + the Game Allocator (I3)
+  resolve a match to a specific `match_id`/Match-Host pairing, **publishes**
+  each client message to a `match.<match_id>.client_to_server` topic
+  (Redis Pub/Sub, per I2's decision) and **subscribes** to
+  `match.<match_id>.server_to_client` — no address resolution, no held
+  connection to a specific pod.
+- **Task (Match-Host side):** the corresponding subscriber/publisher pair
+  in `main_match_host.py`'s own composition — subscribes to the
+  `client_to_server` topic for each `GameSession` it hosts, publishes to
+  the matching `server_to_client` topic.
+- **Acceptance criteria:** an integration test with one WebSocket Gateway
+  process and one Match-Host process (both local, against a real Redis
+  instance — I0's Docker Compose stack is the natural place to run this)
+  confirming a full move round-trip (client → WebSocket Gateway →
+  Match-Host → WebSocket Gateway → client) produces identical wire output
+  to the current single-process design's own existing integration tests.
+  A second test with **multiple subscribers** to the same
+  `server_to_client` topic (simulating Stage F5/F6 Viewers) confirms
+  identical fan-out to all of them — directly exercising the "solves
+  Viewer fan-out for free" property named in `Server_Design.md` §2.4.
 
-### J3 — Dockerfiles + Kubernetes manifests
+### J3 — Game Allocator wiring into the WebSocket Gateway (new, companion to I3)
 
-- **New directory:** `deploy/` (or `infra/`) containing:
-  - `deploy/docker/gateway.Dockerfile`, `deploy/docker/match-host.Dockerfile`
-  - `deploy/k8s/gateway-deployment.yaml` (`Service` type as appropriate for
-    external client access), `deploy/k8s/match-host-deployment.yaml`
-    (`ClusterIP` `Service`, internal-only)
-  - HPA manifests: Gateway scaling on connection count (custom metric),
-    Match-Host scaling on active-match count (custom metric) — per
-    `Server_Design.md` §2.5/§4.8 item 1.
-- **Acceptance criteria:** both images build successfully; a local K3s
-  deployment (`kubectl apply -f deploy/k8s/`) brings up both roles and a
-  manual end-to-end game (two local clients) completes successfully
-  through the full Gateway→Match-Host relay path.
+- **File:** `server/main_ws_gateway.py`.
+- **Task:** call I3's `GameAllocator` at the moment `SessionCoordinator`
+  resolves a match/room as ready; pass the resulting `match_id` to J2's
+  relay so it knows which pub/sub topics to use.
+- **Acceptance criteria:** an integration test confirming a new match is
+  allocated to the currently-least-loaded Match-Host pod among several
+  running instances (extends I3's own unit tests to a real multi-pod
+  scenario).
 
-### J4 — Graceful shutdown (`Server_Design.md` §4.4, §4.8 item 2)
+### J4 — Dockerfiles + Kubernetes manifests *(revised: nine services)*
+
+- **New directory:** `deploy/` (already has `docker-compose.yml` from
+  I0) containing one `Dockerfile` + one K8s `Deployment`/`Service`/HPA
+  manifest set per service: `api-gateway`, `ws-gateway`, `auth-service`,
+  `rooms-api`, `matchmaker`, `game-allocator`, `match-host`
+  (`game-server-shard`), `rating-service` — each its own image, no shared
+  "mega-container" (`Server_Design.md` §8's own stated rationale).
+  `match-host`'s `Service` is `ClusterIP`, internal-only (reached only via
+  J2's Pub/Sub, never directly); the rest are reached via the public LB
+  or internal RPC as appropriate to each (§4's transport table).
+- **HPA manifests, one metric per service, not one generic policy:** API
+  Gateway/Auth/Rooms-API/Rating-Service on request rate; WebSocket
+  Gateway on connection count; Matchmaker/Game-Allocator on queue depth/
+  allocation-request rate; Match-Host on active-match count (all custom
+  metrics, per `Server_Design.md` §2.5/§2.7/§4.8 item 1).
+- **Acceptance criteria:** all nine images build successfully; a local
+  K3s deployment (`kubectl apply -f deploy/k8s/`) brings up every service
+  and a manual end-to-end game (two local clients) completes successfully
+  through the full API Gateway (AUTH via Auth Service) → WebSocket
+  Gateway → Matchmaker → Game Allocator → Match-Host pub/sub relay path,
+  with a match-history row appearing via the Rating Service at game end.
+
+### J5 — Graceful shutdown (`Server_Design.md` §4.4, §4.8 item 2)
 
 - **File:** `server/main_match_host.py`, plus the corresponding K8s
   manifest's `preStop`/`terminationGracePeriodSeconds` fields.
 - **Task:** implement the cordon-then-drain sequence: on `SIGTERM`, stop
-  advertising this pod as available in the presence map (I2), wait (up to
-  the configured grace period, ≥90s + margin) for the pod's own active
-  `GameSession` count to reach zero, then exit.
+  advertising this pod as available in I3's Game Allocator sorted set
+  (remove it or set its load score to a sentinel "not accepting" value),
+  wait (up to the configured grace period, ≥90s + margin) for the pod's
+  own active `GameSession` count to reach zero, then exit.
 - **Acceptance criteria:** an integration test sends `SIGTERM` to a
   Match-Host process mid-match and asserts (a) it stops accepting new
   match assignments immediately, (b) the in-progress match is allowed to
@@ -431,8 +709,11 @@ only exist once there's more than one process).
 - **Files:** `server/presentation/protocol_handler.py` (new
   `format_match_aborted(reason: str) -> str` following the existing
   `"prefix:<detail>"` convention), `server/application/relay.py` (J2 —
-  detect the internal Match-Host connection breaking, send
-  `match_aborted` to both real clients via the Gateway).
+  detect the Match-Host side going silent on its
+  `server_to_client` pub/sub topic, e.g. via a heartbeat/liveness
+  convention on the topic itself since pub/sub has no "connection closed"
+  event the way a direct TCP relay would; send `match_aborted` to both
+  real clients via the WebSocket Gateway).
 - **Task:** confirm no `update_rating` call fires for a match ended this
   way (Part 5's correctness requirement) — likely means the abort path
   bypasses whatever code path normally calls `update_rating` on
@@ -442,12 +723,16 @@ only exist once there's more than one process).
   `match_aborted`, and that no rating-update call occurred for either
   player (mockable/verifiable against I1's `UserRepository`).
 
-### K2 — Redis presence-map staleness handling (`Server_Design.md` §5.5's flagged edge case)
+### K2 — Redis staleness handling for Match-Host ownership records (`Server_Design.md` §5.5's flagged edge case)
 
 - **Task:** a specific test for a Viewer (Stage F5/F6) joining via room
-  code right as a Sentinel failover loses that room's presence-map entry
-  — confirm the failure mode is "room not found, try again" (a normal,
-  understood error), not a hang or crash.
+  code right as a Sentinel failover loses that room's Match-Host
+  ownership record (I3) — confirm the failure mode is "room not found,
+  try again" (a normal, understood error), not a hang or crash. Note this
+  is a narrower risk under the pub/sub design (J2) than the original
+  direct-relay design: a lost ownership record affects new joiners
+  resolving *which* topic to use, not an already-established relay link
+  (which doesn't exist as a distinct thing under pub/sub).
 - **Acceptance criteria:** the above test, passing with a clear, expected
   error path.
 
@@ -456,9 +741,10 @@ only exist once there's more than one process).
 - **Task:** confirm (by inspection/config review, not new application
   code) that Match-Host and Gateway pods write nothing to local disk —
   logs configured to ship to stdout/stderr only (standard for K8s
-  centralized logging pickup), no local log files. Add Cassandra/Scylla
-  disk-usage alerting (infra/ops config, e.g. a Prometheus alert rule)
-  per §5.6/§5.9 item 5.
+  centralized logging pickup), no local log files. Add PostgreSQL
+  disk-usage alerting (data disk + WAL disk specifically, per
+  `Server_Design.md` §5.6's revised table — infra/ops config, e.g. a
+  Prometheus alert rule) per §5.6/§5.9 item 5.
 - **Acceptance criteria:** a config review checklist item, not a code
   test — confirmed as part of Phase 6's monitoring setup (L1).
 
@@ -479,7 +765,7 @@ only exist once there's more than one process).
 
 ### L1 — Monitoring & alerting
 
-- Cassandra/Scylla disk-usage alerts (K3 above).
+- PostgreSQL disk-usage alerts, data + WAL separately (K3 above).
 - Custom metrics export for HPA: active-match-count per Match-Host pod,
   connection-count per Gateway pod (needed by J3's HPA manifests — build
   this alongside, not after).
@@ -509,7 +795,7 @@ only exist once there's more than one process).
 ## 7. Master dependency graph (quick reference)
 
 ```
-G1, G2, G3 ──────────────────────────────┐  (no dependencies, start now)
+G1, G2, G3, G4 ──────────────────────────┐  (no dependencies, start now)
                                           │
 H1 ───────────────────────┐              │
 H2 ─────────┬─────────────┼──────────────┤
@@ -518,9 +804,10 @@ H2 ─────────┬─────────────┼─�
    F2=H2 ──────┘             │              │
    F3 ─ F4 ─ F5 ─ F6 ─ F7 ───┘              │
             │             ▼              ▼
-            │            I1 ── I2 ── I3   (Phase 3: real backends)
-            │                   │
-            └───────────────────┼──> J1 ─ J2 ─ J3 ─ J4  (Phase 4: topology)
+            │        I0 ─ I1 ─ I2 ─ I3 ─ I4   (Phase 3: backends)
+            │             │  I5 ─ I6 ─ I7 ─ I8 ─ I9  (service split + multiprocessing)
+            │             │
+            └───────────────────┼──> J1 ─ J2 ─ J3 ─ J4 ─ J5  (Phase 4: nine-service topology)
                                               │
                                               ▼
                                   K1 ─ K2 ─ K3 ─ K4      (Phase 5: resilience)
