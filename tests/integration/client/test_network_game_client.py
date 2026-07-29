@@ -76,6 +76,24 @@ pytestmark = pytest.mark.slow
 _JOIN_TIMEOUT_S = 15.0
 _POLL_TIMEOUT_S = 15.0
 _POLL_INTERVAL_S = 0.05
+# Stage G1 - client auto-reconnect (see network_game_client.py's own
+# "STAGE G1" docstring section). Reconnect polling gets its own,
+# slightly more generous timeout than _POLL_TIMEOUT_S: a real reconnect
+# involves a real, second AUTH round trip (real PBKDF2-hashed login,
+# server/persistence/user_repository.py's own deliberately-slow-by-design
+# cost) PLUS a brand new TCP/WS connection, on top of whatever backoff
+# delay NetworkGameClient's own _RECONNECT_BACKOFF_SCHEDULE_S imposes -
+# mirrors test_disconnect_countdown_autoresign.py's own identical
+# "_RECONNECT_COUNTDOWN_S needs real headroom" reasoning.
+_RECONNECT_POLL_TIMEOUT_S = 15.0
+# Short enough that NetworkGameClient's own first reconnect attempt
+# (fired after its own first, 0.5s backoff step) always lands well AFTER
+# this countdown has already expired server-side - proving the
+# window-expired path, not racing it.
+_SHORT_DISCONNECT_COUNTDOWN_S = 0.2
+# Mirrors test_matchmaking_protocol.py's own established _SHORT_TIMEOUT_S
+# precedent (1.0s) for keeping a real matchmaking-timeout wait fast.
+_SHORT_MATCHMAKING_TIMEOUT_S = 1.0
 
 
 class _BackgroundTestServer:
@@ -85,8 +103,23 @@ class _BackgroundTestServer:
     already-established substitute for "a real server that just
     happens to be reachable" in this project's own test suite."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        disconnect_countdown_s: float | None = None,
+        matchmaking_timeout_s: float | None = None,
+    ) -> None:
         self.uri: str = ""
+        # Stage G1 - exposed so a reconnect test can both override Stage
+        # E2's own real countdown/timeout constructor parameters (to
+        # keep a countdown-expiry test fast, mirroring
+        # test_disconnect_countdown_autoresign.py's own established
+        # override convention) and inspect real server-side state
+        # afterward (e.g. ConnectionManager's own real connection count,
+        # to prove a rejected connect() never spawns a lingering
+        # background reconnect attempt).
+        self.game_server: GameServer | None = None
+        self._disconnect_countdown_s = disconnect_countdown_s
+        self._matchmaking_timeout_s = matchmaking_timeout_s
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
         ready = threading.Event()
@@ -99,11 +132,18 @@ class _BackgroundTestServer:
         asyncio.run(self._serve(ready))
 
     async def _serve(self, ready: threading.Event) -> None:
-        # matchmaking_timeout_s left at its own real default (60s) -
-        # every scenario below always provides a compatible opponent
-        # (concurrently), so no test here ever needs to wait for or
+        # matchmaking_timeout_s left at its own real default (60s)
+        # unless a test explicitly overrides it - every scenario below
+        # that doesn't override it always provides a compatible opponent
+        # (concurrently), so no such test ever needs to wait for or
         # exercise a timeout.
-        game_server = GameServer(user_repository_db_path=":memory:")
+        kwargs: dict[str, float] = {}
+        if self._disconnect_countdown_s is not None:
+            kwargs["disconnect_countdown_s"] = self._disconnect_countdown_s
+        if self._matchmaking_timeout_s is not None:
+            kwargs["matchmaking_timeout_s"] = self._matchmaking_timeout_s
+        game_server = GameServer(user_repository_db_path=":memory:", **kwargs)
+        self.game_server = game_server
         server = await websockets.serve(game_server.handle_connection, "localhost", 0)
         tick_task = asyncio.create_task(game_server.run_tick_loop())
         port = server.sockets[0].getsockname()[1]
@@ -479,6 +519,232 @@ def test_join_room_on_an_unknown_code_is_a_real_rejection_not_a_viewer():
         assert client.rejection_reason == "room_not_found"
         assert client.is_viewer is False
         assert client.assigned_color is None
+    finally:
+        client.close()
+        test_server.stop()
+
+
+def _force_close_connection(client: NetworkGameClient) -> None:
+    """Simulate a real, ABRUPT mid-match drop of `client`'s CURRENT
+    connection - closes the underlying TRANSPORT directly, bypassing
+    the real WebSocket closing handshake a graceful client.close() (or
+    NetworkGameClient.close()) would perform, mirroring
+    tests/integration/server/test_ws_skeleton.py's own established
+    "abrupt disconnect" technique exactly (re-verified directly against
+    the installed websockets version before writing this: a graceful
+    close produces ConnectionClosedOK, which websockets' own __aiter__
+    implementation swallows silently - ending the `async for` loop with
+    no exception at all - rather than raising, so _receive_loop would
+    never even see it; only this abrupt, transport-level technique
+    produces the genuine ConnectionClosedError a real network drop
+    would, which is what actually exercises Stage G1's new reconnect
+    logic). Scheduled onto `client`'s OWN background loop - a plain,
+    non-coroutine callback (transport.close() is synchronous), not a
+    coroutine needing run_coroutine_threadsafe."""
+
+    client._loop.call_soon_threadsafe(client._connection.transport.close)
+
+
+def test_client_automatically_reconnects_after_connection_drops_mid_match():
+    test_server = _BackgroundTestServer()
+    client1 = NetworkGameClient()
+    client2 = NetworkGameClient()
+    try:
+        thread1 = _start_connect(client1, test_server.uri, "client1", "password1")
+        thread2 = _start_connect(client2, test_server.uri, "client2", "password2")
+        thread1.join(timeout=_JOIN_TIMEOUT_S)
+        thread2.join(timeout=_JOIN_TIMEOUT_S)
+        white_client, black_client = _white_and_black(client1, client2)
+        original_color = white_client.assigned_color
+        original_connection = white_client._connection
+
+        _force_close_connection(white_client)
+
+        deadline = time.perf_counter() + _RECONNECT_POLL_TIMEOUT_S
+        while time.perf_counter() < deadline:
+            if white_client._connection is not None and white_client._connection is not original_connection:
+                break
+            time.sleep(_POLL_INTERVAL_S)
+
+        assert white_client._connection is not None
+        assert white_client._connection is not original_connection
+        assert white_client.assigned_color == original_color
+    finally:
+        client1.close()
+        client2.close()
+        test_server.stop()
+
+
+def test_client_reconnecting_within_the_real_disconnect_countdown_resumes_the_same_match_and_notifies_opponent():
+    # Deliberately uses the server's own real, UNMODIFIED
+    # DEFAULT_DISCONNECT_COUNTDOWN_S (20 real seconds, never overridden
+    # here) - NetworkGameClient's own backoff (first attempt at 0.5s)
+    # reconnects far sooner than that, proving a real reconnect resumes
+    # the SAME match/color well within the real production window, not
+    # merely a test-shortened one.
+    test_server = _BackgroundTestServer()
+    client1 = NetworkGameClient()
+    client2 = NetworkGameClient()
+    try:
+        thread1 = _start_connect(client1, test_server.uri, "client1", "password1")
+        thread2 = _start_connect(client2, test_server.uri, "client2", "password2")
+        thread1.join(timeout=_JOIN_TIMEOUT_S)
+        thread2.join(timeout=_JOIN_TIMEOUT_S)
+        white_client, black_client = _white_and_black(client1, client2)
+        original_color = white_client.assigned_color
+        original_connection = white_client._connection
+
+        # Drain each client's own join-time board-state message first -
+        # mirrors every other test in this file's own established
+        # convention - so the opponent_reconnected assertion below can't
+        # be accidentally satisfied by an unrelated, leftover message.
+        _poll_until(black_client, lambda messages: len(messages) >= 1, _POLL_TIMEOUT_S)
+
+        _force_close_connection(white_client)
+
+        deadline = time.perf_counter() + _RECONNECT_POLL_TIMEOUT_S
+        while time.perf_counter() < deadline:
+            if white_client._connection is not None and white_client._connection is not original_connection:
+                break
+            time.sleep(_POLL_INTERVAL_S)
+
+        assert white_client._connection is not original_connection
+        assert white_client.assigned_color == original_color
+
+        messages = _poll_until(
+            black_client,
+            lambda msgs: any(msg == "opponent_reconnected" for msg in msgs),
+            _RECONNECT_POLL_TIMEOUT_S,
+        )
+        assert any(msg == "opponent_reconnected" for msg in messages)
+    finally:
+        client1.close()
+        client2.close()
+        test_server.stop()
+
+
+def test_reconnect_surfaces_matchmaking_timeout_once_the_real_countdown_window_has_expired():
+    test_server = _BackgroundTestServer(
+        disconnect_countdown_s=_SHORT_DISCONNECT_COUNTDOWN_S,
+        matchmaking_timeout_s=_SHORT_MATCHMAKING_TIMEOUT_S,
+    )
+    client1 = NetworkGameClient()
+    client2 = NetworkGameClient()
+    try:
+        thread1 = _start_connect(client1, test_server.uri, "client1", "password1")
+        thread2 = _start_connect(client2, test_server.uri, "client2", "password2")
+        thread1.join(timeout=_JOIN_TIMEOUT_S)
+        thread2.join(timeout=_JOIN_TIMEOUT_S)
+        white_client, black_client = _white_and_black(client1, client2)
+
+        _force_close_connection(white_client)
+
+        # By the time NetworkGameClient's own first reconnect attempt
+        # fires (0.5s backoff), _SHORT_DISCONNECT_COUNTDOWN_S has already
+        # elapsed server-side, so the resume lookup finds nothing and
+        # this reconnect attempt falls through to ORDINARY matchmaking
+        # with white_client's own stored room_choice ("PLAY" - no other
+        # compatible player is waiting) - which then times out via the
+        # PRE-EXISTING matchmaking-timeout mechanism, surfacing as an
+        # ordinary rejection - no new wire message needed (see
+        # network_game_client.py's own "STAGE G1" docstring section).
+        deadline = time.perf_counter() + _RECONNECT_POLL_TIMEOUT_S
+        while white_client.rejection_reason is None and time.perf_counter() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+
+        assert white_client.rejection_reason == "matchmaking_timeout"
+        assert white_client.assigned_color is None
+    finally:
+        client1.close()
+        client2.close()
+        test_server.stop()
+
+
+def test_create_room_client_reconnect_after_countdown_expiry_replays_create_room_not_a_hardcoded_play():
+    test_server = _BackgroundTestServer(disconnect_countdown_s=_SHORT_DISCONNECT_COUNTDOWN_S)
+    host = NetworkGameClient()
+    guest = NetworkGameClient()
+    guest2 = NetworkGameClient()
+    created_codes: list[str] = []
+    try:
+        host_thread = _start_connect_with_room_choice(
+            host, test_server.uri, "alice", "password1", "CREATE_ROOM", on_room_created=created_codes.append
+        )
+        deadline = time.perf_counter() + _JOIN_TIMEOUT_S
+        while not created_codes and time.perf_counter() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+        assert created_codes
+        first_code = created_codes[0]
+
+        guest_thread = _start_connect_with_room_choice(
+            guest, test_server.uri, "bob", "password2", f"JOIN_ROOM:{first_code}"
+        )
+        host_thread.join(timeout=_JOIN_TIMEOUT_S)
+        guest_thread.join(timeout=_JOIN_TIMEOUT_S)
+        assert host.assigned_color is Color.WHITE
+        assert guest.assigned_color is Color.BLACK
+
+        _force_close_connection(host)
+
+        # Past the SHORT countdown, the resume window has already
+        # expired - the host's own STORED room_choice ("CREATE_ROOM", not
+        # "PLAY") must be replayed verbatim: a SECOND on_room_created
+        # callback firing (a second, real, DIFFERENT room code) is only
+        # possible if "CREATE_ROOM" was genuinely resent - a hardcoded
+        # "PLAY" default would instead silently enter ordinary
+        # matchmaking and never call on_room_created again at all.
+        deadline = time.perf_counter() + _RECONNECT_POLL_TIMEOUT_S
+        while len(created_codes) < 2 and time.perf_counter() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+
+        assert len(created_codes) >= 2
+        second_code = created_codes[1]
+        assert second_code != first_code
+
+        # Prove the new room is real and joinable - this also completes
+        # the host's own in-flight reconnect attempt fully (rather than
+        # leaving it parked waiting forever for a guest), so close()
+        # below has nothing left in flight to race with.
+        guest2_thread = _start_connect_with_room_choice(
+            guest2, test_server.uri, "carol", "password3", f"JOIN_ROOM:{second_code}"
+        )
+        guest2_thread.join(timeout=_JOIN_TIMEOUT_S)
+        assert guest2.assigned_color is Color.BLACK
+
+        deadline = time.perf_counter() + _JOIN_TIMEOUT_S
+        while host.assigned_color is not Color.WHITE and time.perf_counter() < deadline:
+            time.sleep(_POLL_INTERVAL_S)
+        assert host.assigned_color is Color.WHITE
+    finally:
+        host.close()
+        guest.close()
+        guest2.close()
+        test_server.stop()
+
+
+def test_a_rejected_connect_never_triggers_a_background_reconnect_loop():
+    test_server = _BackgroundTestServer()
+    client = NetworkGameClient()
+    try:
+        client.connect(test_server.uri, "alice", "password1", room_choice="JOIN_ROOM:NOPE00")
+        assert client.rejection_reason == "room_not_found"
+
+        # A naive reconnect implementation would treat the server
+        # closing this already-rejected connection as "the connection
+        # dropped, retry" and spin up an endless background AUTH loop
+        # replaying the SAME rejected room choice forever -
+        # _receive_loop's own guard (only ever reconnect while
+        # self.rejection_reason is still None) exists specifically to
+        # prevent this - see network_game_client.py's own "STAGE G1"
+        # docstring section. Real wait, comfortably longer than the
+        # first backoff step (0.5s), then confirm no new connection was
+        # ever opened and rejection_reason was never overwritten.
+        time.sleep(1.5)
+
+        assert client.rejection_reason == "room_not_found"
+        assert client.assigned_color is None
+        assert test_server.game_server is not None
+        assert test_server.game_server._connection_manager.connection_count == 0
     finally:
         client.close()
         test_server.stop()
