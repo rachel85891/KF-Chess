@@ -912,7 +912,8 @@ from server.application.game_session import GameSession
 from server.application.matchmaking_queue import MatchmakingQueue, WaitingPlayer
 from server.application.room import Role
 from server.application.session_coordinator import InMemorySessionCoordinator, SessionCoordinator
-from server.persistence.user_repository import UserRepository
+from server.persistence.user_repository import SqliteUserRepository
+from server.persistence.user_repository_protocol import UserRepository
 from server.presentation.auth_command import MalformedAuthCommandError
 from server.presentation.connection_manager import ConnectionManager
 from server.presentation.move_command import MalformedCommandError, ParsedMoveCommand
@@ -1773,9 +1774,9 @@ class GameServer:
 
         if self._user_repository is None:
             self._user_repository = (
-                UserRepository(db_path=self._user_repository_db_path)
+                SqliteUserRepository(db_path=self._user_repository_db_path)
                 if self._user_repository_db_path is not None
-                else UserRepository()
+                else SqliteUserRepository()
             )
 
         created = self._user_repository.create_account(username, password)
