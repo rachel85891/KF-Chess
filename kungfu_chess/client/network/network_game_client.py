@@ -225,6 +225,85 @@ hands off to `_receive_loop` as a background task - neither method
 inspects the CONTENT of anything that arrives afterward, so a viewer's
 board text is already, correctly, just another item in `poll_incoming`'s
 own stream, with no code change needed to make that true.
+
+STAGE G1 - CLIENT AUTO-RECONNECT (feature/g1-client-auto-reconnect):
+before this stage, `_receive_loop`'s `except ConnectionClosed: pass`
+silently gave up the instant a connection dropped, even though
+server/application/game_server.py's own Stage E2 already gives a
+disconnected player a real 20-second grace window
+(`DEFAULT_DISCONNECT_COUNTDOWN_S`) during which the SAME username
+re-authenticating resumes the SAME match/color automatically
+(`_resume_if_pending_disconnect`) - this stage activates that existing,
+already-correct server-side mechanism from the client side by having
+`_receive_loop` call the new `_attempt_reconnect` instead of just
+`pass`-ing.
+
+`_attempt_reconnect` REUSES `_do_connect` COMPLETELY UNMODIFIED AS ITS
+OWN RETRY BODY, INCLUDING `_do_connect`'S OWN UNCONDITIONAL RESEND OF
+THE STORED `room_choice` - a real, necessary design decision, not an
+oversight (re-verified directly against server/application/
+game_server.py's own `handle_connection` before writing this, not
+assumed): on a SUCCESSFUL resume, the server reads only the
+reconnecting AUTH message, then immediately sends assigned_color+board
+text and enters its own `async for message in connection` game loop -
+it never reads a second room_choice message for a resumed connection at
+all. Skipping the resend on reconnect (the seemingly more "correct"
+choice) was tried first and rejected: `handle_connection`'s OWN "else"
+branch (taken whenever `_resume_if_pending_disconnect` finds nothing -
+the common case once the countdown window has genuinely expired) reads
+`await connection.recv()` for a room choice BEFORE sending anything
+back at all - a client that skips sending it deadlocks forever the
+moment the window has expired, which is exactly the scenario this
+stage's own test suite must exercise. Resending it unconditionally
+instead means a SUCCESSFUL resume's own stray room_choice text lands in
+the server's already-entered game-message loop, fails to parse as a
+move/jump, and bounces back one harmless `rejected:malformed:...`
+message - confirmed harmless by tracing it all the way through
+kungfu_chess.client.loop.network_game_loop_runner.NetworkGameLoopRunner.
+poll_and_process's own unrecognized-message fallback (`_apply_broadcast`
+-> `BoardParser().parse` returns an error -> silently ignored, this
+project's own established "malformed input never crashes" convention),
+never a change to `_do_connect` itself and never a second copy of its
+own recv loop.
+
+WHY `_receive_loop` ONLY RECONNECTS WHEN `self.rejection_reason IS
+None` (a real regression this guard exists specifically to prevent,
+not a defensive-programming reflex): `_do_connect` schedules
+`_receive_loop` as a task BEFORE it knows whether the message that just
+arrived was a real success or an ordinary rejection - so a REJECTED
+connect() (wrong_password/server_full/room_not_found/
+matchmaking_timeout) also produces a doomed `_receive_loop` task that
+immediately sees the server's own close as a `ConnectionClosed` here.
+Without this guard, that doomed task would misread an already-final,
+correctly-reported rejection as "the connection merely dropped, retry"
+and loop forever replaying the SAME rejected credentials/room choice in
+the background - `self.rejection_reason` (set, on any outcome, before
+this loop's own task ever gets a chance to run - no `await` separates
+`create_task(self._receive_loop())` from setting it inside `_do_connect`,
+so no race is possible on this single-threaded loop) is the same,
+pre-existing, plain-attribute signal every other caller already reads
+after the fact - no new flag invented for this.
+
+`_attempt_reconnect` STOPS RETRYING ON ANY ORDINARY REJECTION, NOT JUST
+A SPECIFIC "window expired" ONE - BECAUSE THERE ISN'T A SPECIFIC ONE:
+Stage E2's own server side has no dedicated "the countdown already
+expired" wire message at all - a reconnect attempt that loses the race
+against the countdown falls through to the exact same ordinary
+matchmaking path (search for a fresh, possibly entirely different,
+compatible opponent) any brand-new connection would take, eventually
+producing whichever ordinary rejection that path would ordinarily
+produce (typically `matchmaking_timeout`, per Stage E1). Reusing
+`self.rejection_reason` for this - stop retrying the instant `_do_connect`
+returns having set ANY rejection reason - is therefore the correct,
+general test, not a narrower one keyed to a specific reason string.
+
+BACKOFF SCHEDULE (`_RECONNECT_BACKOFF_SCHEDULE_S`/
+`_RECONNECT_BACKOFF_CEILING_S`, new module constants, mirroring this
+file's own pre-existing `_THREAD_START_TIMEOUT_S`-style naming
+convention): 0.5s, 1s, 2s, then 2s repeating for every attempt after
+that - waited BEFORE each attempt (including the very first), so a
+genuine drop is never retried faster than 0.5s, matching this stage's
+own task description exactly.
 """
 
 from __future__ import annotations
@@ -267,6 +346,13 @@ _ROOM_NOT_FOUND_MESSAGE = "room_not_found"
 
 _THREAD_START_TIMEOUT_S = 5.0
 _CLOSE_TIMEOUT_S = 5.0
+# Stage G1 - the exponential backoff sequence _attempt_reconnect waits
+# through between reconnect attempts: 0.5s, then 1s, then 2s, then 2s
+# repeating for every attempt after that (the module docstring's own
+# "STAGE G1" section explains why this is a fixed, named schedule
+# rather than an unbounded doubling one).
+_RECONNECT_BACKOFF_SCHEDULE_S: "tuple[float, ...]" = (0.5, 1.0, 2.0)
+_RECONNECT_BACKOFF_CEILING_S = 2.0
 
 
 class NetworkGameClientError(Exception):
@@ -642,7 +728,79 @@ class NetworkGameClient:
             async for message in self._connection:
                 self._incoming.put(message)
         except ConnectionClosed:
-            pass
+            # Stage G1 - only a connection that was genuinely ACTIVE
+            # (self.rejection_reason is None) is worth reconnecting -
+            # see module docstring's "STAGE G1" section for why this
+            # guard is load-bearing: _do_connect unconditionally
+            # schedules a fresh _receive_loop task BEFORE it even knows
+            # whether the message that just arrived was a real success
+            # or an ordinary rejection (wrong_password/server_full/
+            # room_not_found/matchmaking_timeout), so a REJECTED
+            # connect() also produces a _receive_loop task that
+            # immediately sees the server's own connection-close as a
+            # ConnectionClosed here. Without this guard, that doomed
+            # task would misread an ordinary, already-final rejection as
+            # "the connection dropped, retry" and loop forever replaying
+            # the SAME rejected credentials/room choice.
+            if self.rejection_reason is None:
+                await self._attempt_reconnect()
+
+    async def _attempt_reconnect(self) -> None:
+        """Runs on the background loop's own thread (called directly by
+        _receive_loop, above, itself already running there - no
+        run_coroutine_threadsafe needed, exactly mirroring how
+        _do_connect schedules _receive_loop as a plain task on this
+        same loop): waits through Stage G1's own exponential backoff
+        schedule, then calls _do_connect again, reusing it verbatim as
+        this retry's own body (see module docstring's "STAGE G1"
+        section for why _do_connect - including its own unconditional
+        resend of the stored room_choice - is reused completely
+        unmodified, not duplicated or special-cased).
+
+        _do_connect itself, on a successful resume, already does
+        everything a caller of connect() would otherwise need to do by
+        hand: it reassigns self._connection to the new WebSocket and
+        schedules a fresh _receive_loop task on this same loop - this
+        method only needs to keep self.assigned_color in sync with that
+        outcome, mirroring connect()'s own "self.assigned_color =
+        future.result(); return self.assigned_color" pattern one level
+        up.
+
+        A transport-level failure (the server unreachable, or the new
+        connection dropping again immediately) is retried, with the
+        backoff advancing to its next step. An ORDINARY application-
+        level outcome - success, or any real rejection (e.g. the
+        countdown window already expired server-side and the fallback
+        matchmaking attempt then times out) - ends this loop: a
+        rejection is a real, final, already-informative outcome (see
+        _parse_join_response) with nothing left to retry.
+
+        Returns:
+            None.
+        """
+
+        attempt = 0
+        while True:
+            if attempt < len(_RECONNECT_BACKOFF_SCHEDULE_S):
+                delay = _RECONNECT_BACKOFF_SCHEDULE_S[attempt]
+            else:
+                delay = _RECONNECT_BACKOFF_CEILING_S
+            await asyncio.sleep(delay)
+            attempt += 1
+
+            try:
+                self.assigned_color = await self._do_connect(
+                    self._reconnect_uri,
+                    self._reconnect_username,
+                    self._reconnect_password,
+                    self._reconnect_on_searching_for_opponent,
+                    self._reconnect_room_choice,
+                    self._reconnect_on_room_created,
+                )
+            except (ConnectionClosed, OSError):
+                continue
+
+            return
 
     def send_move(self, color: Color, piece_kind: PieceKind, from_cell: Position, to_cell: Position) -> None:
         """Format and send a move command - fire-and-forget from the
