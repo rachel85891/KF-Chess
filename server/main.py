@@ -229,7 +229,15 @@ async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tupl
     """
 
     game_server = GameServer()
-    server = await websockets.serve(game_server.handle_connection, host, port)
+    # Stage G2 - pins the `permessage-deflate` extension explicitly.
+    # Verified directly against the currently pinned `websockets`
+    # version (requirements.txt: `websockets>=13`, installed 16.1.1):
+    # `compression` already defaults to `"deflate"` in both
+    # websockets.serve and websockets.connect, so this changes no
+    # runtime behavior today - it exists so this project's own behavior
+    # doesn't silently depend on a third-party default that a future
+    # `websockets` major version could change without anyone noticing.
+    server = await websockets.serve(game_server.handle_connection, host, port, compression="deflate")
     logger.info("KF-Chess server listening on %s:%s", host, port)
     return server, game_server
 
