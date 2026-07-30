@@ -18,3 +18,17 @@
 # websockets.serve as an async-context-manager-or-awaitable Server
 # factory) - verified directly against the installed 16.1.1.
 websockets>=13
+
+# uvloop: drop-in asyncio event-loop replacement, used only by the real
+# server process (server/main.py's own main()) for I/O-bound throughput,
+# per Server_Design.md §14. No Windows support - upstream publishes no
+# Windows wheels and its own setup.py hard-fails the build there
+# (verified directly: `pip install uvloop` on this Windows dev machine
+# raises "RuntimeError: uvloop does not support Windows at the
+# moment"). The `sys_platform != "win32"` marker below makes pip simply
+# skip this line on Windows instead of failing `pip install -r
+# requirements.txt`; server/main.py falls back to asyncio's own default
+# event loop there (see its own comment at the loop_factory call site).
+# Production deployment targets Linux/Kubernetes (Agones) per
+# Server_Design.md §14, where this installs and is used normally.
+uvloop; sys_platform != "win32"
