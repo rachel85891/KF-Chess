@@ -189,30 +189,28 @@ def test_existing_event_driven_broadcasts_still_work_after_the_join_time_board_s
                 white_client = client1 if welcome1.split(":")[1] == "white" else client2
                 await white_client.send("WPe2e4")
 
-                # Same six-broadcast-per-client pattern already
-                # established by tests/integration/server/
-                # test_protocol_wiring.py's own test_legal_move_from_
-                # correct_color_client_is_accepted_and_broadcast_to_both_
-                # clients: MoveAccepted fires immediately (wire event +
-                # pre-move board text + state snapshot), then
-                # PieceArrived fires once the tick loop's real elapsed
-                # time completes the motion (wire event + post-move
-                # board text + state snapshot) - the first four are
-                # drained here, the fifth is asserted on.
+                # UPDATED for Stage G4's lean wire protocol
+                # (feature/g4-lean-wire-protocol) - see
+                # tests/integration/server/test_protocol_wiring.py's own
+                # test_legal_move_from_correct_color_client_is_accepted_
+                # and_broadcast_to_both_clients for the full per-event
+                # message-count reasoning: MoveAccepted broadcasts
+                # wire+LOG_DELTA (BOARD_DELTA empty/skipped - nothing has
+                # moved yet), PieceArrived broadcasts wire+BOARD_DELTA
+                # (LOG_DELTA skipped - nothing captured) - four messages
+                # total per client; the last (BOARD_DELTA) is asserted on
+                # below.
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted LOG_DELTA
                 await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_1 = await asyncio.wait_for(client1.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_2 = await asyncio.wait_for(client2.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert board_after_1 == board_after_2
-        lines = board_after_1.splitlines()
-        assert lines[6].split()[4] == "."
-        assert lines[4].split()[4] == "wP"
+        assert board_delta_1 == board_delta_2
+        assert "e2:." in board_delta_1
+        assert "e4:wP" in board_delta_1
 
     asyncio.run(scenario())

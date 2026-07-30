@@ -224,35 +224,34 @@ def test_legal_move_from_correct_color_client_is_accepted_and_broadcast_to_both_
                 # White's e-pawn double-step opening move - 2 squares.
                 await white_client.send("WPe2e4")
 
-                # Two GAME EVENTS fire per accepted move (MoveAccepted,
-                # instantly - board still pre-move, since the board only
-                # mutates on real arrival, docs/spec.md's own "board
-                # changes only after a moving piece has actually reached
-                # its destination" rule; then PieceArrived, once the
-                # tick loop's real elapsed time completes the motion),
-                # and each of those two events now broadcasts THREE
-                # messages of its own (the wire-format event, the
-                # board-text snapshot, then the score/move-log/clock
-                # snapshot - the later stage's own addition) - six
-                # messages total per client. The first four are drained
-                # and discarded here (wire+board+state for MoveAccepted,
-                # wire for PieceArrived); the fifth is the one that
-                # reflects the actual, final post-move board state.
+                # UPDATED for Stage G4's lean wire protocol
+                # (feature/g4-lean-wire-protocol): the old per-event full
+                # board-text/state-snapshot broadcast is gone -
+                # server/application/game_server.py's own
+                # `_broadcast_event` now sends BOARD_DELTA/LOG_DELTA
+                # instead (see that module's own "STAGE G4" docstring
+                # section). MoveAccepted's own board occupancy is
+                # unchanged (nothing moves until arrival), so its
+                # BOARD_DELTA is empty and skipped - MoveAccepted
+                # broadcasts wire+LOG_DELTA only (2 messages). PieceArrived
+                # genuinely changes occupancy but this move captures
+                # nothing, so its LOG_DELTA is skipped - PieceArrived
+                # broadcasts wire+BOARD_DELTA only (2 messages). Four
+                # messages total per client; the last (BOARD_DELTA) is
+                # asserted on below instead of a full board-text line.
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted LOG_DELTA
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert board_after_white == board_after_black  # both clients see the exact same broadcast state
-        lines = board_after_white.splitlines()
-        assert lines[6].split()[4] == "."  # e2 (row 6, col 4) is now empty
-        assert lines[4].split()[4] == "wP"  # e4 (row 4, col 4) now holds the white pawn
+        assert board_delta_white == board_delta_black  # both clients see the exact same broadcast state
+        assert board_delta_white.startswith("BOARD_DELTA:")
+        assert "e2:." in board_delta_white  # e2 is now empty
+        assert "e4:wP" in board_delta_white  # e4 now holds the white pawn
 
     asyncio.run(scenario())
 
@@ -306,7 +305,7 @@ def test_move_command_for_a_square_not_matching_the_claimed_piece_is_rejected():
     asyncio.run(scenario())
 
 
-def test_move_rejected_by_the_real_engine_broadcasts_board_text_to_both_clients_with_no_wire_event():
+def test_move_rejected_by_the_real_engine_broadcasts_nothing_to_either_client():
     # Safety-net characterization test, added before refactor/server-
     # application-presentation-split: proves the real-engine-rejection
     # path the module docstring's own "MOVE COMMAND REJECTION SCHEME"
@@ -316,10 +315,21 @@ def test_move_rejected_by_the_real_engine_broadcasts_board_text_to_both_clients_
     # move from its own starting square is parseable and piece-matches
     # (e2 really is a white pawn) but illegal chess-piece-movement shape
     # - GameEventPublisher publishes a real MoveRejected event for this,
-    # which only ever produces the ordinary board-text broadcast (no
-    # wire-format event, no direct point-to-point rejection response -
-    # unlike malformed/wrong_color/piece_mismatch, which never reach the
-    # engine at all).
+    # with no direct point-to-point rejection response either (unlike
+    # malformed/wrong_color/piece_mismatch, which never reach the engine
+    # at all).
+    #
+    # UPDATED for Stage G4's lean wire protocol
+    # (feature/g4-lean-wire-protocol), RENAMED from its own original
+    # "...broadcasts_board_text_to_both_clients_with_no_wire_event":
+    # MoveRejected never changes board occupancy at all (nothing moved),
+    # so its BOARD_DELTA is always empty and, per this stage's own
+    # explicit "skip an empty delta" design decision (see
+    # server/application/game_server.py's own "STAGE G4" docstring
+    # section), nothing is broadcast for it anymore - not even the old
+    # (already redundant, since nothing had changed) unchanged-board-text
+    # broadcast. This is not a player-visible regression: the old
+    # broadcast never showed anything different either.
     async def scenario():
         async with _running_game_server(start_tick_loop=True) as (uri, _game_server):
             async with websockets.connect(uri) as client1, websockets.connect(uri) as client2:
@@ -327,13 +337,10 @@ def test_move_rejected_by_the_real_engine_broadcasts_board_text_to_both_clients_
 
                 await white_client.send("WPe2e5")  # 3 squares - illegal pawn shape
 
-                board_after_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-
-        assert board_after_white == board_after_black
-        lines = board_after_white.splitlines()
-        assert lines[6].split()[4] == "wP"  # e2 - the pawn never moved
-        assert lines[3].split()[4] == "."  # e5 - still empty
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(white_client.recv(), timeout=0.5)
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(black_client.recv(), timeout=0.3)
 
     asyncio.run(scenario())
 
@@ -352,24 +359,23 @@ def test_malformed_command_does_not_crash_the_server_which_keeps_accepting_valid
                 # afterward - proven by a real, subsequent legal move
                 # still working normally.
                 await white_client.send("WPe2e4")
-                # Drain the immediate MoveAccepted broadcasts (wire
-                # event + pre-move board text + state snapshot) and
-                # PieceArrived's own wire event, before the later, final
-                # PieceArrived board text (see the sibling test above
-                # for the full reasoning).
+                # UPDATED for Stage G4 - see the sibling
+                # "...broadcast_to_both_clients" test above for the full
+                # per-event message-count reasoning: MoveAccepted
+                # broadcasts wire+LOG_DELTA (2, BOARD_DELTA empty/
+                # skipped), PieceArrived broadcasts wire+BOARD_DELTA (2,
+                # LOG_DELTA skipped - nothing captured).
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted LOG_DELTA
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_white = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_black = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert board_after_white == board_after_black
-        assert board_after_white.splitlines()[4].split()[4] == "wP"
+        assert board_delta_white == board_delta_black
+        assert "e4:wP" in board_delta_white
 
     asyncio.run(scenario())
 
@@ -383,33 +389,32 @@ def test_legal_jump_from_correct_color_client_is_accepted_and_a_later_jump_lande
                 # White's own a-file rook, its own starting square.
                 await white_client.send("JWRa1")
 
-                # JumpAccepted's own wire event, board text, and (this
-                # later stage's own addition) score/move-log/clock
-                # state snapshot - JumpAccepted IS one of the three
-                # event types that broadcast, even though a jump never
-                # changes score/log itself; re-verified this is
-                # consistent (an unaffected-content but still-broadcast
-                # snapshot, exactly like a real move accepted with
-                # nothing captured yet).
+                # UPDATED for Stage G4's lean wire protocol - see
+                # server/application/game_server.py's own "STAGE G4"
+                # docstring section. JumpAccepted never changes board
+                # occupancy itself (a jump only moves on landing, and a
+                # JUMP never actually relocates the piece at all - see
+                # kungfu_chess/client/events/game_events.py's own
+                # JumpLanded docstring), so its BOARD_DELTA is always
+                # empty/skipped - JumpAccepted broadcasts wire+LOG_DELTA
+                # only (the log always gains a new entry on
+                # JumpAccepted, exactly like MoveAccepted).
                 jump_accepted_wire = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
 
                 assert "JUMP" in jump_accepted_wire
 
                 # Real wait for the tick loop to advance real time past
-                # the jump's own real airborne duration - the landing's
-                # own wire event, then its own board-text snapshot.
-                # JumpLanded is NOT one of the three state-snapshot-
-                # triggering event types (it never changes score/log),
-                # so this stays at exactly two messages, unchanged.
+                # the jump's own real airborne duration. JumpLanded also
+                # never changes board occupancy (it returns the SAME
+                # piece to the SAME cell it jumped from) and never adds a
+                # log entry either - both deltas are empty/skipped, so
+                # JumpLanded broadcasts its own wire event ONLY, no
+                # second message at all.
                 jump_landed_wire = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # JumpLanded wire
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
 
         assert "LANDED" in jump_landed_wire
 
@@ -463,12 +468,14 @@ def test_malformed_jump_command_does_not_crash_the_server_which_keeps_accepting_
                 # afterward - proven by a real, subsequent legal jump
                 # still working normally.
                 await white_client.send("JWRa1")
+                # UPDATED for Stage G4 - see the sibling
+                # "test_legal_jump_from_correct_color..." test above for
+                # the full reasoning: JumpAccepted broadcasts wire+
+                # LOG_DELTA only (BOARD_DELTA empty/skipped).
                 jump_accepted_wire = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
 
         assert "JUMP" in jump_accepted_wire
 
@@ -482,12 +489,14 @@ def test_jump_rejected_by_the_real_engine_gets_a_direct_jump_rejected_response()
                 white_client, black_client = await _connect_and_match(client1, client2)
 
                 await white_client.send("JWRa1")
+                # UPDATED for Stage G4 - JumpAccepted broadcasts wire+
+                # LOG_DELTA only (BOARD_DELTA empty/skipped) - see the
+                # sibling "test_legal_jump_from_correct_color..." test
+                # above for the full reasoning.
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # JumpAccepted wire
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # board text
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
+                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
 
                 # The SAME rook is still airborne - a second jump request
                 # for it right now must be rejected by the real engine
@@ -518,21 +527,20 @@ def test_tick_loop_advances_real_wallclock_time_for_an_in_flight_motion_with_no_
 
                 started_at = time.perf_counter()
                 await white_client.send("WPe2e4")  # 2 squares = 2 * MS_PER_SQUARE of real motion time
-                # MoveAccepted's own wire event + board text + state
-                # snapshot arrive near-instantly (pre-move board) - all
-                # drained, not timed. PieceArrived's own wire event
-                # arrives next, also drained - only PieceArrived's
-                # FINAL board text is produced once the tick loop's real
+                # UPDATED for Stage G4's lean wire protocol: MoveAccepted's
+                # own wire event + LOG_DELTA arrive near-instantly
+                # (BOARD_DELTA empty/skipped - nothing has moved yet) -
+                # both drained, not timed. PieceArrived's own wire event
+                # arrives next, also drained - only PieceArrived's own
+                # BOARD_DELTA is produced once the tick loop's real
                 # elapsed time actually covers the motion's full
-                # duration; THAT one is what this test times (each
-                # stage that added one more broadcast message per event
-                # updated this drain count in turn; the thing actually
-                # being timed is unchanged).
+                # duration; THAT one is what this test times (the thing
+                # actually being timed is unchanged by this stage, only
+                # the message shape being waited on).
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted LOG_DELTA
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived board text
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived BOARD_DELTA
                 elapsed_s = time.perf_counter() - started_at
 
         expected_s = (2 * MS_PER_SQUARE) / 1000

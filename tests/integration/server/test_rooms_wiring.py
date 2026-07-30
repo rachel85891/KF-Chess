@@ -97,18 +97,25 @@ def test_host_creates_room_guest_joins_both_get_matched_and_a_real_move_broadcas
             # genuine, live GameSession backs this room-based match.
             await host.send("WPe2e4")
 
-            for _ in range(3):
+            # UPDATED for Stage G4's lean wire protocol
+            # (feature/g4-lean-wire-protocol) - see
+            # tests/integration/server/test_protocol_wiring.py's own
+            # test_legal_move_from_correct_color_client_is_accepted_and_
+            # broadcast_to_both_clients for the full per-event message-
+            # count reasoning: MoveAccepted broadcasts wire+LOG_DELTA
+            # (BOARD_DELTA empty/skipped), PieceArrived broadcasts wire+
+            # BOARD_DELTA (LOG_DELTA skipped - nothing captured).
+            for _ in range(2):
                 await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
             await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
             await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
-            board_after_host = await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
-            board_after_guest = await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
+            board_delta_host = await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
+            board_delta_guest = await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
 
-            assert board_after_host == board_after_guest
-            lines = board_after_host.splitlines()
-            assert lines[6].split()[4] == "."  # e2 now empty
-            assert lines[4].split()[4] == "wP"  # e4 now holds the white pawn
+            assert board_delta_host == board_delta_guest
+            assert "e2:." in board_delta_host  # e2 now empty
+            assert "e4:wP" in board_delta_host  # e4 now holds the white pawn
 
             await host.close()
             await guest.close()
@@ -171,35 +178,41 @@ def test_a_third_client_joining_a_full_room_becomes_a_viewer_who_watches_but_can
             assert await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S) == "room_joined:viewer"
             # A viewer joining mid-game sees the CURRENT board
             # immediately - not a closed connection (Stage F4's own,
-            # now-superseded placeholder).
-            viewer_initial_board = await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)
+            # now-superseded placeholder). Not stored: Stage G4's own
+            # BOARD_DELTA replaces the later full board-text broadcast
+            # this used to be compared against - see the "e4:wP in
+            # board_delta_viewer" assertion below for the real proof the
+            # board genuinely advanced instead.
+            await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)
 
             # A real move, from the real White (host) client.
             await host.send("WPe2e4")
 
-            for _ in range(3):  # MoveAccepted: wire event, board text, state snapshot
+            # UPDATED for Stage G4's lean wire protocol
+            # (feature/g4-lean-wire-protocol) - see
+            # tests/integration/server/test_protocol_wiring.py's own
+            # test_legal_move_from_correct_color_client_is_accepted_and_
+            # broadcast_to_both_clients for the full per-event message-
+            # count reasoning: MoveAccepted broadcasts wire+LOG_DELTA
+            # (BOARD_DELTA empty/skipped), PieceArrived broadcasts wire+
+            # BOARD_DELTA (LOG_DELTA skipped - nothing captured) - four
+            # messages total, not five; nothing is left over after
+            # capturing the BOARD_DELTA below.
+            for _ in range(2):  # MoveAccepted: wire event, LOG_DELTA
                 await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)
             await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
             await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
             await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)
-            board_after_host = await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
-            board_after_guest = await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
-            board_after_viewer = await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)
-
-            # PieceArrived's own state/score/clock snapshot (the 3rd of
-            # its own 3 messages: wire event, board text, state
-            # snapshot) - drained so nothing is left over before the
-            # viewer's own move attempt below.
-            await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
-            await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
-            await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)
+            board_delta_host = await asyncio.wait_for(host.recv(), timeout=_RECV_TIMEOUT_S)
+            board_delta_guest = await asyncio.wait_for(guest.recv(), timeout=_RECV_TIMEOUT_S)
+            board_delta_viewer = await asyncio.wait_for(viewer.recv(), timeout=_RECV_TIMEOUT_S)
 
             # The viewer received the EXACT SAME broadcast as both real
             # players - identical fan-out, not a second-class feed.
-            assert board_after_host == board_after_guest == board_after_viewer
-            assert board_after_viewer != viewer_initial_board  # the board genuinely advanced
+            assert board_delta_host == board_delta_guest == board_delta_viewer
+            assert "e4:wP" in board_delta_viewer  # the board genuinely advanced
 
             # The viewer now attempts a move of its own.
             await viewer.send("WPd2d4")
@@ -333,21 +346,31 @@ def test_play_still_matchmakes_two_play_clients_exactly_as_before_non_regression
 
 
 async def _drain_one_real_event(connections: list) -> list:
-    """Drain exactly one real game event's own full 3-message shape
-    (wire event, board text, state snapshot - see
-    server/application/game_server.py's own _broadcast_event docstring)
-    from every connection in `connections`, in lockstep, returning each
-    connection's own board-text message (the 2nd of the 3) - the one
-    piece every caller below actually wants to compare across every
-    connection. Stage F6 - the whole point of this helper is that it
-    takes an arbitrary NUMBER of connections, never assuming exactly 2."""
+    """Drain exactly one real game event's own broadcast from every
+    connection in `connections`, in lockstep, returning each
+    connection's own second message - the one piece every caller below
+    actually wants to compare across every connection.
 
-    boards = []
+    UPDATED for Stage G4's lean wire protocol (feature/g4-lean-wire-
+    protocol): a real event now broadcasts its wire event plus exactly
+    ONE of BOARD_DELTA/LOG_DELTA, not the old fixed 3-message (wire
+    event, board text, state snapshot) shape - see
+    server/application/game_server.py's own "STAGE G4" docstring
+    section for why a non-capturing MoveAccepted always produces
+    LOG_DELTA only (its own BOARD_DELTA is empty/skipped) and a
+    non-capturing PieceArrived always produces BOARD_DELTA only (its own
+    LOG_DELTA is skipped) - either way, exactly TWO messages per
+    connection for every call site below (this scenario's own moves are
+    all non-capturing).
+
+    Stage F6 - the whole point of this helper is that it takes an
+    arbitrary NUMBER of connections, never assuming exactly 2."""
+
+    deltas = []
     for connection in connections:
         await asyncio.wait_for(connection.recv(), timeout=_RECV_TIMEOUT_S)  # wire event
-        boards.append(await asyncio.wait_for(connection.recv(), timeout=_RECV_TIMEOUT_S))  # board text
-        await asyncio.wait_for(connection.recv(), timeout=_RECV_TIMEOUT_S)  # state snapshot
-    return boards
+        deltas.append(await asyncio.wait_for(connection.recv(), timeout=_RECV_TIMEOUT_S))  # LOG_DELTA or BOARD_DELTA
+    return deltas
 
 
 def test_two_players_and_three_viewers_all_five_connections_receive_every_broadcast_identically():

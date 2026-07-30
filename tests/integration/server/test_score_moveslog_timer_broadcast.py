@@ -60,10 +60,7 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece, PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.notation.auth_command_format import format_auth_command
-from kungfu_chess.notation.game_state_snapshot_wire_format import (
-    STATE_SNAPSHOT_MESSAGE_PREFIX,
-    parse_game_state_snapshot,
-)
+from kungfu_chess.notation.game_state_snapshot_wire_format import LOG_DELTA_MESSAGE_PREFIX, parse_log_delta
 from server.application.game_server import GameServer
 from server.application.game_session import GameSession
 
@@ -145,6 +142,20 @@ async def _authenticate_and_drain_join(client, username: str, password: str) -> 
 
 
 def test_a_real_capture_broadcasts_the_correct_score_move_log_and_advancing_elapsed_clock():
+    """UPDATED for Stage G4's lean wire protocol (feature/g4-lean-wire-
+    protocol): the old per-event full "STATE:" snapshot (score + the
+    WHOLE accumulated move log) is gone - server/application/
+    game_server.py's own `_broadcast_event` now sends `LOG_DELTA` (score/
+    clock scalars + exactly the ONE newest log entry) instead, and only
+    when the log actually grew (see that module's own "STAGE G4"
+    docstring section for why a non-capturing PieceArrived sends none at
+    all). MoveAccepted's own board occupancy is unchanged (nothing has
+    moved yet), so its BOARD_DELTA is empty and skipped entirely -
+    MoveAccepted therefore broadcasts exactly TWO messages (wire event +
+    LOG_DELTA), not three. PieceArrived's arrival genuinely changes
+    occupancy AND (here, a capture) grows the log, so it broadcasts
+    THREE (wire event + BOARD_DELTA + LOG_DELTA)."""
+
     async def scenario():
         session = _capture_ready_session()
         async with _running_game_server(session) as (uri, _game_server):
@@ -161,54 +172,50 @@ def test_a_real_capture_broadcasts_the_correct_score_move_log_and_advancing_elap
                 await white_client.send("WRa8b8")
 
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted wire event
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted board text
-                move_state_text = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # MoveAccepted state snapshot
-                await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                move_log_delta_text = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-                assert move_state_text.startswith(STATE_SNAPSHOT_MESSAGE_PREFIX)
-                move_score, move_log, move_clock_ms = parse_game_state_snapshot(move_state_text)
+                assert move_log_delta_text.startswith(LOG_DELTA_MESSAGE_PREFIX)
+                move_seq, move_score, move_entry, move_clock_ms = parse_log_delta(move_log_delta_text)
                 # Right after MoveAccepted (before arrival), nothing has
-                # been captured yet - score is still 0-0, and the log
-                # has exactly the one move entry (no capture entry yet).
+                # been captured yet - score is still 0-0, and the single
+                # delta entry is the move itself (no capture entry yet).
+                assert move_seq == 1
                 assert move_score.score_by_color == {Color.WHITE: 0, Color.BLACK: 0}
-                assert len(move_log.entries) == 1
-                assert move_log.entries[0].piece_kind is PieceKind.ROOK
-                assert move_log.entries[0].piece_color is Color.WHITE
+                assert move_entry.piece_kind is PieceKind.ROOK
+                assert move_entry.piece_color is Color.WHITE
 
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived wire event
-                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived board text
-                arrival_state_text = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # PieceArrived state snapshot
+                await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # BOARD_DELTA
+                arrival_log_delta_text = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # LOG_DELTA
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                arrival_state_text_2 = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                arrival_log_delta_text_2 = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-        assert arrival_state_text == arrival_state_text_2  # both clients see the exact same broadcast state
+        assert arrival_log_delta_text == arrival_log_delta_text_2  # both clients see the exact same broadcast
 
-        arrival_score, arrival_log, arrival_clock_ms = parse_game_state_snapshot(arrival_state_text)
+        arrival_seq, arrival_score, arrival_entry, arrival_clock_ms = parse_log_delta(arrival_log_delta_text)
 
         # White captured Black's pawn - White's score is now the
         # captured piece's real value, per standard chess scoring
         # (ScoreObserver's own established rule, re-verified directly).
+        assert arrival_seq == 2
         assert arrival_score.score_by_color[Color.WHITE] == PIECE_VALUES[PieceKind.PAWN]
         assert arrival_score.score_by_color[Color.BLACK] == 0
 
-        # The move entry, then the capture entry, in that chronological
-        # order - and the capture's own timestamp is never earlier than
-        # the move's own, matching real chronology (the capture can only
-        # happen strictly at or after the move that caused it).
-        assert len(arrival_log.entries) == 2
-        move_entry, capture_entry = arrival_log.entries
-        assert move_entry.piece_kind is PieceKind.ROOK and move_entry.piece_color is Color.WHITE
-        assert capture_entry.piece_kind is PieceKind.ROOK and capture_entry.piece_color is Color.WHITE
-        assert capture_entry.captured_piece_kind is PieceKind.PAWN
-        assert capture_entry.captured_piece_color is Color.BLACK
-        assert capture_entry.recorded_at_clock_ms >= move_entry.recorded_at_clock_ms
+        # The single delta entry at arrival is the CAPTURE entry (the
+        # move entry was already sent, on its own, at MoveAccepted time
+        # above - LOG_DELTA only ever carries the single newest entry,
+        # never the whole accumulated log).
+        assert arrival_entry.piece_kind is PieceKind.ROOK and arrival_entry.piece_color is Color.WHITE
+        assert arrival_entry.captured_piece_kind is PieceKind.PAWN
+        assert arrival_entry.captured_piece_color is Color.BLACK
+        assert arrival_entry.recorded_at_clock_ms >= move_entry.recorded_at_clock_ms
 
         # The elapsed game clock has genuinely advanced between the two
-        # snapshots - real time (via the real tick loop) actually
-        # passed between MoveAccepted and PieceArrived.
+        # deltas - real time (via the real tick loop) actually passed
+        # between MoveAccepted and PieceArrived.
         assert arrival_clock_ms > move_clock_ms
 
     asyncio.run(scenario())

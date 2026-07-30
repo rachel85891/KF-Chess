@@ -133,26 +133,29 @@ def test_two_close_rating_clients_get_matched_and_a_real_move_broadcasts_correct
                 # own tick loop genuinely advances real time.
                 await white_client.send("WPe2e4")
 
-                # MoveAccepted (wire event + board text + state
-                # snapshot) fires immediately for BOTH clients - drained
-                # here, not asserted on (mirrors this project's own
-                # established drain-then-assert-on-arrival convention).
-                for _ in range(3):
+                # UPDATED for Stage G4's lean wire protocol
+                # (feature/g4-lean-wire-protocol) - see
+                # tests/integration/server/test_protocol_wiring.py's own
+                # test_legal_move_from_correct_color_client_is_accepted_
+                # and_broadcast_to_both_clients for the full per-event
+                # message-count reasoning: MoveAccepted (wire event +
+                # LOG_DELTA, BOARD_DELTA empty/skipped) fires immediately
+                # for BOTH clients - drained here, not asserted on.
+                for _ in range(2):
                     await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
                     await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-                # PieceArrived's own wire event, then its own final
-                # board text, once the tick loop's real elapsed time
-                # completes the 2-square motion.
+                # PieceArrived's own wire event, then its own BOARD_DELTA
+                # (LOG_DELTA skipped - nothing captured), once the tick
+                # loop's real elapsed time completes the 2-square motion.
                 await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)  # wire event
                 await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_1 = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
-                board_after_2 = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_1 = await asyncio.wait_for(white_client.recv(), timeout=_RECV_TIMEOUT_S)
+                board_delta_2 = await asyncio.wait_for(black_client.recv(), timeout=_RECV_TIMEOUT_S)
 
-                assert board_after_1 == board_after_2
-                lines = board_after_1.splitlines()
-                assert lines[6].split()[4] == "."  # e2 now empty
-                assert lines[4].split()[4] == "wP"  # e4 now holds the white pawn
+                assert board_delta_1 == board_delta_2
+                assert "e2:." in board_delta_1  # e2 now empty
+                assert "e4:wP" in board_delta_1  # e4 now holds the white pawn
             finally:
                 await client1.close()
                 await client2.close()
