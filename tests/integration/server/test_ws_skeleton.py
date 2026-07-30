@@ -147,6 +147,31 @@ def test_connection_count_decreases_on_abrupt_disconnect_without_crashing_the_se
     asyncio.run(scenario())
 
 
+def test_the_server_negotiates_permessage_deflate_when_both_sides_pass_compression_deflate():
+    """Stage G2 - proves server/main.py's own explicit
+    `compression="deflate"` (see its module docstring) is not merely
+    passed as a parameter but genuinely negotiated over the wire: a
+    real client, also passing `compression="deflate"` (mirroring
+    kungfu_chess/client/network/network_game_client.py's own matching
+    change), must see the real `permessage-deflate` extension in the
+    real HTTP response headers from the real WebSocket handshake - not
+    a mocked/assumed value."""
+
+    async def scenario():
+        manager = ConnectionManager()
+        server = await websockets.serve(build_handler(manager), "localhost", 0, compression="deflate")
+        try:
+            port = server.sockets[0].getsockname()[1]
+            async with websockets.connect(f"ws://localhost:{port}", compression="deflate") as client:
+                extensions = client.response.headers.get("Sec-WebSocket-Extensions", "")
+                assert "permessage-deflate" in extensions
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
 def test_sending_on_an_already_closed_connection_does_not_raise():
     """Proves server/main.py's own documented "ALREADY-CLOSED-
     CONNECTION POLICY" (see its module docstring): if
