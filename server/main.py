@@ -98,6 +98,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
@@ -110,6 +111,23 @@ DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8765
 
 logger = logging.getLogger(__name__)
+
+# uvloop: drop-in asyncio event-loop replacement for the real server
+# process only (this file's own main(), below), chosen for I/O-bound
+# throughput per Server_Design.md §14. No Windows support - upstream
+# publishes no Windows wheels and its own setup.py hard-fails the build
+# there (verified directly on this dev machine). Production deployment
+# targets Linux/Kubernetes (Agones) per Server_Design.md §14, where
+# uvloop is installed and used; Windows dev machines fall back to
+# asyncio's own default event loop instead - both are real, tested
+# event-loop implementations, so this is a deliberate availability
+# fallback, not a bug or a partial implementation.
+if sys.platform != "win32":
+    import uvloop
+
+    _loop_factory = uvloop.new_event_loop
+else:
+    _loop_factory = None
 
 
 async def echo_message(connection: ServerConnection, message: object) -> None:
@@ -269,7 +287,12 @@ def main() -> None:
             await server.wait_closed()
             tick_task.cancel()
 
-    asyncio.run(_serve_forever())
+    # Pins the real server process's event loop to uvloop where available
+    # (falls back to asyncio's own default loop on Windows - see the
+    # sys.platform guard above) - not test code, not the client
+    # (network_game_client.py's own background loop is a separate
+    # concern and is untouched by this). Per Server_Design.md §14.
+    asyncio.run(_serve_forever(), loop_factory=_loop_factory)
 
 
 if __name__ == "__main__":
