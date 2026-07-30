@@ -835,6 +835,83 @@ CONFIRMED CORRECT AS-IS, NOT A SILENT GAP (mirroring Stage F6's own
 audit style): for a viewer, `self.assigned_color is None`, so BOTH
 already, correctly, evaluate to False - neither panel is "the local
 player" for someone who isn't playing.
+
+STAGE G4 - LEAN WIRE PROTOCOL: BOARD_DELTA/LOG_DELTA
+(feature/g4-lean-wire-protocol): see server/application/game_server.py's
+own "STAGE G4" docstring section for the full server-side design and the
+two-different-delta-strategies resolution this is the client-side half
+of. Short version: `_broadcast_event` no longer resends the entire board
+and entire move log on every event - it sends only the changed cells
+(BOARD_DELTA) and only the single newest log entry (LOG_DELTA), keeping
+the pre-existing full board-text/"STATE:" messages solely as a
+RESYNC_REQUEST-triggered recovery path.
+
+WHY BOARD_DELTA DOES NOT TOUCH self.board AT ALL - IT UPDATES A NEW,
+SEPARATE, PERSISTENT `self._board_occupancy` GRID INSTEAD: this class's
+own established RECONCILIATION POLICY (see "PROBLEM 2" above) already
+made every board-text broadcast AFTER the first one a READ-ONLY sanity
+check, never a mutation of `self.board` - `self.board`'s only real
+driver has always been, and remains, the structured `EVT:` events
+(`_handle_piece_arrived` etc.), completely untouched by this stage.
+`self._board_occupancy` (a plain `Dict[Position, Optional[Tuple[Color,
+PieceKind]]]`, kungfu_chess.notation.board_delta_wire_format's own
+BoardOccupancy shape) is this class's own lightweight, incrementally-
+maintained copy of "what the server has told us the board looks like" -
+seeded once, from the very first full board-text broadcast (via
+`board_to_occupancy`, the SAME function server/application/
+board_delta.py's own compute_board_delta compares against - see that
+module's own docstring for why it lives in kungfu_chess/notation/, not
+server/, specifically so both sides can share it), and updated
+thereafter by applying each BOARD_DELTA's own changed cells directly
+onto it - never by a fresh BoardParser re-parse.
+
+`_log_resync_mismatch` NOW COMPARES `self.board` AGAINST
+`self._board_occupancy`, NOT A FRESHLY-PARSED Board - a real, necessary
+consequence of the above: there is no fresh Board to compare against on
+most calls anymore (BOARD_DELTA never produces one), so the comparison
+snapshot is now obtained incrementally instead of by a full re-parse.
+This preserves the exact PRE-existing "never mutates self.board, never
+touches piece_animator_registry" policy unchanged - only HOW the
+comparison snapshot itself is obtained changed. Called from TWO places
+now (previously only from a later full board-text broadcast, which no
+longer happens during ordinary play): once after `self._board_occupancy`
+is reset from a genuine RESYNC_REQUEST response (preserving the exact
+same "a later full broadcast triggers a sanity check" cadence the
+resync path is the last remaining source of), and once after EVERY
+BOARD_DELTA is applied (replacing the old "a full broadcast on every
+event triggers a sanity check" cadence, since BOARD_DELTA is now what
+arrives on every event instead).
+
+LOG_DELTA CHANGES `_apply_state_snapshot` - ACTUALLY, IT DOESN'T, AND
+THAT ITSELF IS THE DESIGN: `_apply_state_snapshot`'s own pre-existing
+wholesale-replace behavior (parse "STATE:", replace `self._latest_score`/
+`self._latest_log`/`self._latest_clock_ms` wholesale) is left completely
+UNCHANGED by this stage - because, after this stage, a full "STATE:"
+message is NEVER broadcast during ordinary play anymore (LOG_DELTA
+replaces it there); the ONLY remaining source of a "STATE:" message is a
+genuine RESYNC_REQUEST response, for which "replace wholesale" is
+already exactly the correct behavior (a resync IS meant to be a fresh,
+authoritative baseline). A NEW method, `_apply_log_delta`, handles the
+new, per-event message instead: parses LOG_DELTA via
+kungfu_chess.notation.game_state_snapshot_wire_format's own
+`parse_log_delta` (reused, not reimplemented), APPENDS the single parsed
+entry onto `self._latest_log`'s existing tuple (`MovesLogSnapshot` is
+frozen, so this builds a new one: `entries=self._latest_log.entries +
+(entry,)`), and replaces `self._latest_score`/`self._latest_clock_ms`/
+`self._latest_clock_ms_received_at` exactly like `_apply_state_snapshot`
+already does (these stay small, fixed-size scalars - only the log
+itself needed a delta at all, per Server_Design.md's own §14 framing).
+
+RESYNC_REQUEST ITSELF IS SENT ENTIRELY BY NetworkGameClient, NEVER THIS
+CLASS: see that module's own "STAGE G4" docstring section - this class
+never sends RESYNC_REQUEST and never even knows one was sent; it simply
+keeps calling `poll_and_process()` every frame exactly as before, and
+the eventual resync response (a full board-text message, then a full
+"STATE:" message) arrives through the exact same dispatch this class
+already had, handled by the exact same `_apply_broadcast`/
+`_apply_state_snapshot` methods every OTHER board-text/"STATE:" message
+already used - no new "is this a resync" branch is needed anywhere in
+this class at all.
 """
 
 from __future__ import annotations
@@ -878,15 +955,24 @@ from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import Piece
 from kungfu_chess.model.position import Position
+from kungfu_chess.notation.board_delta_wire_format import (
+    BOARD_DELTA_MESSAGE_PREFIX,
+    BoardOccupancy,
+    MalformedBoardDeltaWireFormatError,
+    board_to_occupancy,
+    parse_board_delta,
+)
 from kungfu_chess.notation.game_event_wire_format import (
     EVENT_MESSAGE_PREFIX,
     MalformedGameEventWireFormatError,
     parse_game_event,
 )
 from kungfu_chess.notation.game_state_snapshot_wire_format import (
+    LOG_DELTA_MESSAGE_PREFIX,
     STATE_SNAPSHOT_MESSAGE_PREFIX,
     MalformedGameStateSnapshotWireFormatError,
     parse_game_state_snapshot,
+    parse_log_delta,
 )
 from kungfu_chess.realtime.real_time_arbiter import CELL_SIZE
 from kungfu_chess.view.renderer import InFlightMotion, Renderer, build_snapshot_from_board, motion_progress
@@ -1075,6 +1161,15 @@ class NetworkGameLoopRunner:
         self.room_code = self.network_client.room_code
 
         self.board: Optional[Board] = None
+        # Stage G4 - see module docstring's "STAGE G4" section: a
+        # lightweight, persistent, incrementally-maintained copy of
+        # "what the server has told us the board looks like", seeded
+        # once from the first full board-text broadcast and updated
+        # thereafter by applying each BOARD_DELTA directly onto it -
+        # never by re-parsing a fresh Board. Empty until that first
+        # broadcast, mirroring self.board's own None-until-first-
+        # broadcast convention.
+        self._board_occupancy: BoardOccupancy = {}
         # Stage F7 - a viewer has nothing to click, so the input layer
         # simply isn't built for this session at all (per Implementation_
         # Plan.md's own explicit wording), rather than being built and
@@ -1263,9 +1358,84 @@ class NetworkGameLoopRunner:
             if self.click_controller is not None:
                 self.click_controller.board = board
             self.piece_animator_registry = PieceAnimatorRegistry.from_board(board)
+            # Stage G4 - see module docstring's "STAGE G4" section: seed
+            # the persistent occupancy-comparison grid from this SAME
+            # first board, alongside self.board itself.
+            self._board_occupancy = board_to_occupancy(board)
             return
 
-        self._log_resync_mismatch(board)
+        # Stage G4 - every later full board-text broadcast is now a
+        # genuine RESYNC_REQUEST response (see module docstring's
+        # "STAGE G4" section: BOARD_DELTA replaces the old per-event
+        # full broadcast) - reset the occupancy grid to this fresh
+        # baseline, then run the same read-only sanity check a later
+        # broadcast has always triggered.
+        self._board_occupancy = board_to_occupancy(board)
+        self._log_resync_mismatch()
+
+    def _apply_board_delta(self, text: str) -> None:
+        """Parse one raw "BOARD_DELTA:" broadcast (Stage G4) and apply
+        its changed cells directly onto `self._board_occupancy` - see
+        module docstring's "STAGE G4" section for why this never touches
+        `self.board`/`piece_animator_registry` at all, exactly like the
+        read-only sanity check it replaces.
+
+        Args:
+            text: The raw broadcast text - already confirmed by the
+                caller (poll_and_process) to start with
+                BOARD_DELTA_MESSAGE_PREFIX.
+
+        Returns:
+            None.
+
+        A malformed message, or one that somehow arrives before this
+        client's own `self.board` has ever been established (should be
+        unreachable in practice - the server never sends a BOARD_DELTA
+        before the join-time full board text), is silently ignored,
+        matching this project's "malformed input never crashes the
+        process" convention.
+        """
+
+        try:
+            _seq, changed_cells = parse_board_delta(text)
+        except MalformedBoardDeltaWireFormatError:
+            return
+
+        if self.board is None:
+            return
+
+        self._board_occupancy.update(changed_cells)
+        self._log_resync_mismatch()
+
+    def _apply_log_delta(self, text: str) -> None:
+        """Parse one raw "LOG_DELTA:" broadcast (Stage G4) and APPEND its
+        single entry onto `self._latest_log`'s existing tuple - see
+        module docstring's "STAGE G4" section for why this is an append,
+        not a replace (unlike `_apply_state_snapshot`, which stays a
+        wholesale replace - the correct behavior for the
+        RESYNC_REQUEST-only "STATE:" message it now exclusively serves).
+
+        Args:
+            text: The raw broadcast text - already confirmed by the
+                caller (poll_and_process) to start with
+                LOG_DELTA_MESSAGE_PREFIX.
+
+        Returns:
+            None.
+
+        A malformed message is silently ignored, matching
+        `_apply_state_snapshot`'s own identical policy.
+        """
+
+        try:
+            _seq, score, entry, clock_ms = parse_log_delta(text)
+        except MalformedGameStateSnapshotWireFormatError:
+            return
+
+        self._latest_log = MovesLogSnapshot(entries=self._latest_log.entries + (entry,))
+        self._latest_score = score
+        self._latest_clock_ms = clock_ms
+        self._latest_clock_ms_received_at = self._clock()
 
     def _apply_state_snapshot(self, text: str) -> None:
         """Parse one raw "STATE:" broadcast (kungfu_chess/notation/
@@ -1275,6 +1445,14 @@ class NetworkGameLoopRunner:
         OVER THE NETWORK" section for the full reasoning behind why
         this is always a replacement, never a merge (every "STATE:"
         message is already a complete, authoritative snapshot).
+
+        STAGE G4 - UNCHANGED, BY DESIGN: after this stage, a "STATE:"
+        message is never broadcast during ordinary play anymore
+        (`_apply_log_delta`'s own "LOG_DELTA:" message replaces it
+        there) - the only remaining source of one is a genuine
+        RESYNC_REQUEST response, for which "replace wholesale" is
+        already exactly the correct behavior. See module docstring's
+        "STAGE G4" section.
 
         Args:
             text: The raw broadcast text - already confirmed by the
@@ -1319,27 +1497,25 @@ class NetworkGameLoopRunner:
         elapsed_since_received_ms = int((self._clock() - self._latest_clock_ms_received_at) * 1000)
         return self._latest_clock_ms + elapsed_since_received_ms
 
-    def _log_resync_mismatch(self, resync_board: Board) -> None:
-        """Compare `resync_board` (freshly parsed from a LATER
-        board-text broadcast) against this runner's own, long-lived
-        `self.board`, cell by cell, and print a diagnostic for any
-        genuine disagreement - see module docstring's "RECONCILIATION
-        POLICY" section for why this NEVER mutates `self.board`,
-        replaces a Piece, or touches piece_animator_registry.
-
-        Args:
-            resync_board: The freshly-parsed Board from a board-text
-                broadcast that arrived after `self.board` was already
-                established.
+    def _log_resync_mismatch(self) -> None:
+        """Compare this runner's own, long-lived `self.board` against
+        `self._board_occupancy` (Stage G4 - see module docstring's
+        "STAGE G4" section for why this is now an incrementally-
+        maintained grid rather than a freshly-parsed Board), cell by
+        cell, and print a diagnostic for any genuine disagreement - see
+        module docstring's "RECONCILIATION POLICY" section for why this
+        NEVER mutates `self.board`, replaces a Piece, or touches
+        piece_animator_registry.
 
         Returns:
             None.
 
         Compares (kind, color) per cell, never raw Piece identity/id -
-        `resync_board`'s own pieces were assigned entirely new ids by
-        this same process's BoardParser call, so comparing ids would
-        always disagree even when the two boards genuinely agree about
-        what is actually on the board.
+        `self._board_occupancy` holds bare (Color, PieceKind) tuples,
+        never Piece objects, so there is no id to compare in the first
+        place (see kungfu_chess/notation/board_delta_wire_format.py's
+        own docstring for why BOARD_DELTA's parse direction deliberately
+        never constructs a real, identity-bearing Piece at all).
         """
 
         assert self.board is not None
@@ -1348,15 +1524,15 @@ class NetworkGameLoopRunner:
             for col in range(self.board.width):
                 cell = Position(row=row, col=col)
                 own_piece = self.board.piece_at(cell)
-                resync_piece = resync_board.piece_at(cell) if resync_board.in_bounds(cell) else None
-
                 own_key = None if own_piece is None else (own_piece.kind, own_piece.color)
-                resync_key = None if resync_piece is None else (resync_piece.kind, resync_piece.color)
 
-                if own_key != resync_key:
+                tracked_value = self._board_occupancy.get(cell)
+                tracked_key = None if tracked_value is None else (tracked_value[1], tracked_value[0])
+
+                if own_key != tracked_key:
                     print(
                         f"[NetworkGameLoopRunner] resync mismatch at {cell}: "
-                        f"locally tracked={own_key}, server broadcast={resync_key}"
+                        f"locally tracked={own_key}, server broadcast={tracked_key}"
                     )
 
     def _translate_piece(self, server_piece_id: int, from_cell: Optional[Position]) -> Optional[Piece]:
@@ -1815,10 +1991,10 @@ class NetworkGameLoopRunner:
         docstrings for why neither wire-format message can ever be
         confused with each other or with a board-text broadcast): a
         wire event goes to _apply_wire_event, a state snapshot goes to
-        _apply_state_snapshot (this stage's own addition - see module
-        docstring's "SCORE / MOVE-LOG / CAPTURED-PIECES / TIMER OVER
-        THE NETWORK" section), everything else to the pre-existing
-        _apply_broadcast.
+        _apply_state_snapshot, a board/log delta (Stage G4 - see module
+        docstring's "STAGE G4" section) goes to _apply_board_delta/
+        _apply_log_delta respectively, everything else to the
+        pre-existing _apply_broadcast.
         """
 
         for text in self.network_client.poll_incoming():
@@ -1826,6 +2002,10 @@ class NetworkGameLoopRunner:
                 self._apply_wire_event(text)
             elif text.startswith(STATE_SNAPSHOT_MESSAGE_PREFIX):
                 self._apply_state_snapshot(text)
+            elif text.startswith(BOARD_DELTA_MESSAGE_PREFIX):
+                self._apply_board_delta(text)
+            elif text.startswith(LOG_DELTA_MESSAGE_PREFIX):
+                self._apply_log_delta(text)
             elif text.startswith(_OPPONENT_DISCONNECTED_PREFIX):
                 self._apply_opponent_disconnected(text)
             elif text == _OPPONENT_RECONNECTED_MESSAGE:
