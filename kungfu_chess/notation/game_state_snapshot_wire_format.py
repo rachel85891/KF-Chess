@@ -97,6 +97,23 @@ wire-format module in this project's own "ONE ERROR TYPE" convention:
 a caller only ever needs to catch this one type to know "ignore this
 message", regardless of which of the three delimiter levels or which
 specific field was wrong.
+
+STAGE G4 - format_log_delta/parse_log_delta, THE LEAN-WIRE-PROTOCOL
+STAGE'S OWN "LOG_DELTA" MESSAGE: added here, in the SAME module as
+"STATE:", rather than a third, separate module (unlike BOARD_DELTA,
+which got its own sibling module - see kungfu_chess/notation/
+board_delta_wire_format.py's own docstring for why that data shape is
+genuinely unrelated to this one) - LOG_DELTA is still fundamentally the
+identical (score, ONE log entry, clock_ms) data shape "STATE:" already
+represents, just with exactly one entry instead of the full accumulated
+list; the same SRP boundary this module's own docstring already draws
+("one module per DISTINCT DATA SHAPE being serialized") puts both
+squarely in this one file. `_format_entry`/`_parse_entry` (above) are
+reused DIRECTLY, unchanged, for the entry field - see
+server/application/game_server.py's own "STAGE G4" docstring section for
+why score/clock_ms are still sent as small, fixed-size scalars every
+time (only the log itself is the "ever-growing" piece this stage's own
+delta actually targets).
 """
 
 from __future__ import annotations
@@ -115,8 +132,10 @@ from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.notation.algebraic_notation import algebraic_to_position, position_to_algebraic
 
 STATE_SNAPSHOT_MESSAGE_PREFIX = "STATE:"
+LOG_DELTA_MESSAGE_PREFIX = "LOG_DELTA:"
 
 _MESSAGE_MARKER = "STATE"
+_LOG_DELTA_MARKER = "LOG_DELTA"
 _TOP_LEVEL_SEP = ":"
 _ENTRY_SEP = "|"
 _ENTRY_FIELD_SEP = ","
@@ -129,6 +148,10 @@ _CAPTURE_ENTRY_TAG = "C"
 _TOP_LEVEL_FIELD_COUNT = 5
 _MOVE_ENTRY_FIELD_COUNT = 7  # M, kind, color, from, to, is_jump, recorded_at_clock_ms
 _CAPTURE_ENTRY_FIELD_COUNT = 7  # C, kind, color, cell, captured_kind, captured_color, recorded_at_clock_ms
+# LOG_DELTA, seq, white_score, black_score, clock_ms, entry (one entry,
+# itself further encoded via the SAME _format_entry/_parse_entry - see
+# module docstring's "STAGE G4" section).
+_LOG_DELTA_FIELD_COUNT = 6
 
 
 class GameStateSnapshotWireFormatError(ValueError):
@@ -297,3 +320,63 @@ def parse_game_state_snapshot(text: str) -> Tuple[ScoreSnapshot, MovesLogSnapsho
     score = ScoreSnapshot(score_by_color={Color.WHITE: white_score, Color.BLACK: black_score})
     log = MovesLogSnapshot(entries=entries)
     return score, log, clock_ms
+
+
+def format_log_delta(seq: int, score: ScoreSnapshot, entry: MovesLogEntry, clock_ms: int) -> str:
+    """Format one LOG_DELTA message - see module docstring's "STAGE G4"
+    section: the SAME score/clock_ms scalar fields format_game_state_
+    snapshot already sends, plus exactly ONE log entry (reusing
+    _format_entry directly) instead of the full accumulated list.
+
+    Args:
+        seq: This match's own current broadcast sequence number.
+        score: The current ScoreSnapshot.
+        entry: The single newest MoveLogEntry/CaptureLogEntry to send.
+        clock_ms: The elapsed logical game time - see
+            format_game_state_snapshot's own identical parameter.
+
+    Returns:
+        The single-line wire text.
+    """
+
+    white_score = score.score_by_color.get(Color.WHITE, 0)
+    black_score = score.score_by_color.get(Color.BLACK, 0)
+    return _TOP_LEVEL_SEP.join(
+        [_LOG_DELTA_MARKER, str(seq), str(white_score), str(black_score), str(clock_ms), _format_entry(entry)]
+    )
+
+
+def parse_log_delta(text: str) -> Tuple[int, ScoreSnapshot, MovesLogEntry, int]:
+    """Parse one raw LOG_DELTA message back into (seq, score, entry,
+    clock_ms) - the exact inverse of format_log_delta.
+
+    Args:
+        text: The raw message text - a caller should already know this
+            starts with LOG_DELTA_MESSAGE_PREFIX (mirroring
+            parse_game_state_snapshot's own dispatch convention).
+
+    Returns:
+        (seq, score, entry, clock_ms).
+
+    Raises:
+        MalformedGameStateSnapshotWireFormatError: If `text` doesn't
+            start with the "LOG_DELTA" marker, has the wrong number of
+            top-level fields, has a non-integer seq/score/clock_ms
+            field, or the entry field itself is malformed.
+    """
+
+    fields = text.split(_TOP_LEVEL_SEP)
+    if len(fields) != _LOG_DELTA_FIELD_COUNT or fields[0] != _LOG_DELTA_MARKER:
+        raise MalformedGameStateSnapshotWireFormatError(f"not a log-delta wire message: {text!r}")
+
+    try:
+        seq = int(fields[1])
+        white_score = int(fields[2])
+        black_score = int(fields[3])
+        clock_ms = int(fields[4])
+    except ValueError as exc:
+        raise MalformedGameStateSnapshotWireFormatError(f"malformed seq/score/clock field in {text!r}: {exc}") from None
+
+    entry = _parse_entry(fields[5])
+    score = ScoreSnapshot(score_by_color={Color.WHITE: white_score, Color.BLACK: black_score})
+    return seq, score, entry, clock_ms

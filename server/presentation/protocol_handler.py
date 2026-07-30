@@ -262,6 +262,28 @@ per that class's own docstring) rather than a ConnectionManager itself
 consistent with the "zero GameSession/ConnectionManager/EventBus
 knowledge" principle above.
 
+STAGE G4 - LEAN WIRE PROTOCOL: SEQUENCE NUMBERS + DELTA BOARD/LOG
+(feature/g4-lean-wire-protocol): two new broadcast message shapes,
+`format_board_delta`/`format_log_delta`, both thin wrappers around
+kungfu_chess/notation/board_delta_wire_format.py's own format_board_delta
+and kungfu_chess/notation/game_state_snapshot_wire_format.py's own new
+format_log_delta respectively - mirroring `format_board_text`/
+`format_state_snapshot`'s own established "thin delegation, GameServer
+never imports the underlying wire-format module directly" shape exactly.
+Plus one new, bare, parameterless client->server message,
+`RESYNC_REQUEST_MESSAGE` ("RESYNC_REQUEST") - mirroring
+`SEARCHING_FOR_OPPONENT_MESSAGE`'s own "bare module-level literal"
+shape, since it carries no payload of its own (the client sends this
+exact literal; GameServer's own handle_connection dispatch recognizes it
+BEFORE ever attempting `parse_incoming_command`, since it is not a
+move/jump command at all).
+
+See server/application/game_server.py's own "STAGE G4" docstring section
+for the full BOARD_DELTA/LOG_DELTA/RESYNC_REQUEST design these three
+additions belong to - this class's own job here, as everywhere else in
+this file, stops at "here is how that data looks on the wire," never
+"when/why to send it."
+
 NO CONSTRUCTOR STATE: this class holds no instance data at all - every
 method is a pure function of its own arguments (parsing/formatting) or
 a thin async I/O wrapper (send/broadcast) with no state to initialize.
@@ -280,12 +302,13 @@ from typing import Iterable, Optional, Union
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
-from kungfu_chess.client.events.observers import MovesLogSnapshot, ScoreSnapshot
+from kungfu_chess.client.events.observers import MovesLogEntry, MovesLogSnapshot, ScoreSnapshot
 from kungfu_chess.io.board_printer import BoardPrinter
 from kungfu_chess.model.board import Board
 from kungfu_chess.model.color import Color
+from kungfu_chess.notation.board_delta_wire_format import BoardOccupancy, format_board_delta
 from kungfu_chess.notation.game_event_wire_format import format_game_event
-from kungfu_chess.notation.game_state_snapshot_wire_format import format_game_state_snapshot
+from kungfu_chess.notation.game_state_snapshot_wire_format import format_game_state_snapshot, format_log_delta
 from kungfu_chess.notation.jump_command import JUMP_COMMAND_PREFIX, ParsedJumpCommand, parse_jump_command
 from server.presentation.auth_command import ParsedAuthCommand, parse_auth_command
 from server.presentation.move_command import ParsedMoveCommand, parse_move_command
@@ -306,6 +329,10 @@ _RATING_UPDATE_PREFIX = "rating_update:"
 _ROOM_CREATED_PREFIX = "room_created:"
 _ROOM_JOINED_PREFIX = "room_joined:"
 ROOM_NOT_FOUND_MESSAGE = "room_not_found"
+# Stage G4 - see module docstring's "STAGE G4" section: a bare,
+# parameterless client->server message, mirroring
+# SEARCHING_FOR_OPPONENT_MESSAGE's own "bare module-level literal" shape.
+RESYNC_REQUEST_MESSAGE = "RESYNC_REQUEST"
 
 
 class ProtocolHandler:
@@ -503,6 +530,22 @@ class ProtocolHandler:
         directly either."""
 
         return format_game_state_snapshot(score, log, clock_ms)
+
+    def format_board_delta(self, seq: int, changed_cells: BoardOccupancy) -> str:
+        """The "BOARD_DELTA:<seq>:..." message - a thin delegation to
+        kungfu_chess/notation/board_delta_wire_format.py's own
+        format_board_delta, kept here so GameServer never imports that
+        module directly either (see module docstring's "STAGE G4"
+        section)."""
+
+        return format_board_delta(seq, changed_cells)
+
+    def format_log_delta(self, seq: int, score: ScoreSnapshot, entry: MovesLogEntry, clock_ms: int) -> str:
+        """The "LOG_DELTA:<seq>:..." message - a thin delegation to
+        kungfu_chess/notation/game_state_snapshot_wire_format.py's own
+        format_log_delta (see module docstring's "STAGE G4" section)."""
+
+        return format_log_delta(seq, score, entry, clock_ms)
 
     async def send(self, connection: ServerConnection, text: str) -> None:
         """Send `text` to `connection`, silently ignoring
