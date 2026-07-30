@@ -555,7 +555,17 @@ class NetworkGameClient:
             one level up.
         """
 
-        self._connection = await websockets.connect(uri)
+        # Stage G2 - the client side of the same explicit decision made
+        # in server/main.py's run_server: pins `permessage-deflate`
+        # explicitly. Verified directly against the currently pinned
+        # `websockets` version (requirements.txt: `websockets>=13`,
+        # installed 16.1.1): `compression` already defaults to
+        # `"deflate"` in both websockets.serve and websockets.connect,
+        # so this changes no runtime behavior today - it exists so this
+        # project's own behavior doesn't silently depend on a
+        # third-party default that a future `websockets` major version
+        # could change without anyone noticing.
+        self._connection = await websockets.connect(uri, compression="deflate")
         await self._connection.send(format_auth_command(username, password))
         await self._connection.send(room_choice)
 
