@@ -879,6 +879,144 @@ merely N=1. This stage's own real, required deliverable is exactly this
 audit-and-document work, plus the new N=3 test proving it, per this
 stage's own explicit task framing ("more important here than any new
 code").
+
+STAGE G4 - LEAN WIRE PROTOCOL: SEQUENCE NUMBERS + DELTA BOARD/LOG
+(feature/g4-lean-wire-protocol): replaces `_broadcast_event`'s own old
+"resend the ENTIRE board, then the ENTIRE move log, on every single
+event" behavior (Server_Design.md §14's own measured ~150-250 Gbps
+fleet-wide estimate at 10M concurrent players) with a lean,
+sequence-numbered delta protocol - `BOARD_DELTA`/`LOG_DELTA` - keeping
+the pre-existing full board-text/state-snapshot messages only as a
+`RESYNC_REQUEST`-triggered recovery path, per this stage's own explicit
+"zero change to any player-visible game outcome" requirement.
+
+TWO GENUINELY DIFFERENT DELTA STRATEGIES, NOT ONE UNIFORM RULE - THE
+REAL DESIGN DECISION THIS STAGE RESTS ON (a documented departure from
+Implementation_Plan.md's own simpler original G4 wording, which
+described the client side as "track seq, resync with a fresh baseline
+on a gap" as if every broadcast were replaced wholesale on receipt -
+true of an earlier stage of this project, no longer true of
+kungfu_chess/client/loop/network_game_loop_runner.py today, see that
+module's own "PROBLEM 2" docstring section): a full board-text broadcast
+and a full "STATE:" broadcast serve two structurally different purposes
+on the client, and so need two different delta rules, not one:
+  1. BOARD text (`self.board`, that runner's own class) is built from a
+     full board-text broadcast exactly ONCE (the very first one) and
+     never replaced wholesale again - every REAL position change after
+     that already comes exclusively through structured `EVT:` events.
+     Every later full board-text broadcast was already being used
+     purely as a READ-ONLY SANITY CHECK there (`_log_resync_mismatch`),
+     never a replacement. BOARD_DELTA's own job is therefore not to feed
+     a fresh `BoardParser` re-parse at all - the server computes the
+     diff between `match.last_board_snapshot` (this match's own copy of
+     "what the client should already know") and the board's real,
+     current occupancy, and sends ONLY the changed cells; the client
+     applies those changed cells directly onto its own lightweight,
+     persistent occupancy-comparison grid (never onto `self.board`
+     itself) - see that module's own updated docstring for the
+     client-side half of this.
+  2. LOG entries (`self._latest_log`, that same runner's own class) are
+     the genuinely EVER-GROWING piece Server_Design.md's own §14
+     specifically names as the growth problem - unlike the board, the
+     pre-G4 client already ACCUMULATES this correctly in spirit (each
+     "STATE:" broadcast was a complete snapshot the client applied as a
+     wholesale replace); this stage changes that from a wholesale
+     REPLACE to an APPEND of the single newest entry, which is what
+     actually eliminates the quadratic resend cost - score/clock_ms stay
+     small, fixed-size scalars, sent in full every time (no delta
+     needed, nothing to fix there).
+  3. `RESYNC_REQUEST`'s own response is the one place a genuine,
+     wholesale "replace everything" still happens, on both sides - the
+     kept, unmodified full board-text/state-snapshot messages, exactly
+     as Implementation_Plan.md's own original wording already describes
+     - this is the real "keyframe" recovery path, used only when the
+     client detects a gap in `seq` (a dropped message).
+
+`_Match` GAINS THREE NEW FIELDS - THIS MATCH'S OWN "WHAT HAS ALREADY
+BEEN SENT" BOOKKEEPING, ALL RESET TOGETHER BY A RESYNC:
+  - `last_seq: int` - incremented by exactly 1 for every real broadcast-
+    worthy event (see below for exactly which), and stamped onto
+    whichever of BOARD_DELTA/LOG_DELTA is actually sent for that event -
+    NEVER incremented for an event that ends up sending NEITHER message
+    (see "WHY seq ONLY INCREMENTS WHEN SOMETHING IS ACTUALLY SENT"
+    below) - this is what lets the client's own gap-detection
+    (`received seq != last_seq + 1`) mean exactly what it says.
+  - `last_board_snapshot: BoardOccupancy` - this match's own copy of the
+    board occupancy the client is already assumed to know, seeded once,
+    in `_construct_match`, from the session's real starting position
+    (the SAME position the join-time full board-text broadcast already
+    sends) - NOT left empty until the first event, specifically so the
+    first REAL delta (move #1) is already small, not "the whole board,"
+    which a naive empty-dict default would otherwise produce.
+  - `last_log_entry_count: int` - a real, NECESSARY addition beyond
+    Implementation_Plan.md's/this stage's own prompt's literal wording
+    (which only says "send entries[-1]"): `MovesLogObserver` only
+    appends a new entry on MoveAccepted/JumpAccepted (always) or a
+    CAPTURING PieceArrived (only sometimes - see that class's own
+    on_event) - a non-capturing PieceArrived adds NO new entry at all.
+    Sending `entries[-1]` unconditionally on every one of those three
+    event types would therefore RESEND the same already-sent entry on
+    every non-capturing arrival, and the client's own new APPEND
+    semantics (see above) would silently DUPLICATE it in
+    `self._latest_log`. Tracking how many entries this match has
+    already sent, and only sending LOG_DELTA when the real count grew,
+    is what keeps the append-based redesign correct.
+
+WHY BOARD_DELTA IS COMPUTED FOR EVERY BROADCAST-WORTHY EVENT TYPE
+(`_BROADCAST_EVENT_TYPES`, all seven), NOT ONLY THE THREE THIS STAGE'S
+OWN PROMPT NAMES (MoveAccepted/JumpAccepted/PieceArrived) - the other
+real, necessary widening beyond the prompt's literal wording: the OLD
+code sent a full board-text broadcast unconditionally for every one of
+the seven types, including `AttackerIntercepted`, which really does
+remove a piece from the board (a jump's own interception mechanic - see
+kungfu_chess/client/events/game_events.py's own AttackerIntercepted
+docstring). Scoping BOARD_DELTA to only the three named types would
+silently stop ever broadcasting that real removal at all - a genuine
+regression an event-connected client would never recover from short of
+a lucky RESYNC_REQUEST. Computing (and conditionally sending) the diff
+for all seven costs nothing extra for the other four (MoveAccepted/
+JumpAccepted/JumpLanded never change occupancy at all - the board only
+changes on arrival/interception; MoveRejected/GameOver never do either)
+- their own delta is simply empty and nothing is sent for them, exactly
+the same "skip an empty delta" rule already needed for MoveAccepted/
+JumpAccepted below.
+
+WHY AN EMPTY BOARD_DELTA IS SKIPPED, NEVER SENT (this stage's own
+"decide and document" requirement) - NOT a hypothetical edge case: a
+MoveAccepted/JumpAccepted's own accompanying board text has ALWAYS
+reflected the board's PRE-motion state (nothing has moved yet the
+instant a move is merely ACCEPTED - docs/spec.md's own "board changes
+only after arrival" rule) - so a MoveAccepted/JumpAccepted's own board
+delta is EMPTY in the common case, not a rare corner case. Sending an
+empty "BOARD_DELTA:<seq>:" message would be pure waste (the exact kind
+of waste this whole stage exists to eliminate), so `_broadcast_event`
+skips it whenever the computed delta dict is empty.
+
+WHY seq ONLY INCREMENTS WHEN SOMETHING IS ACTUALLY SENT: if `last_seq`
+incremented unconditionally for every one of the seven event types
+regardless of whether BOARD_DELTA/LOG_DELTA actually go out (e.g.
+MoveRejected, or a non-capturing JumpLanded), the client would never
+observe that seq value at all - the next REAL delta it does receive
+would then jump by more than 1, triggering a FALSE gap detection (and
+an unnecessary RESYNC_REQUEST) for a message that was never actually
+lost. Incrementing only when at least one of BOARD_DELTA/LOG_DELTA is
+about to be sent keeps every seq value the client's own gap-detection
+ever needs to reason about one it will actually, eventually receive.
+
+THE RESYNC_REQUEST HANDLER resets `match.last_board_snapshot`/
+`match.last_seq`/`match.last_log_entry_count` to agree EXACTLY with what
+it just sent (the current real board occupancy, current real seq, and
+current real log length) - this is the one dedicated consistency
+guarantee this stage's own checklist calls out explicitly: the server's
+own resync-response baseline and the very next delta computed after it
+must never disagree, or the very first BOARD_DELTA/LOG_DELTA after a
+resync would itself be wrong.
+
+DEFERRED, NOT THIS STAGE'S JOB (noted explicitly per this stage's own
+task framing): compressing BOARD_DELTA/LOG_DELTA themselves further
+(e.g. binary encoding) - this stage's job is eliminating the quadratic-
+growth/wholesale-resend problem, not further shrinking an already-small
+delta payload.
 """
 
 from __future__ import annotations
@@ -907,6 +1045,7 @@ from kungfu_chess.model.color import Color
 from kungfu_chess.model.piece import PieceKind
 from kungfu_chess.model.position import Position
 from kungfu_chess.notation.jump_command import MalformedJumpCommandError, ParsedJumpCommand
+from server.application.board_delta import BoardOccupancy, board_to_occupancy, compute_board_delta
 from server.application.elo_rating import compute_new_ratings
 from server.application.game_session import GameSession
 from server.application.matchmaking_queue import MatchmakingQueue, WaitingPlayer
@@ -917,7 +1056,11 @@ from server.persistence.user_repository_protocol import UserRepository
 from server.presentation.auth_command import MalformedAuthCommandError
 from server.presentation.connection_manager import ConnectionManager
 from server.presentation.move_command import MalformedCommandError, ParsedMoveCommand
-from server.presentation.protocol_handler import SEARCHING_FOR_OPPONENT_MESSAGE, ProtocolHandler
+from server.presentation.protocol_handler import (
+    RESYNC_REQUEST_MESSAGE,
+    SEARCHING_FOR_OPPONENT_MESSAGE,
+    ProtocolHandler,
+)
 from server.presentation.room_choice_command import (
     CreateRoomCommand,
     JoinRoomCommand,
@@ -962,6 +1105,11 @@ class _Match:
     # branch), never removed except on that viewer's own disconnect
     # (`handle_connection`'s own post-message-loop cleanup).
     viewer_connections: List[ServerConnection] = field(default_factory=list)
+    # Stage G4 - see module docstring's "STAGE G4" section for the full
+    # reasoning behind all three of these fields.
+    last_seq: int = 0
+    last_board_snapshot: BoardOccupancy = field(default_factory=dict)
+    last_log_entry_count: int = 0
 
 
 @dataclass
@@ -1523,6 +1671,13 @@ class GameServer:
         colors: Dict[ServerConnection, Color] = {first_connection: Color.WHITE, second_connection: Color.BLACK}
         usernames: Dict[Color, str] = {Color.WHITE: first_username, Color.BLACK: second_username}
         match = _Match(match_id=match_id, session=session, colors=colors, usernames=usernames)
+        # Stage G4 - seeded from the real starting position (the SAME
+        # position the join-time full board-text broadcast already
+        # sends) so the first real BOARD_DELTA (move #1) is already
+        # small - see module docstring's "STAGE G4" section for why an
+        # empty-dict default would otherwise make that first delta
+        # contain the whole board.
+        match.last_board_snapshot = board_to_occupancy(session.engine.board)
         self._matches[match_id] = match
 
         for event_type in _BROADCAST_EVENT_TYPES:
@@ -1807,6 +1962,16 @@ class GameServer:
             None.
         """
 
+        if message == RESYNC_REQUEST_MESSAGE:
+            # Stage G4 - checked BEFORE parse_incoming_command, since
+            # this is not a move/jump command at all (see module
+            # docstring's "STAGE G4" section) - a viewer may also send
+            # this (no `assigned_color` check here, mirroring how a
+            # viewer is already allowed to receive every other broadcast
+            # identically to a real player, per Stage F5/F6).
+            await self._handle_resync_request(match, connection)
+            return
+
         try:
             parsed = self._protocol.parse_incoming_command(message)
         except (MalformedCommandError, MalformedJumpCommandError) as exc:
@@ -1817,6 +1982,41 @@ class GameServer:
             await self._handle_jump_command(match, connection, assigned_color, parsed)
         else:
             await self._handle_move_command(match, connection, assigned_color, parsed)
+
+    async def _handle_resync_request(self, match: _Match, connection: ServerConnection) -> None:
+        """Respond to a real RESYNC_REQUEST with the kept, unmodified
+        full board-text + state-snapshot "keyframe" messages, POINT-TO-
+        POINT (only to the requesting connection, never broadcast - no
+        other connection has any gap to recover from), then reset
+        `match.last_board_snapshot`/`match.last_seq`/
+        `match.last_log_entry_count` to agree EXACTLY with what was just
+        sent - see module docstring's "STAGE G4" section's own
+        "THE RESYNC_REQUEST HANDLER..." paragraph for why this handoff
+        must be exact, or the very next delta computed after it would be
+        wrong.
+
+        Args:
+            match: The real _Match `connection` belongs to.
+            connection: The connection that sent RESYNC_REQUEST.
+
+        Returns:
+            None.
+        """
+
+        await self._protocol.send(connection, self._current_board_text(match))
+        await self._protocol.send(connection, self._current_state_snapshot_text(match))
+
+        match.last_board_snapshot = board_to_occupancy(match.session.engine.board)
+        match.last_log_entry_count = len(match.session.moves_log_observer.snapshot().entries)
+        # match.last_seq is intentionally left untouched: it is not part
+        # of the resync response's own content (the kept full messages
+        # carry no seq field at all - see module docstring's "STAGE G4"
+        # section) - only the two SNAPSHOT baselines above need to agree
+        # with what was just sent; the next real event's own seq simply
+        # continues counting up from wherever it already was, which the
+        # client accepts as its new baseline the moment it sees it (see
+        # kungfu_chess/client/network/network_game_client.py's own
+        # "STAGE G4" docstring section for the client-side half of this).
 
     async def _handle_move_command(
         self, match: _Match, connection: ServerConnection, assigned_color: Optional[Color], parsed: ParsedMoveCommand
@@ -1892,27 +2092,80 @@ class GameServer:
 
     async def _broadcast_event(self, match: _Match, event: object) -> None:
         """Broadcast the real, structured wire-format event message for
-        `event` (if any), THEN the existing board-text snapshot, THEN
-        (for MoveAccepted/JumpAccepted/PieceArrived only) the score/
-        move-log/elapsed-clock snapshot - to THIS MATCH's own two
-        players AND any viewers currently watching (Stage F5 - see
+        `event` (if any), THEN this match's own lean BOARD_DELTA/
+        LOG_DELTA messages (Stage G4 - see module docstring's "STAGE G4"
+        section for the full design these replace) - to THIS MATCH's own
+        two players AND any viewers currently watching (Stage F5 - see
         module docstring's "STAGE F5" section for why this is the ONE,
-        minimal fan-out change this stage makes, not the broader F6
+        minimal fan-out change that stage made, not the broader F6
         audit), never every connection on the server."""
 
         connections: Tuple[ServerConnection, ...] = tuple(match.colors.keys()) + tuple(match.viewer_connections)
         wire_text = self._protocol.format_event(event)
         if wire_text is not None:
             await self._protocol.broadcast(connections, wire_text)
-        await self._protocol.broadcast(connections, self._current_board_text(match))
-        if isinstance(event, (MoveAccepted, JumpAccepted, PieceArrived)):
-            await self._protocol.broadcast(connections, self._current_state_snapshot_text(match))
+
+        await self._broadcast_board_and_log_deltas(match, connections, event)
+
         if isinstance(event, GameOver):
             # See module docstring's "STAGE D3" section - the single
             # right choke point every real GameOver (king capture,
             # interception, or Stage E2's own auto-resign) already
             # converges on.
             await self._apply_and_notify_rating_update(match, event)
+
+    async def _broadcast_board_and_log_deltas(
+        self, match: _Match, connections: Tuple[ServerConnection, ...], event: object
+    ) -> None:
+        """Stage G4's own replacement for the old unconditional full
+        board-text/state-snapshot broadcast - see module docstring's
+        "STAGE G4" section for the full reasoning behind every decision
+        below (which event types get a board delta computed at all, why
+        an empty one is skipped, why LOG_DELTA needs its own "did the
+        log actually grow" guard, and why `match.last_seq` only
+        increments when something is actually about to be sent).
+
+        Args:
+            match: The real _Match `event` belongs to.
+            connections: The real players + viewers to broadcast to -
+                the SAME tuple `_broadcast_event` already computed, so
+                it is never recomputed here.
+            event: The real event that triggered this broadcast.
+
+        Returns:
+            None.
+        """
+
+        current_occupancy = board_to_occupancy(match.session.engine.board)
+        board_delta = compute_board_delta(match.last_board_snapshot, current_occupancy)
+
+        log = match.session.moves_log_observer.snapshot()
+        send_log_delta = isinstance(event, (MoveAccepted, JumpAccepted, PieceArrived)) and len(
+            log.entries
+        ) > match.last_log_entry_count
+
+        if not board_delta and not send_log_delta:
+            # Nothing actually changed (or nothing this event type is
+            # eligible to report) - see module docstring's "WHY seq ONLY
+            # INCREMENTS..." section for why `match.last_seq` must stay
+            # untouched here too, not just the two sends below.
+            return
+
+        match.last_seq += 1
+        seq = match.last_seq
+
+        if board_delta:
+            await self._protocol.broadcast(connections, self._protocol.format_board_delta(seq, board_delta))
+        match.last_board_snapshot = current_occupancy
+
+        if send_log_delta:
+            score = match.session.score_observer.snapshot()
+            clock_ms = match.session.engine.state.clock_ms
+            newest_entry = log.entries[-1]
+            await self._protocol.broadcast(
+                connections, self._protocol.format_log_delta(seq, score, newest_entry, clock_ms)
+            )
+            match.last_log_entry_count = len(log.entries)
 
     async def _apply_and_notify_rating_update(self, match: _Match, event: GameOver) -> None:
         """Compute and persist a real ELO update for both of `match`'s
