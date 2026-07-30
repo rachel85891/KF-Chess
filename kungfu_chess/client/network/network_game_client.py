@@ -304,6 +304,49 @@ convention): 0.5s, 1s, 2s, then 2s repeating for every attempt after
 that - waited BEFORE each attempt (including the very first), so a
 genuine drop is never retried faster than 0.5s, matching this stage's
 own task description exactly.
+
+STAGE G4 - LEAN WIRE PROTOCOL: seq-GAP DETECTION + RESYNC_REQUEST
+(feature/g4-lean-wire-protocol): this class stays exactly as "dumb"
+about board/log semantics as its own "WHAT THIS CLASS DELIBERATELY DOES
+NOT DO" section above already establishes - it does NOT parse
+BOARD_DELTA/LOG_DELTA payloads at all (that stays
+kungfu_chess.client.loop.network_game_loop_runner.NetworkGameLoopRunner's
+own job, mirroring the identical EVT:/STATE: division of labor already
+in place). The ONLY new thing this class does is read the bare `<seq>`
+field BOARD_DELTA/LOG_DELTA both carry (a plain int, not their own
+occupancy/log CONTENT) and detect a gap - added as one new line inside
+`_receive_loop`'s own `async for` loop body, its pre-existing
+ConnectionClosed try/except left completely untouched (G1's own
+territory - see server/application/game_server.py's own "STAGE G4"
+docstring section for the full cross-stage file-overlap check this
+mirrors).
+
+WHY THIS RUNS AS A PLAIN, DIRECTLY-AWAITED COROUTINE, NOT VIA
+run_coroutine_threadsafe (UNLIKE send_move/send_jump): `_receive_loop`
+already runs ON the background loop's own thread (same reasoning
+`_do_connect`'s own docstring already gives for why ITS OWN
+`asyncio.get_running_loop().create_task(...)` call needs no
+run_coroutine_threadsafe either) - `run_coroutine_threadsafe` exists
+specifically to get INTO that thread from a different one; there is no
+such crossing to do here, so `await self._connection.send(...)`
+directly is the correct, simpler primitive, wrapped in the same
+already-closed-connection swallow every other real send in this class
+uses.
+
+WHY A GAP TRIGGERS EXACTLY ONE RESYNC_REQUEST, NOT ONE PER STRAY
+MESSAGE: `self._awaiting_resync` is set the moment a gap is detected,
+and the very NEXT BOARD_DELTA/LOG_DELTA seen (regardless of its own
+`seq` value relative to the pre-gap baseline) is accepted UNCONDITIONALLY
+as this client's new baseline, clearing the flag - see
+server/application/game_server.py's own "STAGE G4" docstring section
+for why the RESYNC_REQUEST response itself (the kept, unmodified full
+board-text/state-snapshot messages) carries no `seq` field of its own at
+all: the server's own resync handler resets ITS OWN bookkeeping to agree
+with what it just sent, and the very next real event's `seq` simply
+continues counting up from there - this class does not need to inspect
+the resync response's own content (it never does, for any message) to
+know that whatever `seq` value shows up next IS the fresh baseline to
+resume from.
 """
 
 from __future__ import annotations
@@ -343,6 +386,12 @@ _ROOM_CREATED_PREFIX = "room_created:"
 _ROOM_JOINED_GUEST_MESSAGE = "room_joined:guest"
 _ROOM_JOINED_VIEWER_MESSAGE = "room_joined:viewer"
 _ROOM_NOT_FOUND_MESSAGE = "room_not_found"
+# Stage G4 - duplicated here (not imported from server/), matching every
+# constant above it's own identical "a client must never import from
+# server/" convention - see module docstring's "STAGE G4" section.
+_BOARD_DELTA_PREFIX = "BOARD_DELTA:"
+_LOG_DELTA_PREFIX = "LOG_DELTA:"
+RESYNC_REQUEST_MESSAGE = "RESYNC_REQUEST"
 
 _THREAD_START_TIMEOUT_S = 5.0
 _CLOSE_TIMEOUT_S = 5.0
@@ -511,6 +560,14 @@ class NetworkGameClient:
         self._reconnect_room_choice: Optional[str] = None
         self._reconnect_on_searching_for_opponent: Optional[Callable[[], None]] = None
         self._reconnect_on_room_created: Optional[Callable[[str], None]] = None
+
+        # Stage G4 - see module docstring's "STAGE G4" section.
+        # self._last_seq=0 needs no special-casing for the first real
+        # BOARD_DELTA/LOG_DELTA (seq=1, the server's own first real
+        # increment): 1 != 0 + 1 is False, so no gap is ever falsely
+        # detected on the very first one.
+        self._last_seq: int = 0
+        self._awaiting_resync: bool = False
 
     def connect(
         self,
@@ -726,6 +783,7 @@ class NetworkGameClient:
 
         try:
             async for message in self._connection:
+                await self._track_seq_and_maybe_resync(message)
                 self._incoming.put(message)
         except ConnectionClosed:
             # Stage G1 - only a connection that was genuinely ACTIVE
@@ -801,6 +859,61 @@ class NetworkGameClient:
                 continue
 
             return
+
+    async def _track_seq_and_maybe_resync(self, message: object) -> None:
+        """Stage G4 - the one piece of seq-gap detection this class
+        performs (see module docstring's "STAGE G4" section for the
+        full reasoning) - does NOT alter `message` or skip queuing it;
+        `poll_incoming()`'s own stream is unaffected either way.
+
+        Args:
+            message: The raw message just received, BEFORE it is queued.
+
+        Returns:
+            None.
+        """
+
+        seq = self._extract_seq(message)
+        if seq is None:
+            return  # Not a BOARD_DELTA/LOG_DELTA message - nothing to track.
+
+        if self._awaiting_resync:
+            # The very next delta after a detected gap is accepted
+            # unconditionally as the fresh baseline - see module
+            # docstring's "WHY A GAP TRIGGERS EXACTLY ONE
+            # RESYNC_REQUEST..." section.
+            self._last_seq = seq
+            self._awaiting_resync = False
+            return
+
+        if seq != self._last_seq + 1:
+            self._awaiting_resync = True
+            try:
+                await self._connection.send(RESYNC_REQUEST_MESSAGE)
+            except ConnectionClosed:
+                pass
+            return
+
+        self._last_seq = seq
+
+    def _extract_seq(self, message: object) -> Optional[int]:
+        """The bare `<seq>` field from a BOARD_DELTA/LOG_DELTA message,
+        or None for any other message (including a malformed one) -
+        does NOT otherwise parse either message's own payload, per
+        module docstring's "STAGE G4" section."""
+
+        if not isinstance(message, str):
+            return None
+
+        for prefix in (_BOARD_DELTA_PREFIX, _LOG_DELTA_PREFIX):
+            if message.startswith(prefix):
+                seq_text = message[len(prefix) :].split(":", 1)[0]
+                try:
+                    return int(seq_text)
+                except ValueError:
+                    return None
+
+        return None
 
     def send_move(self, color: Color, piece_kind: PieceKind, from_cell: Position, to_cell: Position) -> None:
         """Format and send a move command - fire-and-forget from the

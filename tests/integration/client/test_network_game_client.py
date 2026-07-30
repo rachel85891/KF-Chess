@@ -274,16 +274,17 @@ def test_send_move_then_poll_eventually_surfaces_the_expected_broadcast():
         timeout_s = (2 * MS_PER_SQUARE) / 1000 + 3.0
 
         def has_arrival_broadcast(messages: list[str]) -> bool:
-            # Stage B7 (server track) added a new, single-line wire-
-            # format event message alongside every existing multi-line
-            # board-text broadcast (kungfu_chess/notation/
-            # game_event_wire_format.py) - poll_incoming() now returns a
-            # mix of both message shapes, so a short message (too few
-            # lines to be board text) is skipped here rather than
-            # indexed blindly; this predicate is only ever looking for
-            # the multi-line board-text broadcast anyway.
-            lines_per_message = [msg.splitlines() for msg in messages]
-            return any(len(lines) > 4 and lines[4].split()[4] == "wP" for lines in lines_per_message)
+            # UPDATED for Stage G4's lean wire protocol (feature/g4-lean-
+            # wire-protocol): the old per-event full multi-line
+            # board-text broadcast is gone - server/application/
+            # game_server.py's own `_broadcast_event` now sends a single-
+            # line "BOARD_DELTA:<seq>:..." message with only the changed
+            # cells instead (see that module's own "STAGE G4" docstring
+            # section). e6->e4 is a 2-square pawn move, so this predicate
+            # looks for the arriving pawn's own destination cell (e4)
+            # inside a BOARD_DELTA message rather than indexing a full
+            # board-text broadcast.
+            return any(msg.startswith("BOARD_DELTA:") and "e4:wP" in msg for msg in messages)
 
         messages1 = _poll_until(client1, has_arrival_broadcast, timeout_s)
         messages2 = _poll_until(client2, has_arrival_broadcast, timeout_s)
@@ -747,4 +748,135 @@ def test_a_rejected_connect_never_triggers_a_background_reconnect_loop():
         assert test_server.game_server._connection_manager.connection_count == 0
     finally:
         client.close()
+        test_server.stop()
+
+
+# --- Stage G4 (feature/g4-lean-wire-protocol) - seq-gap detection / RESYNC_REQUEST ---
+
+
+class _FakeConnection:
+    """A minimal stand-in for a real ClientConnection - only `send` is
+    ever called by `_track_seq_and_maybe_resync`, so only `send` is
+    faked here. Records every text sent, in order."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, text: str) -> None:
+        self.sent.append(text)
+
+
+def test_track_seq_and_maybe_resync_detects_a_gap_and_sends_exactly_one_resync_request():
+    """Pure, no real server/networking - directly exercises
+    NetworkGameClient's own seq-gap-detection logic (see that module's
+    own "STAGE G4" docstring section) with a fake connection standing in
+    for the real one."""
+
+    client = NetworkGameClient()
+    client._connection = _FakeConnection()
+
+    async def scenario():
+        # seq=1 is the expected first real delta (self._last_seq starts
+        # at 0) - no gap, nothing sent.
+        await client._track_seq_and_maybe_resync("BOARD_DELTA:1:e2:.,e4:wP")
+        assert client._connection.sent == []
+        assert client._last_seq == 1
+        assert client._awaiting_resync is False
+
+        # seq jumps to 3 - a real gap (seq 2 was lost) - exactly one
+        # RESYNC_REQUEST is sent.
+        await client._track_seq_and_maybe_resync("LOG_DELTA:3:0:0:0:M,P,W,e2,e4,0,0")
+        assert client._connection.sent == ["RESYNC_REQUEST"]
+        assert client._awaiting_resync is True
+
+        # A further delta arriving before the resync response is
+        # processed is accepted UNCONDITIONALLY as the new baseline - no
+        # second RESYNC_REQUEST, regardless of its own seq value.
+        await client._track_seq_and_maybe_resync("BOARD_DELTA:4:e4:.")
+        assert client._connection.sent == ["RESYNC_REQUEST"]  # still just the one
+        assert client._awaiting_resync is False
+        assert client._last_seq == 4
+
+    asyncio.run(scenario())
+
+
+def test_track_seq_and_maybe_resync_ignores_every_non_delta_message():
+    """This class stays "dumb" about board/log semantics (see module
+    docstring's "STAGE G4" section) - it only ever reads the bare `seq`
+    field from BOARD_DELTA/LOG_DELTA messages; every other message shape
+    (EVT:, assigned_color:, etc.) is left completely untouched."""
+
+    client = NetworkGameClient()
+    client._connection = _FakeConnection()
+
+    async def scenario():
+        await client._track_seq_and_maybe_resync("EVT:MOVE:1:e2:e4:2000")
+        await client._track_seq_and_maybe_resync("assigned_color:white:1200")
+        await client._track_seq_and_maybe_resync("STATE:0:0:0:")
+
+        assert client._connection.sent == []
+        assert client._last_seq == 0
+        assert client._awaiting_resync is False
+
+    asyncio.run(scenario())
+
+
+def test_a_detected_seq_gap_triggers_a_real_resync_request_and_the_server_responds_with_a_fresh_baseline():
+    """Real, end-to-end: a real server, a real client, a real dropped-
+    message simulation (directly corrupting this client's own view of
+    its last-seen seq, per this stage's own "directly manipulating the
+    test's own view of what the client 'received'" suggested approach) -
+    confirms the client really does send a real RESYNC_REQUEST over the
+    wire and the server really does respond with a fresh, full baseline
+    ("STATE:" only ever appears as a resync response after this stage -
+    see server/application/game_server.py's own "STAGE G4" docstring
+    section - so seeing one at all IS the proof the round trip worked),
+    after which this client's own seq-tracking has resumed cleanly."""
+
+    test_server = _BackgroundTestServer()
+    client1 = NetworkGameClient()
+    client2 = NetworkGameClient()
+    try:
+        thread1 = _start_connect(client1, test_server.uri, "client1", "password1")
+        thread2 = _start_connect(client2, test_server.uri, "client2", "password2")
+        thread1.join(timeout=_JOIN_TIMEOUT_S)
+        thread2.join(timeout=_JOIN_TIMEOUT_S)
+        white_client, _black_client = _white_and_black(client1, client2)
+
+        # Drain the join-time board-text broadcast first.
+        _poll_until(white_client, lambda messages: len(messages) >= 1, _POLL_TIMEOUT_S)
+
+        # Simulate having missed a message: corrupt this client's own
+        # last-seen seq so the very next real delta looks like a gap.
+        white_client._last_seq = 10
+
+        white_client.send_move(Color.WHITE, PieceKind.PAWN, Position(row=6, col=4), Position(row=4, col=4))
+
+        all_messages: list[str] = []
+
+        def resync_response_seen(messages: list[str]) -> bool:
+            all_messages.extend(messages)
+            return any(msg.startswith("STATE:") for msg in all_messages)
+
+        # MoveAccepted's own LOG_DELTA (seq=1) arrives near-instantly and
+        # is what actually triggers the gap/RESYNC_REQUEST/response -
+        # this half resolves quickly, well before any real motion time.
+        _poll_until(white_client, resync_response_seen, _POLL_TIMEOUT_S)
+        assert resync_response_seen([]), "server never sent a real RESYNC_REQUEST response"
+
+        # `_awaiting_resync` only actually clears once the NEXT real
+        # delta arrives and is accepted as the fresh baseline - that is
+        # PieceArrived's own BOARD_DELTA, which needs the tick loop to
+        # advance real motion time first (2 squares).
+        motion_timeout_s = (2 * MS_PER_SQUARE) / 1000 + 5.0
+        _poll_until(white_client, lambda _messages: not white_client._awaiting_resync, motion_timeout_s)
+
+        assert white_client._awaiting_resync is False
+        # This client's own last_seq was accepted from whatever real
+        # delta arrived right after the resync - no longer the
+        # corrupted, pre-gap value.
+        assert white_client._last_seq != 10
+    finally:
+        client1.close()
+        client2.close()
         test_server.stop()
