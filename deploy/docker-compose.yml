@@ -1,0 +1,86 @@
+# Stage I0 - Docker Compose: small, working, end-to-end version.
+#
+# Real scope of this stage (see server/main.py's own "STAGE I0" module
+# docstring section for the full explanation): postgres/redis come up
+# and are network-reachable AS INFRASTRUCTURE, proven by a lightweight
+# startup connectivity check inside the server process itself. Neither
+# is read from or written to by any application logic yet - account
+# data still flows through SqliteUserRepository (this stack's own
+# `sqlite_data` volume, below) and matchmaking still flows through
+# InMemorySessionCoordinator, both completely unchanged by this stage.
+# Stage I1/I2 build the real PostgresUserRepository/
+# RedisSessionCoordinator implementations that will actually use these
+# two services.
+#
+# No image tag below floats on `latest` - every image is pinned to a
+# specific stable version, per this stage's own checklist.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kfchess
+      POSTGRES_PASSWORD: kfchess
+      POSTGRES_DB: kfchess
+    volumes:
+      # Named volume for Postgres's own data directory - a container
+      # restart (`docker compose down` without `-v` / a crash-restart)
+      # does not silently lose data. No replication (Stage I1's job).
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kfchess -d kfchess"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    # No persistence flags (e.g. --appendonly yes) - per
+    # Server_Design.md §5.5/§5.9's own framing of this store as
+    # bounded-loss-tolerant. Single instance, no Sentinel/Cluster
+    # (Stage I2's job).
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      # `depends_on` alone only waits for container START, not
+      # readiness - `condition: service_healthy` makes Compose
+      # actually wait for each dependency's own healthcheck above to
+      # pass first, so the server's own Stage I0 startup connectivity
+      # check (server/main.py) has a real, fair chance to succeed on
+      # its first attempt rather than racing container boot.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # SERVER_HOST=0.0.0.0: a process bound to localhost/127.0.0.1
+      # inside a container only accepts connections originating from
+      # within that same container's network namespace - Compose's
+      # own port-mapping below requires binding to all interfaces to
+      # be reachable from outside the container at all. See
+      # server/main.py's own "STAGE I0" module docstring section.
+      SERVER_HOST: "0.0.0.0"
+      # Points SqliteUserRepository at the mounted volume path below,
+      # so a container restart doesn't silently wipe accounts.
+      SQLITE_DB_PATH: /data/kfchess.db
+      # Service names (`postgres`/`redis`), not `localhost` - resolved
+      # by Compose's own internal DNS between containers on the same
+      # default network.
+      POSTGRES_URL: postgresql://kfchess:kfchess@postgres:5432/kfchess
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - sqlite_data:/data
+    ports:
+      - "8765:8765"
+
+volumes:
+  postgres_data:
+  sqlite_data:

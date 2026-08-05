@@ -1,0 +1,10 @@
+# Stage I0 - keeps the build context (COPY . . in Dockerfile) limited
+# to what the server process actually needs, rather than accidentally
+# baking local dev/VCS artifacts into the image.
+.git
+.pytest_cache
+**/__pycache__
+**/*.pyc
+.venv
+venv
+*.egg-info
