@@ -89,7 +89,12 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
-_DEFAULT_RATING_RANGE = 100
+# Public (no leading underscore) - Stage I2's RedisSessionCoordinator
+# imports this exact constant rather than retyping the "100 points,
+# inclusive" rule as a second literal (see session_coordinator.py's own
+# module docstring). Value/semantics unchanged from this module's own
+# original private constant of the same name.
+RATING_RANGE_POINTS = 100
 
 
 @dataclass(frozen=True)
@@ -184,7 +189,7 @@ class MatchmakingQueue:
         entries = list(self._waiting.values())
         for i, first in enumerate(entries):
             for second in entries[i + 1 :]:
-                if abs(first.rating - second.rating) <= _DEFAULT_RATING_RANGE:
+                if abs(first.rating - second.rating) <= RATING_RANGE_POINTS:
                     return first, second
         return None
 

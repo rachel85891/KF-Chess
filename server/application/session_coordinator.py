@@ -137,10 +137,14 @@ RoomFullError's own real trigger condition is.
 
 from __future__ import annotations
 
+import json
+import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Protocol, Tuple, runtime_checkable
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
-from server.application.matchmaking_queue import MatchmakingQueue, WaitingPlayer
+import redis
+
+from server.application.matchmaking_queue import MatchmakingQueue, RATING_RANGE_POINTS, WaitingPlayer
 from server.application.room import Role, Room, RoomCodeGenerator
 
 # Type aliases, not new competing dataclasses - see module docstring's
@@ -304,3 +308,279 @@ class InMemorySessionCoordinator:
 
         room.add_viewer(identity)
         return RoomJoinResult(room=room, role=Role.VIEWER)
+
+
+class RedisSessionCoordinator:
+    """Stage I2's real, distributed SessionCoordinator implementation -
+    backed by real Redis (Server_Design.md §1.6/§2.3/§2.4/§2.6/§5.5),
+    the exact "future distributed implementation" this module's own
+    docstring described but deliberately did not build. Satisfies the
+    SessionCoordinator Protocol structurally, exactly like
+    InMemorySessionCoordinator - never declared as a subclass of it.
+
+    WHAT'S GENUINELY REUSED VS. GENUINELY REIMPLEMENTED HERE, PER THIS
+    STAGE'S OWN REQUIREMENTS: MatchmakingQueue's own in-process pairing
+    algorithm is NOT reused (a Redis sorted set needs a genuinely
+    different, Redis-native pairing query) - but its own pairing
+    PREDICATE, `RATING_RANGE_POINTS` (imported, never retyped as a
+    second literal), is. RoomCodeGenerator and Room ARE both reused
+    verbatim, unmodified - the Redis-backed room registry stores a
+    serialized snapshot of the SAME real Room state Room's own
+    capacity/role methods already produce and enforce; it does not
+    reimplement any of that logic a second time.
+
+    SYNCHRONOUS `redis.Redis`, NOT `redis.asyncio.Redis` (a deliberate
+    DEVIATION from this stage's own prompt, which used
+    `redis.asyncio.Redis` only as an illustrative example, not a hard
+    requirement) - THE reason: `SessionCoordinator`'s own Protocol
+    methods (`find_match`/`create_room`/`join_room`, above) are plain
+    `def`, not `async def` - a caller does `result = coordinator.
+    find_match(...)` and expects an actual `Optional[MatchResult]`
+    back, not a coroutine that still needs awaiting. Implementing this
+    class's own methods as `async def` over `redis.asyncio.Redis` would
+    make `isinstance(coordinator, SessionCoordinator)` still pass
+    (`@runtime_checkable` only checks attribute names exist, never
+    signatures/async-ness), while silently breaking every synchronous
+    caller and, more importantly, breaking this very stage's own
+    central "same test suite, unchanged, against both backends"
+    requirement - a parametrized test calling `coordinator.find_match(
+    ...)` synchronously would receive a coroutine object instead of a
+    real result for the Redis parameter value alone. Staying
+    synchronous is what makes that shared contract suite
+    (test_session_coordinator_contract.py) genuinely run the SAME
+    assertions against both implementations, not two different calling
+    conventions dressed up as one Protocol. (server/main.py's own
+    Stage I0 startup connectivity check uses `redis.asyncio.Redis`
+    correctly - that check runs inside an already-async context with no
+    Protocol to satisfy at all; not a precedent this class's own,
+    differently-constrained situation should follow.)
+
+    CONSTRUCTOR TAKES `redis_url` OR AN INJECTED `client`, MIRRORING
+    Stage I1's OWN DSN-vs-injected-client REASONING for consistency
+    across these two parallel stages: production code (a future
+    composition root, not this stage's own scope - see Requirement #3)
+    passes `redis_url` (matching `REDIS_URL`'s own shape from
+    docker-compose.yml) and this class builds its own connection
+    pool via `redis.Redis.from_url(...)`; tests inject an
+    already-connected `client` instead, both so no test needs to parse
+    a URL a second time and so a test can point multiple coordinator
+    instances at ONE already-verified-reachable connection without
+    reconnecting per instance.
+
+    WHY A LOCAL, PER-INSTANCE `_room_cache` EXISTS AT ALL (Redis is
+    still the only cross-process source of truth - this cache does NOT
+    change that): test_session_coordinator_contract.py's own shared
+    suite includes `test_join_room_uses_the_same_room_instance_across_
+    repeated_joins`, asserting `first.room is second.room` - a REAL
+    Python object-identity guarantee InMemorySessionCoordinator gives
+    "for free" purely because its own `_rooms` dict holds one instance
+    forever. A pure "reconstruct a fresh Room from Redis on every call"
+    implementation would never satisfy that within even a SINGLE
+    coordinator instance, let alone across processes - so this class
+    keeps a local, per-instance `Dict[RoomCode, Tuple[Room, List[dict]]]`
+    write-through cache: the SAME Room object is reused (and mutated
+    in place, exactly like InMemorySessionCoordinator's own `join_room`)
+    for every call reaching THIS instance, with the authoritative,
+    ordered member list re-persisted to the Redis hash after every
+    mutation so any OTHER coordinator instance (a different process, or
+    this same process after a cache eviction that never actually
+    happens here) can correctly reconstruct an EQUIVALENT - necessarily
+    not object-identical - Room by replaying that same ordered list
+    through Room.add_player()/add_viewer() (see `_reconstruct_room`,
+    below). This is the honest, expected shape of the guarantee a
+    distributed store can actually make: the DATA is canonical and
+    shared; no Python object ever is, or could be, shared across a
+    real process boundary. The extra, beyond-the-required-list
+    `test_redis_session_coordinator_join_room_reconstructs_the_same_room_
+    data_from_a_second_coordinator_instance` test (contract file) is the
+    real proof of THIS half of the guarantee.
+
+    IDENTITY VALUES MUST BE JSON-SERIALIZABLE HERE, UNLIKE
+    InMemorySessionCoordinator's FULLY AGNOSTIC `object` TYPING: Room's
+    own `host_identity`/`identity` parameters, and MatchmakingQueue's
+    own `connection_id`, are typed as bare `object` because the
+    in-memory implementation never needs to serialize them. This
+    Redis-backed implementation does (JSON, for both the sorted-set
+    member payload and the room-registry hash value) - a real, stated
+    scope narrowing versus the Protocol's own fully agnostic typing, but
+    not a problem THIS stage's own scope actually hits: wiring real
+    connection objects through this coordinator (which would need a
+    real, serializable identity, e.g. a connection id string, chosen at
+    that point) is explicitly Phase 4's job, not this stage's (see
+    Requirement #2/#3) - documented here as accepted, deferred scope,
+    not silently ignored.
+    """
+
+    _QUEUE_KEY_SUFFIX = "matchmaking:queue"
+    _ROOMS_KEY_SUFFIX = "rooms"
+
+    def __init__(
+        self,
+        redis_url: Optional[str] = None,
+        client: Optional["redis.Redis"] = None,
+        room_code_generator: Optional[RoomCodeGenerator] = None,
+        clock: Callable[[], float] = time.perf_counter,
+        key_prefix: str = "kfchess",
+    ) -> None:
+        """Create a coordinator.
+
+        Args:
+            redis_url: A real `redis://...` URL - this instance builds
+                its own `redis.Redis.from_url(...)` client from it.
+                Mutually exclusive with `client` (see class docstring's
+                "CONSTRUCTOR TAKES..." section).
+            client: An already-constructed `redis.Redis` instance to use
+                instead of building one from `redis_url` - injectable
+                (DIP) purely for testability.
+            room_code_generator: Same injectable RoomCodeGenerator
+                InMemorySessionCoordinator accepts - defaults to a
+                fresh, real one.
+            clock: Same injectable-clock convention as MatchmakingQueue's
+                own constructor - only ever used to order a pair by
+                which entry joined earlier (see class docstring); no
+                required test needs this settable, but it stays
+                consistent with this project's own established
+                "inject the clock" convention rather than a bare
+                `time.perf_counter()` call sprinkled inline.
+            key_prefix: Namespaces every Redis key this instance reads
+                or writes (`f"{key_prefix}:matchmaking:queue"`,
+                `f"{key_prefix}:rooms"`) - defaults to `"kfchess"` for
+                production; tests pass a unique prefix per test so
+                parallel/repeated test runs against one real, shared
+                Redis instance never collide with each other's own
+                queue/room state.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If neither `redis_url` nor `client` is given.
+        """
+
+        if client is not None:
+            self._client = client
+        elif redis_url is not None:
+            self._client = redis.Redis.from_url(redis_url, decode_responses=True)
+        else:
+            raise ValueError("RedisSessionCoordinator requires either redis_url or client")
+
+        self._room_code_generator = room_code_generator if room_code_generator is not None else RoomCodeGenerator()
+        self._clock = clock
+        self._queue_key = f"{key_prefix}:{self._QUEUE_KEY_SUFFIX}"
+        self._rooms_key = f"{key_prefix}:{self._ROOMS_KEY_SUFFIX}"
+        # See class docstring's "WHY A LOCAL, PER-INSTANCE `_room_cache`
+        # EXISTS AT ALL" section - Redis (self._rooms_key) remains the
+        # only cross-process source of truth; this is a write-through
+        # cache on top of it, local to this one instance.
+        self._room_cache: Dict[RoomCode, Tuple[Room, List[dict]]] = {}
+
+    def find_match(self, connection_id: object, username: str, rating: int) -> Optional[MatchResult]:
+        """See SessionCoordinator.find_match's own docstring - a
+        Redis-native pairing query (a sorted set scored by rating),
+        NOT a wrapper around MatchmakingQueue (see class docstring's
+        "WHAT'S GENUINELY REUSED..." section). Reuses MatchmakingQueue's
+        own `RATING_RANGE_POINTS` constant for the "100 points,
+        inclusive" predicate.
+
+        Identity values must be JSON-serializable here - see class
+        docstring's own section on this.
+        """
+
+        entry = {
+            "connection_id": connection_id,
+            "username": username,
+            "rating": rating,
+            "joined_at": self._clock(),
+        }
+        # sort_keys=True: a deterministic serialization of THIS entry,
+        # so the exact same string can be recognized (and excluded as
+        # "self") when it comes back out of ZRANGEBYSCORE just below,
+        # and passed to ZREM verbatim once a match is confirmed.
+        member = json.dumps(entry, sort_keys=True)
+        self._client.zadd(self._queue_key, {member: rating})
+
+        low, high = rating - RATING_RANGE_POINTS, rating + RATING_RANGE_POINTS
+        raw_candidates = self._client.zrangebyscore(self._queue_key, low, high)
+        candidates = [json.loads(raw) for raw in raw_candidates if raw != member]
+        if not candidates:
+            # No compatible partner waiting yet - this entry stays
+            # queued in the sorted set for a later call to find.
+            return None
+
+        # Mirrors MatchmakingQueue's own FIFO-fairness spirit (see that
+        # module's own "PAIRING STRATEGY" section) without needing to
+        # replicate its exact scan order: among every rating-compatible
+        # candidate, the one that has been waiting longest is chosen.
+        partner = min(candidates, key=lambda candidate: candidate["joined_at"])
+        partner_member = json.dumps(partner, sort_keys=True)
+        self._client.zrem(self._queue_key, member, partner_member)
+
+        self_player = WaitingPlayer(**entry)
+        partner_player = WaitingPlayer(**partner)
+        if self_player.joined_at <= partner_player.joined_at:
+            return self_player, partner_player
+        return partner_player, self_player
+
+    def create_room(self, host_identity: object) -> RoomCode:
+        """See SessionCoordinator.create_room's own docstring - the
+        Redis hash (self._rooms_key) IS the "full set of active codes"
+        a coordinator needs to re-roll a collision against, exactly the
+        same role InMemorySessionCoordinator's own `_rooms` dict plays."""
+
+        code = self._room_code_generator.generate()
+        while self._client.hexists(self._rooms_key, code):
+            code = self._room_code_generator.generate()
+
+        members: List[dict] = [{"identity": host_identity, "role": Role.HOST.value}]
+        self._client.hset(self._rooms_key, code, json.dumps(members))
+        self._room_cache[code] = (Room(code=code, host_identity=host_identity), members)
+        return code
+
+    def join_room(self, code: RoomCode, identity: object) -> Optional[RoomJoinResult]:
+        """See SessionCoordinator.join_room's own docstring - GUEST-vs-
+        VIEWER is decided via Room.can_add_player(), reused unmodified,
+        exactly like InMemorySessionCoordinator. See class docstring's
+        "WHY A LOCAL, PER-INSTANCE `_room_cache` EXISTS AT ALL" section
+        for why a cache hit returns the SAME Room instance, and a cache
+        miss reconstructs an equivalent one from Redis's own persisted,
+        ordered member list."""
+
+        cached = self._room_cache.get(code)
+        if cached is None:
+            raw = self._client.hget(self._rooms_key, code)
+            if raw is None:
+                return None
+            members = json.loads(raw)
+            room = self._reconstruct_room(code, members)
+            self._room_cache[code] = (room, members)
+        else:
+            room, members = cached
+
+        if room.can_add_player():
+            room.add_player(identity)
+            role = Role.GUEST
+        else:
+            room.add_viewer(identity)
+            role = Role.VIEWER
+
+        members.append({"identity": identity, "role": role.value})
+        self._client.hset(self._rooms_key, code, json.dumps(members))
+        return RoomJoinResult(room=room, role=role)
+
+    def _reconstruct_room(self, code: RoomCode, members: List[dict]) -> Room:
+        """Rebuild a real Room from its persisted, ordered member list -
+        by REPLAYING it through Room.add_player()/add_viewer(), never by
+        poking at Room's own internal state directly, so Room's own
+        already-tested capacity/role rules are exactly what decide
+        whether this replay is even valid (it always is, here, since
+        `members` only ever holds a sequence this same class itself
+        already produced via those same two real methods)."""
+
+        host_identity = members[0]["identity"]
+        room = Room(code=code, host_identity=host_identity)
+        for member in members[1:]:
+            if member["role"] == Role.GUEST.value:
+                room.add_player(member["identity"])
+            else:
+                room.add_viewer(member["identity"])
+        return room
