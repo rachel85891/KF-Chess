@@ -7,72 +7,32 @@ wired it up). Every test uses an in-memory SQLite database
 (db_path=":memory:") - never touches disk, per this stage's own
 "support both a real file path and :memory: so tests never touch disk"
 requirement.
+
+STAGE I1 RE-SCOPE: this file originally held 11 tests. 9 of them used
+only the four public UserRepository Protocol methods and have moved to
+the new, genuinely backend-agnostic
+tests/unit/server/test_user_repository_contract.py, parameterized over
+both SqliteUserRepository and PostgresUserRepository - see that file's
+own module docstring for the full split rationale. The 2 tests below
+are the ones that stay HERE, specifically because they reach into
+SqliteUserRepository's own private `_connection` attribute - a
+SQLite-only shape a Postgres-backed class doesn't share - to prove a
+real negative about the raw stored row (no plaintext storage, real
+per-user salting). They are re-scoped, by this comment, as SQLite-
+implementation-specific proofs of a PROPERTY that PostgresUserRepository
+must satisfy too, just verified through Postgres's own equivalent raw-
+row access instead - see
+tests/unit/server/test_postgres_user_repository.py for those direct
+Postgres-side equivalents.
 """
 
 from __future__ import annotations
 
-import sqlite3
-
-import pytest
-
-from server.persistence.user_repository import DEFAULT_STARTING_RATING, SqliteUserRepository, UserNotFoundError
+from server.persistence.user_repository import SqliteUserRepository
 
 
 def _repo() -> SqliteUserRepository:
     return SqliteUserRepository(db_path=":memory:")
-
-
-def test_create_account_succeeds_for_a_new_username_with_the_default_starting_rating():
-    repo = _repo()
-
-    created = repo.create_account("alice", "correct horse battery staple")
-
-    assert created is True
-    assert repo.get_rating("alice") == DEFAULT_STARTING_RATING
-
-
-def test_create_account_fails_for_a_duplicate_username_and_leaves_the_original_untouched():
-    repo = _repo()
-    repo.create_account("alice", "first-password")
-    repo.update_rating("alice", 1350)  # give the original account distinguishable state
-
-    created_again = repo.create_account("alice", "a-completely-different-password")
-
-    assert created_again is False
-    # The original account's password and rating are both untouched by
-    # the failed duplicate attempt - not silently overwritten.
-    assert repo.verify_login("alice", "first-password") is True
-    assert repo.verify_login("alice", "a-completely-different-password") is False
-    assert repo.get_rating("alice") == 1350
-
-
-def test_verify_login_succeeds_with_the_correct_password():
-    repo = _repo()
-    repo.create_account("alice", "correct horse battery staple")
-
-    assert repo.verify_login("alice", "correct horse battery staple") is True
-
-
-def test_verify_login_fails_with_a_wrong_password():
-    repo = _repo()
-    repo.create_account("alice", "correct horse battery staple")
-
-    assert repo.verify_login("alice", "wrong password") is False
-
-
-def test_verify_login_fails_for_a_nonexistent_username_indistinguishably_from_a_wrong_password():
-    repo = _repo()
-    repo.create_account("alice", "correct horse battery staple")
-
-    # Same return type/value (False) for "wrong password" and "username
-    # never existed at all" - see module docstring's own "username-
-    # enumeration-safety" section for why this must never differ.
-    wrong_password_result = repo.verify_login("alice", "wrong password")
-    nonexistent_user_result = repo.verify_login("someone-who-never-signed-up", "anything")
-
-    assert wrong_password_result is False
-    assert nonexistent_user_result is False
-    assert type(wrong_password_result) is type(nonexistent_user_result)
 
 
 def test_password_is_never_stored_in_plaintext_anywhere_in_the_stored_row():
@@ -118,43 +78,3 @@ def test_two_users_with_the_same_password_get_different_stored_hashes():
     # different salts/hashes - proving the difference isn't a bug.
     assert repo.verify_login("alice", shared_password) is True
     assert repo.verify_login("bob", shared_password) is True
-
-
-def test_get_rating_and_update_rating_round_trip():
-    repo = _repo()
-    repo.create_account("alice", "correct horse battery staple")
-
-    repo.update_rating("alice", 1450)
-
-    assert repo.get_rating("alice") == 1450
-
-
-def test_get_rating_for_a_nonexistent_username_raises_user_not_found_error():
-    repo = _repo()
-
-    with pytest.raises(UserNotFoundError):
-        repo.get_rating("someone-who-never-signed-up")
-
-
-def test_update_rating_for_a_nonexistent_username_raises_user_not_found_error():
-    repo = _repo()
-
-    with pytest.raises(UserNotFoundError):
-        repo.update_rating("someone-who-never-signed-up", 1300)
-
-
-def test_a_real_file_backed_database_path_also_works(tmp_path):
-    # Proves this class also genuinely supports a real file path (not
-    # just ":memory:") - constructed against a tmp_path fixture so this
-    # test still never touches any REAL, persistent project file.
-    db_path = str(tmp_path / "kf_chess_users_test.db")
-
-    repo = SqliteUserRepository(db_path=db_path)
-    repo.create_account("alice", "correct horse battery staple")
-
-    # A second, independent connection to the SAME real file sees the
-    # same, real, committed data - proving this isn't just an in-memory
-    # illusion.
-    repo_reopened = SqliteUserRepository(db_path=db_path)
-    assert repo_reopened.verify_login("alice", "correct horse battery staple") is True
-    assert repo_reopened.get_rating("alice") == DEFAULT_STARTING_RATING
