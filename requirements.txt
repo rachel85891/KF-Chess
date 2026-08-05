@@ -32,3 +32,25 @@ websockets>=13
 # Production deployment targets Linux/Kubernetes (Agones) per
 # Server_Design.md §14, where this installs and is used normally.
 uvloop; sys_platform != "win32"
+
+# asyncpg: async-native PostgreSQL client, matching this project's
+# already-async composition root (server/main.py's own main()) - no
+# reason to introduce a synchronous Postgres client into an asyncio
+# codebase. Used ONLY by Stage I0's own throwaway startup connectivity
+# check (server/main.py's `_check_infra_connectivity`) - it does not
+# back a real PostgresUserRepository yet, that's Stage I1's own
+# deliverable. Unlike uvloop above, this is NOT platform-conditional:
+# real Windows wheels exist (verified directly: asyncpg 0.31.0
+# installs cleanly via a prebuilt wheel on this Windows dev machine).
+asyncpg>=0.29
+
+# redis: the standard redis-py client. Its `redis.asyncio` submodule
+# (the one actually used here, not the sync API) is built into this
+# same package - no separate async package needed (verified directly
+# against the installed 8.1.0). Used ONLY by Stage I0's own throwaway
+# startup connectivity check (server/main.py's
+# `_check_infra_connectivity`) - it does not back a real
+# RedisSessionCoordinator yet, that's Stage I2's own deliverable.
+# Unlike uvloop above, this is NOT platform-conditional: it ships as a
+# pure-Python wheel with no platform-specific build step.
+redis>=5.0

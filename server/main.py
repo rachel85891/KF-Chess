@@ -92,13 +92,52 @@ still true, still tested), but `run_server`/`main` now import and
 construct GameServer deliberately, as this stage's own explicit,
 intentional exception to that original Stage B1 design goal - not an
 oversight or a quiet regression of it.
+
+STAGE I0 - Docker Compose, and what Postgres/Redis do NOT do yet here:
+this stage adds a real `docker-compose.yml` (Postgres + Redis + this
+same server, unchanged) so the 3-container deployment topology can be
+proven to come up and talk to itself, before Stage I1/I2 build the
+real Postgres-backed `UserRepository`/Redis-backed
+`SessionCoordinator` implementations that will actually use these two
+stores. IMPORTANT, read this before assuming otherwise: as of THIS
+stage, Postgres and Redis are present as infrastructure only -
+nothing in this file, or anywhere else in this codebase, reads or
+writes application data through either of them yet. Account data
+still flows entirely through the existing `SqliteUserRepository`
+(now optionally pointed at a Docker-mounted volume via
+`SQLITE_DB_PATH`, below, so a container restart doesn't silently wipe
+accounts) and matchmaking still flows entirely through the existing
+`InMemorySessionCoordinator` - both completely unchanged by this
+stage. The only things this stage adds are:
+  - `SERVER_HOST`/`SQLITE_DB_PATH` environment-variable overrides
+    (read in `main()`, below), so the same unmodified `run_server()`/
+    `GameServer` composition root can be told to bind to `0.0.0.0`
+    (required for Docker's own port-mapping to reach a process bound
+    to `localhost` inside a container - see `deploy/docker-compose.yml`)
+    and to persist its SQLite file to a mounted volume path, instead
+    of only ever using `DEFAULT_HOST`/`SqliteUserRepository`'s own
+    `DEFAULT_DB_PATH` as before. Neither variable set (e.g. every
+    existing test, and any local non-Docker run) reproduces today's
+    exact behavior - this is a strict superset, not a replacement.
+  - A throwaway startup connectivity check (`_run_startup_connectivity_
+    check`, below), run once before `run_server()`, that - only when
+    both `POSTGRES_URL` and `REDIS_URL` are set - opens one real,
+    trivial connection to each, logs success, and closes it
+    immediately without retaining it or using it for anything else.
+    This is the actual proof the Compose topology's container-to-
+    container networking works end-to-end, not merely that the
+    containers started; it deliberately does NOT construct or wire in
+    a `PostgresUserRepository`/`RedisSessionCoordinator` (neither
+    exists yet - that's Stage I1/I2's own job).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+from typing import Optional
 
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
@@ -209,20 +248,35 @@ def build_handler(manager: ConnectionManager):
     return handler
 
 
-async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tuple[Server, GameServer]:
+async def run_server(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    user_repository_db_path: Optional[str] = None,
+) -> tuple[Server, GameServer]:
     """Start the real WebSocket server, wired to the real Stage B3
     protocol (server/game_server.py's GameServer), and return both the
     live Server handle and the GameServer backing it.
 
     Args:
-        host: Interface to bind to. Defaults to localhost (no
-            external-facing deployment concern exists yet at this
-            stage).
+        host: Interface to bind to. Defaults to DEFAULT_HOST
+            (localhost) - Stage I0's own SERVER_HOST env-var override
+            is resolved by the caller (main(), below) and passed in
+            here explicitly, so this function's own default stays
+            exactly what it was before that stage (unaffected local/
+            test usage that never sets the env var at all).
         port: TCP port to bind to. Defaults to DEFAULT_PORT (8765) -
             pass 0 to let the OS assign a free ephemeral port instead
             (used by this module's own tests, so parallel test runs
             never collide with each other or with a real running
             instance on the default port).
+        user_repository_db_path: Forwarded as-is to
+            `GameServer(user_repository_db_path=...)`. Defaults to
+            None, which `GameServer.__init__` already treats
+            identically to "use SqliteUserRepository's own
+            DEFAULT_DB_PATH" - so this function's own default behavior
+            is completely unchanged from before Stage I0. Stage I0's
+            own SQLITE_DB_PATH env-var override is resolved by the
+            caller (main(), below) and passed in here explicitly.
 
     Returns:
         (server, game_server): `server` is the live websockets Server
@@ -246,7 +300,7 @@ async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tupl
     a bare ConnectionManager/build_handler pair the way it used to.
     """
 
-    game_server = GameServer()
+    game_server = GameServer(user_repository_db_path=user_repository_db_path)
     # Stage G2 - pins the `permessage-deflate` extension explicitly.
     # Verified directly against the currently pinned `websockets`
     # version (requirements.txt: `websockets>=13`, installed 16.1.1):
@@ -260,6 +314,83 @@ async def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> tupl
     return server, game_server
 
 
+async def _check_infra_connectivity(postgres_url: str, redis_url: str) -> None:
+    """Stage I0's own infrastructure proof: open one real, trivial
+    connection to Postgres and to Redis, log success, and close each
+    immediately - never retained, never used for anything else (see
+    this module's own "STAGE I0" docstring section for why: neither
+    backend has a real `UserRepository`/`SessionCoordinator`
+    implementation yet, that's Stage I1/I2's own job).
+
+    `asyncpg`/`redis` are imported HERE, not at module level, so that
+    importing `server.main` itself (every existing test already does
+    this) never requires either package to be installed unless this
+    function actually runs - which only happens when both
+    POSTGRES_URL and REDIS_URL are set (see `_run_startup_
+    connectivity_check`, below).
+
+    Args:
+        postgres_url: A real `postgresql://...` DSN - connected to
+            directly, not parsed or validated here (asyncpg does
+            that).
+        redis_url: A real `redis://...` URL - passed straight to
+            `redis.asyncio.Redis.from_url`.
+
+    Raises:
+        Whatever the underlying client raises on a failed connection -
+        deliberately not caught here; the caller (`_run_startup_
+        connectivity_check`) is the one place that decides what a
+        failure means for process startup.
+    """
+
+    import asyncpg
+
+    connection = await asyncpg.connect(postgres_url)
+    await connection.close()
+    logger.info("Stage I0 startup check: Postgres connection succeeded.")
+
+    import redis.asyncio as redis_asyncio
+
+    client = redis_asyncio.Redis.from_url(redis_url)
+    try:
+        await client.ping()
+    finally:
+        await client.aclose()
+    logger.info("Stage I0 startup check: Redis connection succeeded.")
+
+
+def _run_startup_connectivity_check() -> None:
+    """Synchronous entry point for `_check_infra_connectivity`, called
+    once from `main()` before `run_server()` starts. Reads
+    POSTGRES_URL/REDIS_URL from os.environ; if either is unset (e.g.
+    every existing test, and any local non-Docker run), this is a
+    complete no-op - Stage I0's own env-var-gated scope boundary (see
+    this module's own "STAGE I0" docstring section).
+
+    Runs its own throwaway `asyncio.run(...)` event loop rather than
+    being folded into `main()`'s real `_serve_forever()` coroutine:
+    this check must complete (and the process must exit if it fails)
+    BEFORE the real server starts listening at all - a separate,
+    short-lived event loop that begins and ends here keeps that
+    ordering obvious, without tangling this one-shot startup check
+    into the long-lived server loop's own lifecycle.
+    """
+
+    postgres_url = os.environ.get("POSTGRES_URL")
+    redis_url = os.environ.get("REDIS_URL")
+    if postgres_url is None or redis_url is None:
+        return
+
+    try:
+        asyncio.run(_check_infra_connectivity(postgres_url, redis_url))
+    except Exception:
+        logger.exception(
+            "Stage I0 startup connectivity check failed - could not reach "
+            "Postgres and/or Redis. Refusing to start."
+        )
+        sys.exit(1)
+
+
 def main() -> None:
     """Real entry point: run the server (and its background tick loop)
     until the process is killed (Ctrl+C / SIGTERM) - see the
@@ -268,8 +399,23 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO)
 
+    # Stage I0: SERVER_HOST/SQLITE_DB_PATH env-var overrides, resolved
+    # here (not inside run_server(), whose own default parameter
+    # values stay exactly DEFAULT_HOST/None - see its own docstring)
+    # so run_server() itself remains fully testable/callable exactly
+    # as before, with zero Stage I0 awareness of its own. Neither var
+    # set (every existing test, any local non-Docker run) resolves to
+    # exactly today's pre-Stage-I0 values.
+    host = os.environ.get("SERVER_HOST", DEFAULT_HOST)
+    sqlite_db_path = os.environ.get("SQLITE_DB_PATH")
+
+    # Stage I0: proves the Compose topology's networking works
+    # end-to-end - see _run_startup_connectivity_check's own
+    # docstring. Must run before the real server starts listening.
+    _run_startup_connectivity_check()
+
     async def _serve_forever() -> None:
-        server, game_server = await run_server()
+        server, game_server = await run_server(host=host, user_repository_db_path=sqlite_db_path)
         # Created and kept alive as a local variable in THIS coroutine
         # frame, which itself stays alive for the whole process
         # (suspended at `await server.serve_forever()` below) - the
