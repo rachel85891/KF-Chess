@@ -1059,6 +1059,7 @@ from server.presentation.move_command import MalformedCommandError, ParsedMoveCo
 from server.presentation.protocol_handler import (
     RESYNC_REQUEST_MESSAGE,
     SEARCHING_FOR_OPPONENT_MESSAGE,
+    SERVER_FULL_MESSAGE,
     ProtocolHandler,
 )
 from server.presentation.room_choice_command import (
@@ -1305,6 +1306,30 @@ class GameServer:
         Returns:
             None.
         """
+
+        # Stage I4 - the connection-cap check runs BEFORE even the AUTH
+        # message is read (below), so a rejected connection never costs
+        # a wasted AUTH round-trip. This is NOT the old, deliberately
+        # removed fixed-two-connections `server_full` policy (see module
+        # docstring's "WHY server_full... IS REMOVED ENTIRELY" section) -
+        # that policy was a hard, non-configurable two-connection-total
+        # cap, fundamentally incompatible with matchmaking; this is an
+        # opt-in (default `None`/off), much-higher, per-process resource-
+        # protection ceiling, checked against ConnectionManager's own
+        # existing `connection_count` (no second counter introduced).
+        # Deliberately applies identically to a genuinely new connection
+        # and to a Stage-E2 reconnect attempt: a disconnected-but-still-
+        # countdown-window player's OLD connection was already
+        # `.remove()`-d, so by the time they reconnect,
+        # `connection_count` cannot tell that attempt apart from any
+        # other brand-new connection - a priority-aware admission policy
+        # that reserves capacity for resumes is a legitimate future
+        # refinement, deliberately not built here (out of this stage's
+        # own scope).
+        if self._max_connections is not None and self._connection_manager.connection_count >= self._max_connections:
+            await self._protocol.send(connection, SERVER_FULL_MESSAGE)
+            await connection.close()
+            return
 
         try:
             raw_auth_message = await connection.recv()
