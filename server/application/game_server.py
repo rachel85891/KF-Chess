@@ -1071,6 +1071,18 @@ from server.presentation.room_choice_command import (
 TICK_INTERVAL_S = 1 / 30
 DEFAULT_MATCHMAKING_TIMEOUT_S = 60.0
 DEFAULT_DISCONNECT_COUNTDOWN_S = 20.0
+# Stage I4 - a per-process resource-protection cap, mirroring
+# DEFAULT_MATCHMAKING_TIMEOUT_S/DEFAULT_DISCONNECT_COUNTDOWN_S's own
+# "named module constant + matching constructor parameter" shape. `None`
+# ("no cap") is itself the default, NOT a return to the old, deliberately
+# REMOVED fixed-two-connections "server_full" policy (see this module's
+# own "WHY server_full... IS REMOVED ENTIRELY" docstring section above) -
+# that policy hard-capped the server at exactly two connections, ever,
+# which is fundamentally incompatible with matchmaking. This is instead
+# a much-higher, OPTIONAL, configurable ceiling purely for protecting
+# server resources under real load - off unless a deployer explicitly
+# opts in.
+DEFAULT_MAX_CONNECTIONS: Optional[int] = None
 
 _BROADCAST_EVENT_TYPES = (
     MoveAccepted,
@@ -1142,6 +1154,7 @@ class GameServer:
         session_factory: Callable[[], GameSession] = GameSession,
         matchmaking_timeout_s: float = DEFAULT_MATCHMAKING_TIMEOUT_S,
         disconnect_countdown_s: float = DEFAULT_DISCONNECT_COUNTDOWN_S,
+        max_connections: Optional[int] = DEFAULT_MAX_CONNECTIONS,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         """Construct (or accept injected) collaborators - see module
@@ -1193,6 +1206,18 @@ class GameServer:
                 20 (this stage's own "auto-resign after 20 seconds"
                 requirement) - overridable for tests, so no test needs
                 a real 20-second wait.
+            max_connections: The maximum number of simultaneously
+                tracked connections (`ConnectionManager.connection_
+                count`) this process will allow before rejecting new
+                ones with `server_full` - see `handle_connection`'s own
+                docstring for exactly where this is checked. Defaults to
+                `None`, meaning "no cap" - every existing test's and
+                caller's own behavior is therefore completely unchanged
+                unless a caller explicitly opts in. This is NOT the old,
+                deliberately removed fixed-two-connections `server_full`
+                policy (see module docstring's "WHY server_full... IS
+                REMOVED ENTIRELY" section) - it is a much-higher,
+                configurable, per-process resource-protection ceiling.
             clock: Callable returning the current time as a float -
                 defaults to time.perf_counter. Used both to construct
                 the default MatchmakingQueue and for this instance's
@@ -1218,6 +1243,7 @@ class GameServer:
         self._session_factory = session_factory
         self._matchmaking_timeout_s = matchmaking_timeout_s
         self._disconnect_countdown_s = disconnect_countdown_s
+        self._max_connections = max_connections
         self._matchmaking_queue = (
             matchmaking_queue if matchmaking_queue is not None else MatchmakingQueue(clock=self._clock)
         )
